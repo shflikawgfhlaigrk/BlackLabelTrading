@@ -1,0 +1,19 @@
+# Xcode / build artifacts (regeneratable)
+dd/
+DerivedData/
+build/
+build-archive/
+build-signed/
+*.app/
+*.ipa
+*.dSYM/
+# Xcode user state
+*.xcuserstate
+**/xcuserdata/
+**/*.xcodeproj/project.xcworkspace/xcuserdata/
+# macOS / session noise
+.DS_Store
+.remember/
+*.log
+# local signing scratch
+/tmp/bl-build/
