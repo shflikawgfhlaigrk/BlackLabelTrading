@@ -100,11 +100,21 @@ final class FeedClient: ObservableObject {
     @discardableResult
     func ensureBackendRunning() async -> Bool {
         // Only for the default localhost backend; a custom baseURL is the buyer's own choice.
-        let u = baseURL.trimmingCharacters(in: .whitespaces)
-        guard u == Self.defaultURL || u.hasPrefix("http://127.0.0.1") || u.hasPrefix("http://localhost") else { return false }
+        let isLocal = BackendBootstrap.isLocalDefaultURL(baseURL, defaultURL: Self.defaultURL)
+        guard isLocal else { return false }
         if await healthOK() { return true }
         guard !triedBootstrap else { return await healthOK() }
         triedBootstrap = true
+        // HONEST self-containment: the App Sandbox DENIES exec of /bin/bash, so a sandboxed build
+        // CANNOT spawn the bundled launch-backend.sh (verified: execvp Operation not permitted). In
+        // that posture the app relies on the externally-managed (launchd) backend; if it's down we
+        // surface an honest error and stay .offline — we never pretend a feed exists.
+        let sandboxed = BackendBootstrap.runtimeSandboxed(env: ProcessInfo.processInfo.environment)
+        guard BackendBootstrap.decide(sandboxed: sandboxed, isLocalDefault: isLocal) == .spawnBundled else {
+            lastError = "Backend not running. The sandboxed app can't start it directly — "
+                + "the installer's background service (launchd) manages it. Open Settings to check."
+            return false
+        }
         guard let script = Bundle.main.url(forResource: "launch-backend", withExtension: "sh", subdirectory: "backend")
                 ?? bundledBackendScript() else { return false }
         let proc = Process()

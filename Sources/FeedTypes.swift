@@ -159,3 +159,51 @@ enum LiveFold {
         return out
     }
 }
+
+// MARK: - Self-contained backend bootstrap policy (PURE LOGIC, test-locked).
+// HONEST self-containment: the product SHIPS its own backend inside the .app bundle, but whether
+// the app can AUTO-SPAWN it in-process depends on the codesign/sandbox posture of the build:
+//
+//   * App Sandbox (com.apple.security.app-sandbox) DENIES process-exec of a non-bundled tool like
+//     /bin/bash by default — verified empirically: `execvp() ... Operation not permitted`. So a
+//     sandboxed build (the only kind that launches ad-hoc-signed, and the kind required for the
+//     Mac App Store) CANNOT spawn launch-backend.sh. In that posture the app relies on the
+//     externally-managed backend (a launchd LaunchAgent the installer registers) and otherwise
+//     degrades to the honest .offline state — it NEVER fabricates a feed.
+//   * A NON-sandboxed Developer-ID-signed build CAN spawn the bundled script. (No Developer ID
+//     Application cert is present on this machine, so that build is not currently producible —
+//     documented, not claimed.)
+//
+// `BackendBootstrap` makes this decision explicit + testable instead of attempting a doomed spawn
+// and swallowing the failure. `_APP_SANDBOX_CONTAINER_ID` is exported into every sandboxed
+// process by macOS; its presence is a reliable runtime sandbox signal.
+enum BackendBootstrap: Equatable {
+    /// Attempt an in-process spawn of the bundled backend (only valid for non-sandboxed builds).
+    case spawnBundled
+    /// Sandboxed: cannot spawn; rely on the externally-managed (launchd) backend + offline fallback.
+    case relyExternal
+    /// Backend URL is a custom/remote host the buyer chose — never auto-spawn anything.
+    case external
+
+    /// Pure decision. `sandboxed` = process is App-Sandboxed; `isLocalDefault` = baseURL points at
+    /// the product's own localhost backend (vs a buyer-configured remote host).
+    static func decide(sandboxed: Bool, isLocalDefault: Bool) -> BackendBootstrap {
+        guard isLocalDefault else { return .external }
+        return sandboxed ? .relyExternal : .spawnBundled
+    }
+
+    /// True only when a build can actually auto-spawn its bundled backend. Honest: false under
+    /// the App Sandbox, where exec of /bin/bash is denied.
+    static func canSpawn(sandboxed: Bool) -> Bool { !sandboxed }
+
+    /// Runtime sandbox detection (macOS exports this into every sandboxed process).
+    static func runtimeSandboxed(env: [String: String]) -> Bool {
+        env["APP_SANDBOX_CONTAINER_ID"] != nil
+    }
+
+    /// A localhost/default backend URL (the only kind the app may auto-manage).
+    static func isLocalDefaultURL(_ u: String, defaultURL: String) -> Bool {
+        let t = u.trimmingCharacters(in: .whitespaces)
+        return t == defaultURL || t.hasPrefix("http://127.0.0.1") || t.hasPrefix("http://localhost")
+    }
+}

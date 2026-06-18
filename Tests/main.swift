@@ -15,6 +15,9 @@ func eq(_ a: Double, _ b: Double, _ name: String, tol: Double = 1e-6) {
 func eqi(_ a: Int, _ b: Int, _ name: String) {
     if a == b { passed += 1 } else { failed += 1; print("  FAIL: \(name) — got \(a), expected \(b)") }
 }
+func eq<T: Equatable>(_ a: T, _ b: T, _ name: String) {
+    if a == b { passed += 1 } else { failed += 1; print("  FAIL: \(name) — got \(a), expected \(b)") }
+}
 
 func day(_ offset: Int) -> Date { Date(timeIntervalSince1970: 1_700_000_000 + Double(offset) * 86_400) }
 
@@ -1146,6 +1149,35 @@ testLiveTickDecode()
 testLiveFold()
 testCaptureStatusState()
 testFeedSymbolsPicker()
+
+// Self-contained backend bootstrap policy (honest sandbox-spawn limitation)
+func testBackendBootstrapPolicy() {
+    // Sandboxed + localhost default -> rely on external (launchd) backend; CANNOT spawn /bin/bash.
+    eq(BackendBootstrap.decide(sandboxed: true, isLocalDefault: true), .relyExternal,
+       "app-sandboxed build relies on external backend (cannot spawn bundled script)")
+    // Non-sandboxed (Developer-ID) + localhost default -> may spawn the bundled backend.
+    eq(BackendBootstrap.decide(sandboxed: false, isLocalDefault: true), .spawnBundled,
+       "non-sandboxed build may spawn the bundled backend")
+    // Custom/remote backend URL -> never auto-manage regardless of sandbox.
+    eq(BackendBootstrap.decide(sandboxed: false, isLocalDefault: false), .external,
+       "buyer-configured remote backend is never auto-spawned")
+    eq(BackendBootstrap.decide(sandboxed: true, isLocalDefault: false), .external,
+       "remote backend is external even when sandboxed")
+    // canSpawn is honest: false under the sandbox (exec of /bin/bash denied).
+    ok(!BackendBootstrap.canSpawn(sandboxed: true), "sandboxed build canSpawn == false (honest)")
+    ok(BackendBootstrap.canSpawn(sandboxed: false), "non-sandboxed build canSpawn == true")
+    // Runtime sandbox detection via macOS-exported env var.
+    ok(BackendBootstrap.runtimeSandboxed(env: ["APP_SANDBOX_CONTAINER_ID": "x"]),
+       "APP_SANDBOX_CONTAINER_ID present -> detected sandboxed")
+    ok(!BackendBootstrap.runtimeSandboxed(env: [:]), "no container id -> not sandboxed")
+    // Local-default URL classification.
+    let def = "http://127.0.0.1:8787"
+    ok(BackendBootstrap.isLocalDefaultURL("http://127.0.0.1:8787", defaultURL: def), "127.0.0.1 is local default")
+    ok(BackendBootstrap.isLocalDefaultURL("http://localhost:9000", defaultURL: def), "localhost is local default")
+    ok(!BackendBootstrap.isLocalDefaultURL("http://192.168.1.10:8787", defaultURL: def), "LAN host is NOT local default")
+    ok(!BackendBootstrap.isLocalDefaultURL("https://feed.example.com", defaultURL: def), "remote https is NOT local default")
+}
+testBackendBootstrapPolicy()
 
 // Opt-in live backend integration (locks the end-to-end wire contract on real captured data).
 if ProcessInfo.processInfo.environment["BLT_LIVE_BACKEND"] == "1" {
