@@ -336,6 +336,44 @@ struct SignalLog: Identifiable, Codable, Hashable {
     }
 }
 
+// MARK: - Equity curve (real, computed from the honestly-graded session ledger)
+// A single point on the session equity curve. index 0 is the zero baseline; each
+// subsequent point is one graded signal, carrying the running cumulative P&L.
+struct EquityPoint: Identifiable {
+    let id = UUID()
+    let index: Int
+    let date: Date
+    let equity: Double   // cumulative session P&L up to and including this signal
+    let pnl: Double       // this signal's realized P&L (0 for the baseline point)
+}
+
+enum EquityCurve {
+    // Build a cumulative session-P&L curve from graded signals ONLY. Pending
+    // signals contribute nothing (honest grading). Returns [] when nothing is
+    // graded yet, so the UI shows a proper empty state — never a fabricated line.
+    static func points(_ signals: [SignalLog]) -> [EquityPoint] {
+        let g = signals.filter { $0.grade == "win" || $0.grade == "loss" }
+                       .sorted { $0.created < $1.created }
+        guard let first = g.first else { return [] }
+        var pts: [EquityPoint] = [EquityPoint(index: 0, date: first.created.addingTimeInterval(-1), equity: 0, pnl: 0)]
+        var run = 0.0
+        for (i, s) in g.enumerated() {
+            run += s.pnl
+            pts.append(EquityPoint(index: i + 1, date: s.created, equity: run, pnl: s.pnl))
+        }
+        return pts
+    }
+    static func peak(_ pts: [EquityPoint]) -> Double { pts.map(\.equity).max() ?? 0 }
+    static func trough(_ pts: [EquityPoint]) -> Double { pts.map(\.equity).min() ?? 0 }
+    // Max drawdown: largest peak-to-valley drop in cumulative equity (>= 0).
+    static func maxDrawdown(_ pts: [EquityPoint]) -> Double {
+        guard !pts.isEmpty else { return 0 }
+        var peakSoFar = -Double.greatestFiniteMagnitude, mdd = 0.0
+        for p in pts { peakSoFar = max(peakSoFar, p.equity); mdd = max(mdd, peakSoFar - p.equity) }
+        return mdd
+    }
+}
+
 // MARK: - Prop firm reference data (real futures prop firms)
 struct PropFirm: Identifiable, Hashable {
     let id = UUID()
@@ -415,35 +453,11 @@ final class AppModel: ObservableObject {
         let n = gradedSignals.count
         return n > 0 ? Double(signalWins) / Double(n) * 100 : 0
     }
+    // Real session equity curve, derived from graded signals only (empty until graded).
+    var equityCurve: [EquityPoint] { EquityCurve.points(signals) }
 
-    // Preview/screenshot seeding — only used when BLX_PREVIEW=1 and the store is empty.
-    func seedPreviewIfEmpty() {
-        if trades.isEmpty {
-            var win = Trade(symbol: "ES", direction: .long, entry: 5000, stop: 4990, target: 5025, size: 2, result: .win, pnl: 480, notes: "Trend continuation long off VWAP reclaim.")
-            var loss = Trade(symbol: "NQ", direction: .short, entry: 17850, stop: 17890, target: 17760, size: 1, result: .loss, pnl: -220, notes: "Faded a pop; stopped at structure.")
-            var open = Trade(symbol: "CL", direction: .long, entry: 78.40, stop: 78.00, target: 79.20, size: 3, result: .open, pnl: 0, notes: "Working a breakout retest.")
-            win.created = Date().addingTimeInterval(-86400 * 2)
-            loss.created = Date().addingTimeInterval(-86400)
-            open.created = Date().addingTimeInterval(-3600)
-            trades = [open, loss, win]
-        }
-        if signals.isEmpty {
-            let inp = SignalEngine.scenarios[0].inputs
-            let r = SignalEngine.evaluate(inp)
-            let gp = GateEngine.passedCount(GateEngine.evaluate(inp, r))
-            let agree = ConsensusEngine.agreeing(ConsensusEngine.votes(inp), with: r.direction)
-            var won = SignalLog(symbol: r.symbol, direction: r.direction.rawValue, score: r.score,
-                                entry: r.entry, stop: r.stop, target: r.target,
-                                riskDollars: r.riskDollars, rr: r.rr,
-                                created: Date().addingTimeInterval(-5400), gatesPassed: gp, tfAgree: agree)
-            won.grade = "win"; won.pnl = r.riskDollars * max(0.1, r.rr)
-            let pending = SignalLog(symbol: r.symbol, direction: r.direction.rawValue, score: r.score,
-                                    entry: r.entry, stop: r.stop, target: r.target,
-                                    riskDollars: r.riskDollars, rr: r.rr,
-                                    created: Date().addingTimeInterval(-1800), gatesPassed: gp, tfAgree: agree)
-            signals = [pending, won]
-        }
-    }
+    // SHIP NO DATA: no seed/sample/demo records. The store starts empty and only
+    // ever holds the end user's own trades and graded signals (see EmptyState UI).
 
     // Journal rollups (real, computed from saved data)
     var closedTrades: [Trade] { trades.filter { $0.result != .open } }

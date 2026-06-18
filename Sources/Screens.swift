@@ -1,4 +1,83 @@
 import SwiftUI
+import Charts
+
+// MARK: - Equity curve (real SwiftUI Charts view fed by the graded session ledger)
+struct EquityCurveCard: View {
+    let points: [EquityPoint]
+    private var last: Double { points.last?.equity ?? 0 }
+    private var peak: Double { EquityCurve.peak(points) }
+    private var maxDD: Double { EquityCurve.maxDrawdown(points) }
+    private var curveTint: Color { last > 0 ? BLTheme.green : (last < 0 ? BLTheme.red : BLTheme.gold) }
+    // Pad the y-domain a touch so the line never hugs the frame edges.
+    private var yDomain: ClosedRange<Double> {
+        let lo = min(0, EquityCurve.trough(points)), hi = max(0, peak)
+        let pad = max(1, (hi - lo) * 0.12)
+        return (lo - pad)...(hi + pad)
+    }
+
+    var body: some View {
+        Panel(title: "Equity curve", icon: "chart.xyaxis.line", accent: points.isEmpty ? BLTheme.gold : curveTint) {
+            if points.isEmpty {
+                EmptyState(icon: "chart.xyaxis.line", title: "No equity curve yet",
+                           hint: "Grade committed signals Win or Loss and your cumulative session P&L plots here — real data only, no track record implied.")
+            } else {
+                HStack(spacing: 12) {
+                    curveStat("Session P&L", (last >= 0 ? "+" : "") + TradeMath.money(last), curveTint)
+                    curveStat("Peak", (peak >= 0 ? "+" : "") + TradeMath.money(peak), BLTheme.gold)
+                    curveStat("Max drawdown", maxDD > 0 ? "-" + TradeMath.money(maxDD) : TradeMath.money(0), BLTheme.red)
+                }
+                Chart {
+                    // Zero reference line.
+                    RuleMark(y: .value("Flat", 0))
+                        .lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 4]))
+                        .foregroundStyle(BLTheme.sub.opacity(0.35))
+                    ForEach(points) { p in
+                        AreaMark(x: .value("Step", p.index), y: .value("Equity", p.equity))
+                            .interpolationMethod(.monotone)
+                            .foregroundStyle(LinearGradient(colors: [curveTint.opacity(0.28), curveTint.opacity(0.02)],
+                                                            startPoint: .top, endPoint: .bottom))
+                        LineMark(x: .value("Step", p.index), y: .value("Equity", p.equity))
+                            .interpolationMethod(.monotone)
+                            .lineStyle(StrokeStyle(lineWidth: 2.4, lineCap: .round))
+                            .foregroundStyle(curveTint)
+                    }
+                    if let lastPt = points.last {
+                        PointMark(x: .value("Step", lastPt.index), y: .value("Equity", lastPt.equity))
+                            .symbolSize(70)
+                            .foregroundStyle(curveTint)
+                    }
+                }
+                .chartYScale(domain: yDomain)
+                .chartXAxis {
+                    AxisMarks(values: .automatic(desiredCount: min(points.count, 6))) { _ in
+                        AxisGridLine().foregroundStyle(BLTheme.stroke.opacity(0.5))
+                        AxisValueLabel().foregroundStyle(BLTheme.sub)
+                    }
+                }
+                .chartYAxis {
+                    AxisMarks(position: .leading) { value in
+                        AxisGridLine().foregroundStyle(BLTheme.stroke.opacity(0.5))
+                        AxisValueLabel {
+                            if let v = value.as(Double.self) { Text(TradeMath.money(v)).foregroundStyle(BLTheme.sub) }
+                        }
+                    }
+                }
+                .frame(height: 200)
+                .padding(.top, 4)
+                Text("\(points.count - 1) graded signal\(points.count - 1 == 1 ? "" : "s") · cumulative realized P&L on this Mac. Not a track record.")
+                    .font(.system(size: 10.5, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+            }
+        }
+    }
+
+    @ViewBuilder private func curveStat(_ l: String, _ v: String, _ tint: Color) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(l.uppercased()).font(.system(size: 9.5, weight: .bold, design: .rounded)).foregroundColor(BLTheme.sub).tracking(0.5)
+            Text(v).font(.system(size: 16, weight: .heavy, design: .rounded)).foregroundColor(tint).monospacedDigit()
+        }.frame(maxWidth: .infinity, alignment: .leading)
+            .padding(11).background(BLTheme.bg2).clipShape(RoundedRectangle(cornerRadius: 10))
+    }
+}
 
 // MARK: - Signals (primary dashboard — user-driven / scenario scoring engine)
 struct SignalsScreen: View {
@@ -110,6 +189,9 @@ struct SignalsScreen: View {
                         ForEach(model.signals) { s in signalLogRow(s) }
                     }
                 }
+
+                // Real equity curve, plotted from the graded session ledger above.
+                EquityCurveCard(points: model.equityCurve)
             }
             .padding(24)
         }
