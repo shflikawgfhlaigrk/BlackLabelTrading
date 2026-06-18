@@ -796,9 +796,12 @@ struct FirmRow: View {
 struct SettingsScreen: View {
     @EnvironmentObject var session: Session
     @EnvironmentObject var model: AppModel
+    @EnvironmentObject var feed: FeedClient
     @State private var confirmDelete = false
     @State private var googleClientID = AppSettingsStore.googleClientID
     @State private var googleSaved = false
+    @State private var feedURLDraft = ""
+    @State private var feedSaved = false
     var body: some View {
         ScrollView { VStack(alignment: .leading, spacing: 20) {
             ScreenTitle(title: "Settings", subtitle: "Account, connections, and app info.", icon: "gearshape.fill")
@@ -817,6 +820,40 @@ struct SettingsScreen: View {
 
             // Headline ask: a real, reachable place to enter the WealthCharts account.
             WealthChartsPanel()
+
+            // Live data feed — buyer-configurable backend that serves THEIR own captured bars.
+            Panel(title: "Live data feed", icon: "dot.radiowaves.left.and.right") {
+                HStack(spacing: 8) {
+                    Circle().fill(feedStatusColor).frame(width: 9, height: 9)
+                    Text(feed.state.label).font(.system(size: 12.5, weight: .bold, design: .rounded)).foregroundColor(BLTheme.text)
+                    if let e = feed.lastError { Text("· \(e)").font(.system(size: 11, design: .rounded)).foregroundColor(BLTheme.red) }
+                    Spacer()
+                    GhostButton(label: "Test", icon: "arrow.clockwise") { Task { await feed.connect(email: session.email); await feed.refreshStatus() } }
+                }
+                Text("Black Label Trading captures YOUR WealthCharts feed into a private store on this Mac and serves it to the chart/screener/backtester over localhost. Nothing is fetched from us. Point this at your own backend host/port if you run it elsewhere on your machine or network.")
+                    .font(.system(size: 11.5, design: .rounded)).foregroundColor(BLTheme.sub).fixedSize(horizontal: false, vertical: true)
+                Field(title: "Backend URL", text: $feedURLDraft, prompt: FeedClient.defaultURL)
+                HStack(spacing: 8) {
+                    GoldButton(label: "Save", icon: "checkmark") {
+                        let v = feedURLDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+                        feed.baseURL = v.isEmpty ? FeedClient.defaultURL : v
+                        feedURLDraft = feed.baseURL
+                        withAnimation { feedSaved = true }
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { withAnimation { feedSaved = false } }
+                        Task { await feed.connect(email: session.email); await feed.refreshStatus() }
+                    }
+                    GhostButton(label: "Reset", icon: "arrow.uturn.left") {
+                        feed.baseURL = FeedClient.defaultURL; feedURLDraft = FeedClient.defaultURL
+                        Task { await feed.connect(email: session.email); await feed.refreshStatus() }
+                    }
+                    if feedSaved { Text("Saved.").font(.system(size: 11, weight: .semibold, design: .rounded)).foregroundColor(BLTheme.green) }
+                }
+                if !feed.symbols.pickerList.isEmpty {
+                    Text("Captured symbols: \(feed.symbols.pickerList.prefix(12).joined(separator: ", "))")
+                        .font(.system(size: 11, design: .rounded)).foregroundColor(BLTheme.sub).fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .onAppear { feedURLDraft = feed.baseURL; Task { await feed.refreshStatus() } }
 
             // Make the Google sign-in option configurable rather than silently hidden.
             Panel(title: "Sign-in providers", icon: "globe") {
@@ -859,6 +896,14 @@ struct SettingsScreen: View {
             Button("Cancel", role: .cancel) {}
             Button("Delete", role: .destructive) { AccountStore.delete(session.email); withAnimation { session.signedIn = false; session.email = "" } }
         } message: { Text("This permanently removes your account credentials from this Mac. Your saved trades and signals remain in the app's local store.") }
+    }
+    private var feedStatusColor: Color {
+        switch feed.state {
+        case .live: return BLTheme.green
+        case .idle, .connecting: return BLTheme.gold
+        case .loggedOut, .notSignedIn: return BLTheme.red
+        case .offline: return BLTheme.sub
+        }
     }
     @ViewBuilder private func productRow(_ name: String, _ price: String, _ desc: String, _ tint: Color, _ status: String) -> some View {
         HStack(alignment: .top, spacing: 12) {

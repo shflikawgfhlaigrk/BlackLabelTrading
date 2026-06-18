@@ -971,6 +971,78 @@ testHoloPresetApplyAndPersist()
 testHoloLegibilityReadingSurfaceAlwaysOpaque()
 testHoloLegibilityTextGlowIsMinimalAndHeadingOnly()
 
+// ===== Live feed decode layer (FeedTypes) =====
+func testFeedBarsDecode() {
+    let obj: [String: Any] = ["symbol": "ES", "bars": [
+        [100.0, 101.0, 99.0, 100.5, 1_700_000_000.0],
+        [100.5, 102.0, 100.0, 101.5, 1_700_000_015.0],
+    ]]
+    let bars = FeedBars.decode(obj)
+    eqi(bars.count, 2, "feed bars count")
+    eq(bars[0].open, 100, "feed bar0 open")
+    eq(bars[1].close, 101.5, "feed bar1 close")
+    ok(bars[0].date < bars[1].date, "feed bars sorted ascending")
+}
+func testFeedBarsEmptyAndMalformed() {
+    eqi(FeedBars.decode([:]).count, 0, "feed empty obj -> no bars")
+    eqi(FeedBars.decode(["bars": []]).count, 0, "feed empty array -> no bars")
+    let obj: [String: Any] = ["bars": [[1.0, 2.0], ["x", "y", "z", "w", "v"], [5.0, 6.0, 4.0, 5.5, 1_700_000_000.0]]]
+    eqi(FeedBars.decode(obj).count, 1, "feed skips malformed rows")
+}
+func testFeedBarsGeometryDefensive() {
+    let obj: [String: Any] = ["bars": [[10.0, 9.0, 11.0, 12.0, 1_700_000_000.0]]]
+    let b = FeedBars.decode(obj)
+    eqi(b.count, 1, "defensive geometry decodes")
+    ok(b[0].high >= max(b[0].open, b[0].close), "feed high is a real max")
+    ok(b[0].low <= min(b[0].open, b[0].close), "feed low is a real min")
+}
+func testLiveTickDecode() {
+    ok(LiveTick.decode(["gated": true]) == nil, "gated tick -> nil")
+    ok(LiveTick.decode(["symbol": "ES"]) == nil, "incomplete tick -> nil")
+    let t = LiveTick.decode(["symbol": "ES", "price": 4500.25, "ts": 1_700_000_000.0])
+    ok(t != nil, "valid tick decodes")
+    eq(t!.price, 4500.25, "tick price")
+}
+func testLiveFold() {
+    let bars = [
+        Bar(date: Date(timeIntervalSince1970: 1_700_000_000), open: 100, high: 101, low: 99, close: 100.5),
+        Bar(date: Date(timeIntervalSince1970: 1_700_000_015), open: 100.5, high: 101, low: 100, close: 100.8),
+    ]
+    let up = LiveFold.apply(LiveTick(symbol: "ES", price: 103, ts: Date(timeIntervalSince1970: 1_700_000_020)), to: bars)
+    eq(up.last!.high, 103, "fold widens high")
+    eq(up.last!.close, 103, "fold moves close")
+    eq(up.last!.low, 100, "fold keeps low")
+    let stale = LiveFold.apply(LiveTick(symbol: "ES", price: 50, ts: Date(timeIntervalSince1970: 1_699_999_999)), to: bars)
+    eq(stale.last!.close, 100.8, "stale tick ignored")
+    eqi(LiveFold.apply(LiveTick(symbol: "ES", price: 1, ts: Date()), to: []).count, 0, "fold empty no-op")
+}
+func testCaptureStatusState() {
+    ok(CaptureStatus(cdpReachable: true, feedAvailable: true, feedLive: true, liveTicks: ["ES"]).state(signedIn: false) == .notSignedIn, "state notSignedIn")
+    ok(CaptureStatus().state(signedIn: true) == .loggedOut, "state loggedOut")
+    ok(CaptureStatus(cdpReachable: true).state(signedIn: true) == .connecting, "state connecting")
+    ok(CaptureStatus(cdpReachable: true, feedAvailable: true).state(signedIn: true) == .idle, "state idle")
+    ok(CaptureStatus(cdpReachable: true, feedAvailable: true, liveTicks: ["ES"]).state(signedIn: true) == .live, "state live")
+}
+func testFeedSymbolsPicker() {
+    let s = FeedSymbols.decode([
+        "backtestable": ["AAA", "BBB"], "live": ["BBB", "CCC"],
+        "liveTicks": ["CCC", "DDD"], "busiest": "AAA",
+    ])
+    let p = s.pickerList
+    eqi(p.count, 4, "picker de-duplicates union")
+    ok(p.first == "CCC", "picker leads with live tick")
+    ok(Set(p).count == p.count, "picker has no dupes")
+}
+
+// Live feed decode
+testFeedBarsDecode()
+testFeedBarsEmptyAndMalformed()
+testFeedBarsGeometryDefensive()
+testLiveTickDecode()
+testLiveFold()
+testCaptureStatusState()
+testFeedSymbolsPicker()
+
 try? FileManager.default.removeItem(at: tmpBase)   // clean temp test stores
 print("\n\(passed) passed, \(failed) failed")
 exit(failed == 0 ? 0 : 1)

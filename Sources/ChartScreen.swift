@@ -64,8 +64,19 @@ enum Resampler {
     }
 }
 
+// Where the chart's bars come from. Live = the buyer's own WealthCharts capture (via the
+// product's own backend); Import = a CSV the user pastes. Both are the user's OWN data — Live
+// is never fabricated, it shows an honest "feed offline" state when capture isn't flowing.
+enum ChartSource: String, CaseIterable, Identifiable {
+    case live = "Live feed", importCSV = "Import"
+    var id: String { rawValue }
+    var icon: String { self == .live ? "dot.radiowaves.left.and.right" : "square.and.arrow.down" }
+}
+
 struct ChartScreen: View {
     @EnvironmentObject var drawings: DrawingStore
+    @EnvironmentObject var feed: FeedClient
+    @State private var source: ChartSource = .live
     @State private var symbol = ""
     @State private var baseBars: [Bar] = []
     @State private var csvText = ""
@@ -75,6 +86,13 @@ struct ChartScreen: View {
     @State private var ind = ChartScreen.loadIndicators()
     @State private var renkoBrick: Double = 0
     @State private var showImporter = false
+
+    // Live feed state
+    @State private var liveTick: LiveTick? = nil
+    @State private var feedNote = ""
+    @State private var loadingFeed = false
+    @State private var livePollTask: Task<Void, Never>? = nil
+    @State private var lastLiveClose: Double? = nil
 
     // Drawing state
     @State private var activeTool: DrawingKind? = nil
@@ -125,6 +143,7 @@ struct ChartScreen: View {
         VStack(alignment: .leading, spacing: 0) {
             header
             Divider().overlay(BLTheme.stroke)
+            if source == .live { feedBanner }
             if baseBars.isEmpty {
                 emptyState
             } else {
@@ -132,6 +151,7 @@ struct ChartScreen: View {
                     VStack(alignment: .leading, spacing: 14) {
                         toolbar
                         priceChartCard
+                        volumePane
                         if ind.rsi { rsiPane }
                         if ind.macd { macdPane }
                         if ind.atr { atrPane }
@@ -140,25 +160,102 @@ struct ChartScreen: View {
                 }
             }
         }
+        .onAppear {
+            if source == .live { Task { await refreshFeed() } }
+        }
+        .onChange(of: source) { newSource in
+            stopLivePoll()
+            if newSource == .live { Task { await refreshFeed() } }
+        }
+        .onChange(of: feed.state) { _ in
+            // When the feed transitions to flowing while we're live, (re)start tick polling.
+            if source == .live && feed.state.isFlowing { startLivePoll() } else { stopLivePoll() }
+        }
+        .onDisappear { stopLivePoll() }
     }
 
-    // MARK: Header (title + symbol + load)
+    // MARK: Honest live-feed banner — every word reflects a REAL backend response. No "connected"
+    // unless the buyer's own WC session is genuinely reachable and flowing.
+    @ViewBuilder private var feedBanner: some View {
+        let st = feed.state
+        HStack(spacing: 10) {
+            ZStack {
+                Circle().fill(bannerColor(st).opacity(0.25)).frame(width: 18, height: 18)
+                Circle().fill(bannerColor(st)).frame(width: 8, height: 8)
+                    .modifier(LivePulse(active: st.isFlowing))
+            }
+            VStack(alignment: .leading, spacing: 1) {
+                Text(st.label).font(.system(size: 12, weight: .bold, design: .rounded)).foregroundColor(BLTheme.text)
+                Text(bannerHint(st)).font(.system(size: 10, design: .rounded)).foregroundColor(BLTheme.sub)
+            }
+            Spacer()
+            if loadingFeed || feed.connecting {
+                ProgressView().controlSize(.small).tint(BLTheme.gold)
+            }
+            if st == .loggedOut || st == .notSignedIn || st == .connecting {
+                GhostButton(label: "Connect WealthCharts", icon: "bolt.horizontal") {
+                    Task { loadingFeed = true; await feed.launchCapture(); await refreshFeed(); loadingFeed = false }
+                }
+            }
+            if st == .offline {
+                GhostButton(label: "Retry", icon: "arrow.clockwise") { Task { await reconnectFeed() } }
+            }
+            GhostButton(label: "Refresh", icon: "arrow.clockwise") { Task { await refreshFeed() } }
+        }
+        .padding(.horizontal, 18).padding(.vertical, 9)
+        .background(bannerColor(st).opacity(0.07))
+        .overlay(Rectangle().fill(bannerColor(st).opacity(0.35)).frame(height: 1), alignment: .bottom)
+    }
+    private func bannerColor(_ s: FeedState) -> Color {
+        switch s {
+        case .live: return BLTheme.green
+        case .idle, .connecting: return BLTheme.gold
+        case .loggedOut, .notSignedIn: return BLTheme.red
+        case .offline: return BLTheme.sub
+        }
+    }
+    private func bannerHint(_ s: FeedState) -> String {
+        switch s {
+        case .live: return "Ticks flowing from your WealthCharts session into your local store."
+        case .idle: return "Feed reachable, no fresh ticks right now (market quiet / closed)."
+        case .connecting: return "Capture window open — waiting for your WealthCharts feed to come up."
+        case .loggedOut: return "Sign in to WealthCharts in the capture window to start your own feed."
+        case .notSignedIn: return "Backend reachable — connecting your session…"
+        case .offline: return "The product backend isn't reachable. It serves your own captured data."
+        }
+    }
+
+    // MARK: Header (title + source toggle + symbol + load)
     private var header: some View {
         HStack(alignment: .top) {
-            ScreenTitle(title: "Chart", subtitle: "Candlestick / Heikin-Ashi / Renko on YOUR imported bars — indicators, drawing tools, multi-timeframe. Nothing downloaded or invented.", icon: "chart.xyaxis.line")
+            ScreenTitle(title: "Chart", subtitle: "Candlestick / Heikin-Ashi / Renko on YOUR live or imported bars — indicators, drawing tools, multi-timeframe. Nothing downloaded from us or invented.", icon: "chart.xyaxis.line")
             Spacer()
             VStack(alignment: .trailing, spacing: 6) {
+                // Source toggle: Live feed (own capture) vs Import (CSV).
+                Picker("", selection: $source) {
+                    ForEach(ChartSource.allCases) { s in
+                        Label(s.rawValue, systemImage: s.icon).tag(s)
+                    }
+                }.labelsHidden().pickerStyle(.segmented).fixedSize()
                 HStack(spacing: 8) {
-                    TextField("Symbol", text: $symbol)
-                        .textFieldStyle(.plain).font(.system(size: 13, weight: .bold, design: .rounded)).foregroundColor(BLTheme.text)
-                        .frame(width: 90).padding(.vertical, 8).padding(.horizontal, 11)
-                        .background(BLTheme.bg2).clipShape(RoundedRectangle(cornerRadius: 9))
-                        .overlay(RoundedRectangle(cornerRadius: 9).stroke(BLTheme.stroke, lineWidth: 1))
-                        .onChange(of: symbol) { _ in winStart = 0 }
-                    GoldButton(label: "Load bars", icon: "square.and.arrow.down") { showImporter = true }
+                    if source == .live {
+                        liveSymbolField
+                        GoldButton(label: loadingFeed ? "Loading…" : "Load", icon: "arrow.down.circle") {
+                            Task { await loadLiveBars() }
+                        }
+                    } else {
+                        TextField("Symbol", text: $symbol)
+                            .textFieldStyle(.plain).font(.system(size: 13, weight: .bold, design: .rounded)).foregroundColor(BLTheme.text)
+                            .frame(width: 90).padding(.vertical, 8).padding(.horizontal, 11)
+                            .background(BLTheme.bg2).clipShape(RoundedRectangle(cornerRadius: 9))
+                            .overlay(RoundedRectangle(cornerRadius: 9).stroke(BLTheme.stroke, lineWidth: 1))
+                            .onChange(of: symbol) { _ in winStart = 0 }
+                        GoldButton(label: "Load bars", icon: "square.and.arrow.down") { showImporter = true }
+                    }
                 }
-                if !importNote.isEmpty {
-                    Text(importNote).font(.system(size: 10.5, weight: .semibold, design: .rounded)).foregroundColor(baseBars.isEmpty ? BLTheme.red : BLTheme.green)
+                let note = source == .live ? feedNote : importNote
+                if !note.isEmpty {
+                    Text(note).font(.system(size: 10.5, weight: .semibold, design: .rounded)).foregroundColor(baseBars.isEmpty ? BLTheme.red : BLTheme.green)
                 }
             }
         }
@@ -166,15 +263,138 @@ struct ChartScreen: View {
         .sheet(isPresented: $showImporter) { importSheet.sheetCloseBar() }
     }
 
-    private var emptyState: some View {
-        VStack {
-            Spacer()
-            EmptyState(icon: "chart.xyaxis.line", title: "Load your own price data",
-                       hint: "Import an OHLC CSV (date,open,high,low,close[,volume]) for a symbol. The chart, indicators and drawings all run on your data — nothing is fetched or faked.")
-            GoldButton(label: "Import OHLC CSV", icon: "square.and.arrow.down") { showImporter = true }
-            Spacer()
-        }.frame(maxWidth: .infinity, maxHeight: .infinity)
+    // Live symbol picker: a menu of the buyer's own captured symbols + free-text entry.
+    private var liveSymbolField: some View {
+        HStack(spacing: 6) {
+            TextField("Symbol", text: $symbol)
+                .textFieldStyle(.plain).font(.system(size: 13, weight: .bold, design: .rounded)).foregroundColor(BLTheme.text)
+                .frame(width: 110).padding(.vertical, 8).padding(.horizontal, 11)
+                .background(BLTheme.bg2).clipShape(RoundedRectangle(cornerRadius: 9))
+                .overlay(RoundedRectangle(cornerRadius: 9).stroke(BLTheme.stroke, lineWidth: 1))
+                .onSubmit { Task { await loadLiveBars() } }
+                .onChange(of: symbol) { _ in winStart = 0 }
+            if !feed.symbols.pickerList.isEmpty {
+                Menu {
+                    ForEach(feed.symbols.pickerList, id: \.self) { s in
+                        Button(s) { symbol = s; Task { await loadLiveBars() } }
+                    }
+                } label: {
+                    Image(systemName: "chevron.down.circle").font(.system(size: 14)).foregroundColor(BLTheme.gold)
+                }.menuStyle(.borderlessButton).frame(width: 22)
+            }
+        }
     }
+
+    @ViewBuilder private var emptyState: some View {
+        if source == .live {
+            liveEmptyState
+        } else {
+            VStack {
+                Spacer()
+                EmptyState(icon: "chart.xyaxis.line", title: "Load your own price data",
+                           hint: "Import an OHLC CSV (date,open,high,low,close[,volume]) for a symbol. The chart, indicators and drawings all run on your data — nothing is fetched or faked.")
+                GoldButton(label: "Import OHLC CSV", icon: "square.and.arrow.down") { showImporter = true }
+                Spacer()
+            }.frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    // Live empty state is HONEST about why the chart is empty (feed off vs no symbol chosen vs
+    // store cold) — and never shows a fake candle to fill the space.
+    @ViewBuilder private var liveEmptyState: some View {
+        VStack(spacing: 14) {
+            Spacer()
+            switch feed.state {
+            case .offline:
+                EmptyState(icon: "wifi.slash", title: "Your data backend isn't running",
+                           hint: "Black Label Trading captures YOUR WealthCharts feed into a local store on this Mac and serves it to the app. Start the backend, then refresh. Or switch to Import to chart a CSV.")
+                GhostButton(label: "Retry connection", icon: "arrow.clockwise") { Task { await reconnectFeed() } }
+            case .loggedOut, .notSignedIn, .connecting:
+                EmptyState(icon: "dot.radiowaves.left.and.right", title: "Connect your WealthCharts feed",
+                           hint: "Open the capture window and sign into YOUR WealthCharts account. Bars start landing in your local store within ~30s — then they appear here. Nothing is ever fabricated.")
+                GoldButton(label: "Connect WealthCharts", icon: "bolt.horizontal") {
+                    Task { loadingFeed = true; await feed.launchCapture(); await refreshFeed(); loadingFeed = false }
+                }
+            default:
+                if feed.symbols.pickerList.isEmpty {
+                    EmptyState(icon: "hourglass", title: "Feed connected — store is still filling",
+                               hint: "Your WealthCharts session is reachable but your local store has no bars yet. Leave a chart open in WealthCharts; bars accumulate here. Honest empty until real bars arrive.")
+                } else {
+                    EmptyState(icon: "chart.xyaxis.line", title: "Pick a symbol to chart",
+                               hint: "Your captured symbols are in the dropdown next to the symbol field. Choose one to load its real bars.")
+                    if let busiest = feed.symbols.busiest {
+                        GoldButton(label: "Chart \(busiest)", icon: "chart.bar") { symbol = busiest; Task { await loadLiveBars() } }
+                    }
+                }
+            }
+            Spacer()
+        }.frame(maxWidth: .infinity, maxHeight: .infinity).padding(24)
+    }
+
+    // MARK: - Live feed loading (never fabricates — empty store yields an empty chart).
+    private func refreshFeed() async {
+        await feed.refreshStatus()
+        // Auto-pick the busiest captured symbol on first entry if none chosen.
+        if symbol.trimmingCharacters(in: .whitespaces).isEmpty, let b = feed.symbols.busiest {
+            symbol = b
+        }
+        if !symbol.trimmingCharacters(in: .whitespaces).isEmpty { await loadLiveBars() }
+        if feed.state.isFlowing { startLivePoll() }
+    }
+    private func reconnectFeed() async {
+        loadingFeed = true; defer { loadingFeed = false }
+        await feed.connect(email: "local@blacklabel")
+        await refreshFeed()
+    }
+    private func loadLiveBars() async {
+        let s = symbol.trimmingCharacters(in: .whitespaces)
+        guard !s.isEmpty else { feedNote = "Enter or pick a symbol."; return }
+        loadingFeed = true; defer { loadingFeed = false }
+        let bars = await feed.recentBars(symbol: s, limit: 400)
+        baseBars = bars; winStart = 0; winCount = 0; crosshair = nil; liveTick = nil; lastLiveClose = nil
+        renkoBrick = CandleTransform.suggestedBrickSize(baseBars)
+        if bars.isEmpty {
+            feedNote = feed.state.hasData ? "No bars captured for \(s) yet." : "Feed offline — no bars to show."
+        } else {
+            feedNote = "Loaded \(bars.count) live bars for \(s)."
+        }
+        if feed.state.isFlowing { startLivePoll() }
+    }
+
+    // Poll the live last-price tick and fold it into the most-recent bar (moves the close,
+    // widens high/low). A new candle is NEVER invented client-side — only the backend's real
+    // aggregation prints new bars; we re-pull periodically to pick those up.
+    private func startLivePoll() {
+        guard source == .live, livePollTask == nil else { return }
+        livePollTask = Task {
+            var sinceRepull = 0
+            while !Task.isCancelled {
+                let s = symbol.trimmingCharacters(in: .whitespaces)
+                if !s.isEmpty {
+                    if let t = await feed.liveTick(symbol: s) {
+                        liveTick = t
+                        lastLiveClose = t.price
+                        baseBars = LiveFold.apply(t, to: baseBars)
+                    }
+                    sinceRepull += 1
+                    // Every ~30s re-pull recent bars so newly-printed candles appear, and refresh
+                    // the honest feed status banner.
+                    if sinceRepull >= 6 {
+                        sinceRepull = 0
+                        await feed.refreshStatus()
+                        let fresh = await feed.recentBars(symbol: s, limit: 400)
+                        if !fresh.isEmpty {
+                            var merged = fresh
+                            if let t = liveTick { merged = LiveFold.apply(t, to: merged) }
+                            baseBars = merged
+                        }
+                    }
+                }
+                try? await Task.sleep(nanoseconds: 5_000_000_000)  // 5s tick poll
+            }
+        }
+    }
+    private func stopLivePoll() { livePollTask?.cancel(); livePollTask = nil }
 
     // MARK: Toolbar (style / timeframe / indicators / drawing tools / zoom)
     private var toolbar: some View {
@@ -302,6 +522,20 @@ struct ChartScreen: View {
                             Text(String(format: "%.3f", f.ratio)).font(.system(size: 8, design: .rounded)).foregroundColor(BLTheme.gold.opacity(0.7))
                         }
                 }
+                // Live last-price marker — only when a genuine fresh tick exists (never faked).
+                if let lp = livePriceLine {
+                    RuleMark(y: .value("live", lp))
+                        .foregroundStyle((vis.last?.up ?? true) ? BLTheme.green : BLTheme.red)
+                        .lineStyle(StrokeStyle(lineWidth: 1, dash: [2,3]))
+                        .annotation(position: .trailing, alignment: .leading, spacing: 0) {
+                            Text(TradeMath.num(lp))
+                                .font(.system(size: 10, weight: .heavy, design: .rounded)).monospacedDigit()
+                                .foregroundColor(Color(hex: 0x0E0E0E))
+                                .padding(.horizontal, 5).padding(.vertical, 2)
+                                .background((vis.last?.up ?? true) ? BLTheme.green : BLTheme.red)
+                                .clipShape(RoundedRectangle(cornerRadius: 3))
+                        }
+                }
             }
             .chartXScale(domain: Double(xLo)...Double(xHi))
             .chartYScale(domain: yDomain)
@@ -322,7 +556,16 @@ struct ChartScreen: View {
 
     private var chartTitle: String {
         let s = effectiveSymbol.isEmpty ? "—" : effectiveSymbol
-        return "\(s) · \(style.rawValue) · \(timeframe.rawValue) · \(bars.count) bars"
+        let live = (source == .live && feed.state.isFlowing) ? " · LIVE" : ""
+        return "\(s) · \(style.rawValue) · \(timeframe.rawValue) · \(bars.count) bars\(live)"
+    }
+
+    // The live last-price line: shown only on a flowing live feed with a real tick. nil otherwise
+    // (import mode, offline feed, or no tick) — so the chart never draws a fabricated price.
+    private var livePriceLine: Double? {
+        guard source == .live, feed.state.isFlowing, style != .renko else { return nil }
+        if let t = liveTick { return t.price }
+        return lastLiveClose
     }
 
     // OHLC bars matching the current candle index space (for VWAP, which needs real volume).
@@ -495,6 +738,27 @@ struct ChartScreen: View {
                 .chartYAxis { AxisMarks(position: .trailing) { _ in AxisValueLabel().foregroundStyle(BLTheme.sub) } }.chartXAxis(.hidden)
         }
     }
+
+    // Volume sub-pane — only rendered when the user's bars actually carry volume (honest: a feed
+    // capture with no volume column shows no fake bars). Coloured by candle direction.
+    @ViewBuilder private var volumePane: some View {
+        let vis = visible
+        let hasVol = vis.contains { $0.volume > 0 }
+        if hasVol {
+            Panel(title: "Volume", icon: "chart.bar.fill", accent: BLTheme.gold) {
+                Chart {
+                    ForEach(vis) { c in
+                        BarMark(x: .value("i", c.index), y: .value("vol", c.volume), width: .ratio(0.62))
+                            .foregroundStyle((c.up ? BLTheme.green : BLTheme.red).opacity(0.55))
+                    }
+                }
+                .frame(height: 90).chartXScale(domain: paneXDomain)
+                .chartYAxis { AxisMarks(position: .trailing) { v in AxisValueLabel {
+                    if let d = v.as(Double.self) { Text(TradeMath.compact(d)).font(.system(size: 8)).foregroundStyle(BLTheme.sub) } } } }
+                .chartXAxis(.hidden)
+            }
+        }
+    }
     private var paneXDomain: ClosedRange<Double> {
         let vis = visible
         return Double(vis.first?.index ?? 0)...Double((vis.last?.index ?? 1) + 1)
@@ -650,5 +914,24 @@ struct ChartScreen: View {
         p.begin { resp in
             if resp == .OK, let url = p.url, let s = try? String(contentsOf: url, encoding: .utf8) { csvText = s; loadBars() }
         }
+    }
+}
+
+// A gentle pulsing ring that signals a genuinely-flowing live feed. When inactive it renders
+// nothing (so a static dot stays static — no fake "live" animation when the feed is off).
+struct LivePulse: ViewModifier {
+    let active: Bool
+    @State private var on = false
+    func body(content: Content) -> some View {
+        content.background(
+            Group {
+                if active {
+                    Circle().stroke(BLTheme.green, lineWidth: 1.5)
+                        .scaleEffect(on ? 2.4 : 1).opacity(on ? 0 : 0.7)
+                        .onAppear { withAnimation(.easeOut(duration: 1.6).repeatForever(autoreverses: false)) { on = true } }
+                        .onDisappear { on = false }
+                }
+            }
+        )
     }
 }

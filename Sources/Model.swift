@@ -564,6 +564,14 @@ enum TradeMath {
     }
     // Trim trailing zeros for text-field display.
     static func numTrim(_ v: Double) -> String { v == v.rounded() ? String(Int(v)) : String(v) }
+    // Compact magnitude (1.2K / 3.4M) for axis labels like volume.
+    static func compact(_ v: Double) -> String {
+        let a = abs(v)
+        if a >= 1_000_000_000 { return String(format: "%.1fB", v / 1_000_000_000) }
+        if a >= 1_000_000 { return String(format: "%.1fM", v / 1_000_000) }
+        if a >= 1_000 { return String(format: "%.1fK", v / 1_000) }
+        return numTrim(v)
+    }
 }
 
 // MARK: - Local accounts (on-device, App Store 5.1.1(v) deletion supported)

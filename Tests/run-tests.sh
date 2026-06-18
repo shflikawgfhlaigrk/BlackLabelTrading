@@ -20,6 +20,7 @@ SOURCES=(
   "$ROOT/Sources/Backtest.swift"
   "$ROOT/Sources/BacktestDepth.swift"
   "$ROOT/Sources/Charting.swift"
+  "$ROOT/Sources/FeedTypes.swift"
   "$ROOT/Sources/JournalImport.swift"
   "$ROOT/Sources/Screener.swift"
   "$ROOT/Sources/AlertsEngine.swift"

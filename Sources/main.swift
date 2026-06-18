@@ -176,16 +176,22 @@ struct RootView: View {
     @StateObject var strategies = StrategyStore()
     @StateObject var paper = PaperBook()
     @StateObject var holo = HoloThemeController()
+    @StateObject var feed = FeedClient()
     var body: some View {
         Group { if session.signedIn { MainView() } else { AuthView() } }
             .environmentObject(session).environmentObject(model).environmentObject(wc)
             .environmentObject(watch).environmentObject(alerts).environmentObject(nav).environmentObject(drawings)
-            .environmentObject(strategies).environmentObject(paper).environmentObject(holo)
+            .environmentObject(strategies).environmentObject(paper).environmentObject(holo).environmentObject(feed)
             // Inject the live HoloTheme + the effective motion gate (toggle AND not Reduce Motion)
             // so every FX component app-wide re-skins instantly when the Theme Studio changes.
             .holoEnvironment(holo)
             .preferredColorScheme(.dark)
             .onAppear { NotificationCenterBridge.configure(alerts) }
+            // On sign-in, hand the buyer's session email to the own backend so the live feed
+            // banner reflects REAL capture state (never a fabricated "connected").
+            .onChange(of: session.signedIn) { signedIn in
+                if signedIn { Task { await feed.connect(email: session.email) } }
+            }
     }
 }
 
