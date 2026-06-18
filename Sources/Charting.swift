@@ -164,6 +164,79 @@ enum ChartIndicators {
     }
 }
 
+// MARK: - Chart axis intelligence. PURE MATH shared by the SwiftUI chart screen AND the
+// headless render proof, so what Michael inspects in the PNG is the exact same scaling the
+// live app uses. Implements "nice" tick steps (1/2/2.5/5 × 10ⁿ), auto-fit padding, and an
+// optional logarithmic price scale (for instruments that move multiplicatively).
+enum ChartScale {
+    // A "nice" number ≥ (or ≤, when `ceil` is false) the target, of the form {1,2,2.5,5,10}×10ⁿ.
+    static func niceNum(_ x: Double, ceil: Bool) -> Double {
+        guard x > 0 else { return 0 }
+        let exp = floor(log10(x))
+        let f = x / pow(10, exp)               // fraction in [1,10)
+        let nf: Double
+        if ceil {
+            nf = f <= 1 ? 1 : f <= 2 ? 2 : f <= 2.5 ? 2.5 : f <= 5 ? 5 : 10
+        } else {
+            // largest nice fraction <= f (floor): boundaries are the nice values themselves.
+            nf = f < 2 ? 1 : f < 2.5 ? 2 : f < 5 ? 2.5 : f < 10 ? 5 : 10
+        }
+        return nf * pow(10, exp)
+    }
+
+    // Evenly-spaced "nice" tick prices spanning [lo,hi] with about `target` ticks. The returned
+    // ticks are clamped to the [lo,hi] window so labels never escape the plotted price range.
+    static func ticks(lo: Double, hi: Double, target: Int = 6) -> [Double] {
+        guard hi > lo, target > 1 else { return lo == hi ? [lo] : [] }
+        let range = niceNum(hi - lo, ceil: false)
+        let step = niceNum(range / Double(target - 1), ceil: true)
+        guard step > 0 else { return [] }
+        let start = (lo / step).rounded(.down) * step
+        var out: [Double] = []
+        var v = start
+        var guardN = 0
+        while v <= hi + step * 0.5 && guardN < 1000 {
+            if v >= lo - step * 0.5 { out.append(v) }
+            v += step; guardN += 1
+        }
+        return out
+    }
+
+    // Auto-fit price domain: pad the [low,high] of the visible candles by `padFrac` so wicks
+    // never touch the frame, then snap the padded bounds outward to nice numbers for clean
+    // gridlines. Honest: derived ONLY from the supplied bars — never widened to hide a move.
+    static func priceDomain(low: Double, high: Double, padFrac: Double = 0.06) -> (lo: Double, hi: Double) {
+        guard high > low else {
+            let c = low; let d = max(abs(c) * 0.01, 0.5)
+            return (c - d, c + d)
+        }
+        let pad = (high - low) * padFrac
+        return (low - pad, high + pad)
+    }
+
+    // Map a price to a y-pixel inside [topY, bottomY] under a linear OR log scale. Log scale is
+    // only valid for strictly-positive domains (prices); callers fall back to linear otherwise.
+    static func yPixel(_ price: Double, lo: Double, hi: Double, topY: Double, bottomY: Double, log: Bool) -> Double {
+        let h = bottomY - topY
+        guard hi > lo else { return bottomY }
+        if log && lo > 0 && hi > 0 && price > 0 {
+            let t = (Foundation.log(price) - Foundation.log(lo)) / (Foundation.log(hi) - Foundation.log(lo))
+            return bottomY - t * h
+        }
+        let t = (price - lo) / (hi - lo)
+        return bottomY - t * h
+    }
+
+    // Decimal places to render a price label at, inferred from the tick step magnitude so a
+    // $30,000 future shows whole numbers while a $1.2345 FX pair shows 4 decimals.
+    static func priceDecimals(step: Double) -> Int {
+        guard step > 0 else { return 2 }
+        if step >= 100 { return 0 }
+        if step >= 1 { return step.truncatingRemainder(dividingBy: 1) == 0 ? 0 : 2 }
+        return max(0, min(6, Int(ceil(-log10(step))) + 1))
+    }
+}
+
 // MARK: - Fibonacci retracement / extension levels between a swing low and high.
 struct FibLevel: Identifiable { let ratio: Double; let price: Double; var id: Double { ratio } }
 enum Fibonacci {

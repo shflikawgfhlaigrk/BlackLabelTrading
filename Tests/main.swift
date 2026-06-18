@@ -1034,6 +1034,110 @@ func testFeedSymbolsPicker() {
     ok(Set(p).count == p.count, "picker has no dupes")
 }
 
+// ===== ChartScale (axis intelligence shared by the SwiftUI chart + the headless render proof) =====
+func testChartScaleNiceNum() {
+    eq(ChartScale.niceNum(0.8, ceil: true), 1, "niceNum ceil 0.8 -> 1")
+    eq(ChartScale.niceNum(23, ceil: true), 25, "niceNum ceil 23 -> 25")
+    eq(ChartScale.niceNum(67, ceil: true), 100, "niceNum ceil 67 -> 100")
+    eq(ChartScale.niceNum(420, ceil: false), 250, "niceNum floor 420 -> 250")
+}
+func testChartScaleTicks() {
+    let t = ChartScale.ticks(lo: 29800, hi: 30200, target: 5)
+    ok(t.count >= 3, "ticks produces several lines")
+    // step is a nice number and ticks are monotone & inside a small slack of the domain
+    ok(t.allSatisfy { $0 >= 29800 - 200 && $0 <= 30200 + 200 }, "ticks clamp near domain")
+    if t.count > 1 {
+        let step = t[1] - t[0]
+        eq(ChartScale.niceNum(step, ceil: true), step, "tick step is a nice number")
+    }
+    ok(ChartScale.ticks(lo: 5, hi: 5).count <= 1, "degenerate domain -> at most one tick")
+}
+func testChartScalePriceDomainPad() {
+    let d = ChartScale.priceDomain(low: 100, high: 200, padFrac: 0.1)
+    eq(d.lo, 90, "domain pads low by padFrac")
+    eq(d.hi, 210, "domain pads high by padFrac")
+    let flat = ChartScale.priceDomain(low: 50, high: 50)   // flat series still yields a band
+    ok(flat.hi > flat.lo, "flat series gets a non-degenerate band")
+}
+func testChartScaleYPixelLinearAndLog() {
+    // Linear: midpoint of domain maps to vertical midpoint between topY..bottomY.
+    let yLinMid = ChartScale.yPixel(150, lo: 100, hi: 200, topY: 0, bottomY: 100, log: false)
+    eq(yLinMid, 50, "linear midpoint -> pixel midpoint")
+    // hi maps to topY (top of pane), lo maps to bottomY (bottom of pane).
+    eq(ChartScale.yPixel(200, lo: 100, hi: 200, topY: 0, bottomY: 100, log: false), 0, "hi -> topY")
+    eq(ChartScale.yPixel(100, lo: 100, hi: 200, topY: 0, bottomY: 100, log: false), 100, "lo -> bottomY")
+    // Log: geometric midpoint (sqrt(lo*hi)) maps to the pixel midpoint.
+    let geo = (100.0 * 200.0).squareRoot()
+    let yLog = ChartScale.yPixel(geo, lo: 100, hi: 200, topY: 0, bottomY: 100, log: true)
+    eq(yLog, 50, "log geometric-mid -> pixel midpoint", tol: 1e-6)
+}
+func testChartScaleDecimals() {
+    eqi(ChartScale.priceDecimals(step: 250), 0, "big step -> 0 decimals")
+    eqi(ChartScale.priceDecimals(step: 5), 0, "integer step -> 0 decimals")
+    ok(ChartScale.priceDecimals(step: 0.01) >= 2, "small step -> >=2 decimals")
+}
+
+// ===== LIVE backend integration test (opt-in via BLT_LIVE_BACKEND=1) =====
+// Boots no process itself — asserts the ALREADY-RUNNING self-contained backend (bltd_api.py)
+// serves a wire format that decodes into REAL Bar/LiveTick values, locking the contract the app
+// depends on end to end. Offline by default so the core suite stays deterministic.
+func liveGET(_ base: String, _ path: String, token: String?) -> [String: Any]? {
+    guard let url = URL(string: base + path) else { return nil }
+    var req = URLRequest(url: url); req.timeoutInterval = 8
+    if let t = token { req.setValue("Bearer \(t)", forHTTPHeaderField: "Authorization") }
+    let sem = DispatchSemaphore(value: 0); var out: [String: Any]? = nil
+    URLSession.shared.dataTask(with: req) { d, _, _ in defer { sem.signal() }
+        if let d = d { out = try? JSONSerialization.jsonObject(with: d) as? [String: Any] } }.resume()
+    _ = sem.wait(timeout: .now() + 10); return out
+}
+func livePOST(_ base: String, _ path: String, _ body: [String: Any]) -> [String: Any]? {
+    guard let url = URL(string: base + path) else { return nil }
+    var req = URLRequest(url: url); req.httpMethod = "POST"; req.timeoutInterval = 8
+    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+    let sem = DispatchSemaphore(value: 0); var out: [String: Any]? = nil
+    URLSession.shared.dataTask(with: req) { d, _, _ in defer { sem.signal() }
+        if let d = d { out = try? JSONSerialization.jsonObject(with: d) as? [String: Any] } }.resume()
+    _ = sem.wait(timeout: .now() + 10); return out
+}
+func testLiveBackendIntegration() {
+    let base = ProcessInfo.processInfo.environment["BLT_BACKEND_URL"] ?? "http://127.0.0.1:8787"
+    // 1) sign in -> token
+    guard let auth = livePOST(base, "/auth/signin", ["email": "local@blacklabel", "password": "local-session"]),
+          let token = auth["token"] as? String, !token.isEmpty else {
+        ok(false, "[integration] backend sign-in returns a token"); return
+    }
+    ok(true, "[integration] backend sign-in returns a token")
+    // 2) symbols -> pick busiest captured symbol
+    guard let symsObj = liveGET(base, "/api/symbols", token: token) else { ok(false, "[integration] /api/symbols reachable"); return }
+    let syms = FeedSymbols.decode(symsObj)
+    guard let sym = syms.busiest ?? syms.pickerList.first else { ok(false, "[integration] store has a captured symbol"); return }
+    ok(true, "[integration] store has a captured symbol (\(sym))")
+    // 3) /api/recent decodes into REAL bars with sane geometry (high>=low, high>=close, sorted)
+    let enc = sym.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? sym
+    guard let recent = liveGET(base, "/api/recent?symbol=\(enc)&limit=400", token: token) else { ok(false, "[integration] /api/recent reachable"); return }
+    let bars = FeedBars.decode(recent)
+    ok(!bars.isEmpty, "[integration] /api/recent decodes into >=1 real Bar")
+    ok(bars.allSatisfy { $0.high >= $0.low && $0.high >= $0.close && $0.low <= $0.open }, "[integration] decoded bars have valid OHLC geometry")
+    ok(zip(bars, bars.dropFirst()).allSatisfy { $0.date <= $1.date }, "[integration] decoded bars are time-sorted oldest->newest")
+    ok(bars.allSatisfy { $0.open > 0 && $0.close > 0 }, "[integration] decoded bar prices are positive reals (not fabricated/zero)")
+    // 4) /api/live decodes into a LiveTick OR honest nil (gated) — never a bogus value
+    if let liveObj = liveGET(base, "/api/live?symbol=\(enc)", token: token) {
+        if let tick = LiveTick.decode(liveObj) {
+            ok(tick.price > 0 && tick.symbol.uppercased() == sym.uppercased(), "[integration] /api/live decodes a real tick for \(sym)")
+        } else {
+            ok((liveObj["gated"] as? Bool) == true || liveObj["symbol"] == nil, "[integration] /api/live honest gated/empty when no tick")
+        }
+    } else { ok(false, "[integration] /api/live reachable") }
+}
+
+// ChartScale axis intelligence
+testChartScaleNiceNum()
+testChartScaleTicks()
+testChartScalePriceDomainPad()
+testChartScaleYPixelLinearAndLog()
+testChartScaleDecimals()
+
 // Live feed decode
 testFeedBarsDecode()
 testFeedBarsEmptyAndMalformed()
@@ -1042,6 +1146,12 @@ testLiveTickDecode()
 testLiveFold()
 testCaptureStatusState()
 testFeedSymbolsPicker()
+
+// Opt-in live backend integration (locks the end-to-end wire contract on real captured data).
+if ProcessInfo.processInfo.environment["BLT_LIVE_BACKEND"] == "1" {
+    print("Running LIVE backend integration test (BLT_LIVE_BACKEND=1)...")
+    testLiveBackendIntegration()
+}
 
 try? FileManager.default.removeItem(at: tmpBase)   // clean temp test stores
 print("\n\(passed) passed, \(failed) failed")

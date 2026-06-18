@@ -81,6 +81,17 @@ if [ -f "/Applications/$APPNAME.app/Contents/Resources/Assets.car" ]; then
   cp -f "/Applications/$APPNAME.app/Contents/Resources/Assets.car" "$APP/Contents/Resources/" || true
 fi
 
+# --- bundle the SELF-CONTAINED data backend (stdlib-only Python; ships NO data) ---
+# The buyer's app captures THEIR OWN WealthCharts feed into THEIR OWN local SQLite store and
+# serves it on 127.0.0.1:8787. These are code only — the store is created empty at runtime.
+if [ -d "$ROOT/backend" ]; then
+  echo "==> Bundling self-contained backend (code only, no data)"
+  mkdir -p "$APP/Contents/Resources/backend"
+  cp -f "$ROOT/backend"/bltd_*.py "$APP/Contents/Resources/backend/"
+  cp -f "$ROOT/backend/launch-backend.sh" "$APP/Contents/Resources/backend/"
+  chmod +x "$APP/Contents/Resources/backend/launch-backend.sh"
+fi
+
 # --- adhoc sign with entitlements (sandbox + network client) ---
 # NOTE: ad-hoc signing does NOT use --options runtime and the entitlements deliberately
 # exclude the restricted applesignin entitlement — AMFI SIGKILLs an ad-hoc app that carries
@@ -102,6 +113,11 @@ if [ "${1:-}" == "--install" ]; then
   else
     cp -f "$APP/Contents/MacOS/$BIN_NAME" "$DEST/Contents/MacOS/$BIN_NAME"
     cp -f "$APP/Contents/Info.plist" "$DEST/Contents/Info.plist"
+    # Keep the bundled self-contained backend (code only) in sync on install.
+    if [ -d "$APP/Contents/Resources/backend" ]; then
+      rm -rf "$DEST/Contents/Resources/backend"
+      cp -Rf "$APP/Contents/Resources/backend" "$DEST/Contents/Resources/backend"
+    fi
   fi
   echo "==> Re-signing installed bundle (adhoc, with entitlements)"
   codesign --force --deep --sign - --entitlements "$SRC/app.entitlements" "$DEST"

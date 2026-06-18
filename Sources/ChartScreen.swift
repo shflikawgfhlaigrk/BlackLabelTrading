@@ -24,6 +24,7 @@ struct ChartIndicatorSet: Codable, Equatable {
     var vwapWindow = 20
     var rsiPeriod = 14
     var atrPeriod = 14
+    var logScale = false        // logarithmic price axis (for multiplicative instruments)
 }
 
 // Timeframe resampling: aggregate the user's base bars up to a coarser interval. This is an
@@ -307,8 +308,13 @@ struct ChartScreen: View {
             switch feed.state {
             case .offline:
                 EmptyState(icon: "wifi.slash", title: "Your data backend isn't running",
-                           hint: "Black Label Trading captures YOUR WealthCharts feed into a local store on this Mac and serves it to the app. Start the backend, then refresh. Or switch to Import to chart a CSV.")
-                GhostButton(label: "Retry connection", icon: "arrow.clockwise") { Task { await reconnectFeed() } }
+                           hint: "Black Label Trading ships its OWN data backend inside the app. It captures YOUR WealthCharts feed into a local store on this Mac (nothing leaves your machine) and serves it here. Start it, then refresh — or switch to Import to chart a CSV.")
+                HStack(spacing: 8) {
+                    GoldButton(label: "Start my backend", icon: "bolt.fill") {
+                        Task { loadingFeed = true; await feed.ensureBackendRunning(); await reconnectFeed(); loadingFeed = false }
+                    }
+                    GhostButton(label: "Retry connection", icon: "arrow.clockwise") { Task { await reconnectFeed() } }
+                }
             case .loggedOut, .notSignedIn, .connecting:
                 EmptyState(icon: "dot.radiowaves.left.and.right", title: "Connect your WealthCharts feed",
                            hint: "Open the capture window and sign into YOUR WealthCharts account. Bars start landing in your local store within ~30s — then they appear here. Nothing is ever fabricated.")
@@ -421,6 +427,7 @@ struct ChartScreen: View {
                 indToggle("RSI", $ind.rsi, BLTheme.blue)
                 indToggle("MACD", $ind.macd, BLTheme.goldDim)
                 indToggle("ATR", $ind.atr, BLTheme.red)
+                indToggle("Log", $ind.logScale, BLTheme.goldDim)
                 Spacer()
                 GhostButton(label: "Indicator settings", icon: "slider.horizontal.3") { showIndSettings.toggle() }
             }
@@ -473,10 +480,13 @@ struct ChartScreen: View {
     // MARK: Price chart card (candles + overlays + drawing layer + crosshair)
     private var priceChartCard: some View {
         let vis = visible
-        let lo = vis.map(\.low).min() ?? 0
-        let hi = vis.map(\.high).max() ?? 1
-        let pad = (hi - lo) * 0.06
-        let yDomain = (lo - pad)...(hi + pad)
+        let loRaw = vis.map(\.low).min() ?? 0
+        let hiRaw = vis.map(\.high).max() ?? 1
+        // Shared auto-fit (nice padding) — identical math to the headless render proof.
+        let dom = ChartScale.priceDomain(low: loRaw, high: hiRaw)
+        let yDomain = dom.lo...dom.hi
+        // Nice-tick gridline values for the y-axis (1/2/2.5/5 × 10ⁿ steps).
+        let yTicks = ChartScale.ticks(lo: dom.lo, hi: dom.hi, target: 7)
         let xLo = vis.first?.index ?? 0
         let xHi = (vis.last?.index ?? 1) + 1
         // Indicator series aligned to the (full) candle index space, then filtered to visible.
@@ -538,8 +548,8 @@ struct ChartScreen: View {
                 }
             }
             .chartXScale(domain: Double(xLo)...Double(xHi))
-            .chartYScale(domain: yDomain)
-            .chartYAxis { AxisMarks(position: .trailing) { v in AxisGridLine().foregroundStyle(BLTheme.stroke.opacity(0.4))
+            .chartYScale(domain: yDomain, type: (ind.logScale && dom.lo > 0) ? .log : .linear)
+            .chartYAxis { AxisMarks(position: .trailing, values: yTicks) { v in AxisGridLine().foregroundStyle(BLTheme.stroke.opacity(0.4))
                 AxisValueLabel { if let d = v.as(Double.self) { Text(TradeMath.num(d)).font(.system(size: 9)).foregroundStyle(BLTheme.sub) } } } }
             .chartXAxis { AxisMarks { v in AxisGridLine().foregroundStyle(BLTheme.stroke.opacity(0.3))
                 AxisValueLabel { if let i = v.as(Int.self), let c = candles.first(where: { $0.index == i }) {

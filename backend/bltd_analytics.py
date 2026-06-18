@@ -1,0 +1,273 @@
+"""Black Label Trading — analytics spine (full backtest statistics, screener, studies).
+
+SELF-CONTAINED, pure-stdlib. Builds on bltd_store's engine math (same OOS verdict, same bars in)
+but adds the *expensive* analytics a paid terminal needs and the cheap store omitted:
+
+  - full_backtest(): a complete report — every OOS trade, the equity curve (cumulative R and
+    cumulative points), and the headline stats (win rate, expectancy, profit factor, max
+    drawdown, Sharpe, Sortino, avg win/loss, payoff, longest streaks).
+  - screen(): run every enabled engine across a set of symbols and rank by proven OOS edge.
+  - studies(): chart studies computed from real bars — EMA, VWAP, RSI, Bollinger bands.
+
+ZERO fabrication: every number traces to real captured bars passed in. Empty/insufficient input
+yields an explicit "insufficient" report, never an invented stat. Nothing is hardcoded — callers
+pass the buyer's tuned config.
+"""
+from __future__ import annotations
+
+import math
+
+import bltd_store as S
+
+
+# ===========================================================================
+# full backtest report (trades + equity curve + headline stats)
+# ===========================================================================
+def _trades_for(engine: str, ohlc, cfg):
+    """The OOS trade list for an engine on a bar series, using the buyer's config. Mirrors the
+    same OOS split + walk the gate uses, so the report and the gate agree exactly."""
+    oos_frac = cfg.get("oosFrac", S.OOS_FRAC)
+    lookback = cfg.get("lookback", S.LOOKBACK)
+    split = int(len(ohlc) * (1.0 - oos_frac))
+    oos = ohlc[split:]
+    if engine == "meanrev":
+        return S._mr_trades(oos, lookback, cfg), split
+    if engine in ("breakout", "research"):
+        closes = [b[3] for b in oos]
+        target_r = cfg.get("bkTargetR", S.BK_TARGET_R)
+        trades = []
+        i = lookback
+        n = len(closes)
+        while i < n:
+            prior = closes[i - lookback:i]
+            last = closes[i]
+            if not prior:
+                i += 1
+                continue
+            if last > max(prior):
+                direction, stop = "long", min(prior)
+            elif last < min(prior):
+                direction, stop = "short", max(prior)
+            else:
+                i += 1
+                continue
+            t = S._bk_simulate(closes, i, direction, last, stop, target_r)
+            if not t:
+                i += 1
+                continue
+            trades.append(t)
+            i += max(1, t["held"])
+        return trades, split
+    return [], split
+
+
+def _stats(trades):
+    """Headline stats over a trade list. Pure. Returns explicit zeros (not None) on empty."""
+    n = len(trades)
+    if n == 0:
+        return {"trades": 0, "wins": 0, "losses": 0, "winRate": 0.0, "expectancyR": 0.0,
+                "netPts": 0.0, "totalR": 0.0, "profitFactor": 0.0, "maxDrawdownR": 0.0,
+                "sharpe": 0.0, "sortino": 0.0, "avgWinR": 0.0, "avgLossR": 0.0, "payoff": 0.0,
+                "longestWin": 0, "longestLoss": 0}
+    rs = [t["r"] for t in trades]
+    wins_r = [r for r in rs if r > 0]
+    loss_r = [r for r in rs if r < 0]
+    wins, losses = len(wins_r), len(loss_r)
+    total_r = sum(rs)
+    expectancy = total_r / n
+    gross_win = sum(wins_r)
+    gross_loss = -sum(loss_r)
+    pf = (gross_win / gross_loss) if gross_loss > 0 else gross_win
+    net_pts = sum((t["exit"] - t["entry"]) if t["dir"] == "long" else (t["entry"] - t["exit"]) for t in trades)
+    # equity-curve drawdown in R
+    peak = cum = 0.0
+    mdd = 0.0
+    for r in rs:
+        cum += r
+        peak = max(peak, cum)
+        mdd = min(mdd, cum - peak)
+    # Sharpe / Sortino on per-trade R (annualization is meaningless here; trade-level ratio)
+    mean = expectancy
+    var = sum((r - mean) ** 2 for r in rs) / n
+    sd = math.sqrt(var) if var > 0 else 0.0
+    sharpe = (mean / sd * math.sqrt(n)) if sd > 0 else 0.0
+    downside = [min(0.0, r - 0.0) for r in rs]
+    dvar = sum(d * d for d in downside) / n
+    dsd = math.sqrt(dvar) if dvar > 0 else 0.0
+    sortino = (mean / dsd * math.sqrt(n)) if dsd > 0 else 0.0
+    avg_win = (gross_win / wins) if wins else 0.0
+    avg_loss = (-gross_loss / losses) if losses else 0.0
+    payoff = (avg_win / abs(avg_loss)) if avg_loss != 0 else 0.0
+    # streaks
+    lw = ll = cw = cl = 0
+    for r in rs:
+        if r > 0:
+            cw += 1
+            cl = 0
+        elif r < 0:
+            cl += 1
+            cw = 0
+        else:
+            cw = cl = 0
+        lw = max(lw, cw)
+        ll = max(ll, cl)
+    return {"trades": n, "wins": wins, "losses": losses, "winRate": round(wins / n, 4),
+            "expectancyR": round(expectancy, 4), "netPts": round(net_pts, 4),
+            "totalR": round(total_r, 4), "profitFactor": round(pf, 4),
+            "maxDrawdownR": round(mdd, 4), "sharpe": round(sharpe, 4), "sortino": round(sortino, 4),
+            "avgWinR": round(avg_win, 4), "avgLossR": round(avg_loss, 4), "payoff": round(payoff, 4),
+            "longestWin": lw, "longestLoss": ll}
+
+
+def _equity_curve(trades):
+    """Cumulative R and cumulative points after each trade — the equity curve points."""
+    curve = []
+    cum_r = cum_pts = 0.0
+    for idx, t in enumerate(trades):
+        cum_r += t["r"]
+        pts = (t["exit"] - t["entry"]) if t["dir"] == "long" else (t["entry"] - t["exit"])
+        cum_pts += pts
+        curve.append({"i": idx, "cumR": round(cum_r, 4), "cumPts": round(cum_pts, 4),
+                      "r": round(t["r"], 4), "dir": t["dir"]})
+    return curve
+
+
+def full_backtest(engine: str, ohlc, cfg=None) -> dict:
+    """A complete OOS backtest report for one engine on a bar series. Honest 'insufficient'
+    on too-few bars — never a fabricated stat."""
+    cfg = cfg or S.CONFIG_DEFAULTS
+    lookback = cfg.get("lookback", S.LOOKBACK)
+    if engine not in S.PROVERS:
+        return {"ok": False, "engine": engine, "reason": f"unknown engine '{engine}'",
+                "stats": _stats([]), "curve": [], "enoughBars": False}
+    if len(ohlc) < lookback + 2:
+        return {"ok": False, "engine": engine,
+                "reason": f"insufficient bars ({len(ohlc)}) — arms at >= {lookback + 2}",
+                "stats": _stats([]), "curve": [], "enoughBars": False}
+    trades, split = _trades_for(engine, ohlc, cfg)
+    stats = _stats(trades)
+    verdict = S.PROVERS[engine](ohlc, cfg)
+    return {"ok": bool(verdict.get("ok")), "engine": engine, "reason": verdict.get("reason", ""),
+            "stats": stats, "curve": _equity_curve(trades), "enoughBars": True,
+            "oosSplit": split, "oosBars": len(ohlc) - split, "totalBars": len(ohlc)}
+
+
+# ===========================================================================
+# screener — run engines across symbols, rank by edge
+# ===========================================================================
+def screen(store, symbols, engines, cfg=None) -> list[dict]:
+    """For every (engine, symbol), run the gate and return a ranked row list. Proven edges first,
+    then by net points. Pure read over the store. Honest: rows with too-few bars are flagged
+    'warming' rather than dropped, so the screener never lies by omission."""
+    cfg = cfg or store.config()
+    lookback = cfg.get("lookback", S.LOOKBACK)
+    rows = []
+    for sym in symbols:
+        ohlc = store.ohlc(sym)
+        bars = len(ohlc)
+        for eng in engines:
+            if eng not in S.PROVERS:
+                continue
+            if bars < lookback + 2:
+                rows.append({"engine": eng, "symbol": sym, "edge": False, "warming": True,
+                             "bars": bars, "winRate": 0.0, "netPts": 0.0, "expectancyR": 0.0,
+                             "trades": 0, "reason": f"warming ({bars} bars, arms at {lookback + 2})"})
+                continue
+            v = S.PROVERS[eng](ohlc, cfg)
+            rows.append({"engine": eng, "symbol": sym, "edge": bool(v.get("ok")), "warming": False,
+                         "bars": bars, "winRate": v.get("winRate", 0.0), "netPts": v.get("netPts", 0.0),
+                         "expectancyR": v.get("expectancyR", 0.0), "trades": v.get("trades", 0),
+                         "reason": v.get("reason", "")})
+    rows.sort(key=lambda r: (not r["edge"], r["warming"], -r["netPts"]))
+    return rows
+
+
+# ===========================================================================
+# chart studies — EMA / VWAP / RSI / Bollinger from real OHLC bars
+# ===========================================================================
+def ema(values, span):
+    if not values:
+        return []
+    k = 2.0 / (span + 1.0)
+    out = [values[0]]
+    for v in values[1:]:
+        out.append(out[-1] + k * (v - out[-1]))
+    return out
+
+
+def sma(values, window):
+    out = []
+    for i in range(len(values)):
+        if i + 1 < window:
+            out.append(None)
+        else:
+            out.append(sum(values[i + 1 - window:i + 1]) / window)
+    return out
+
+
+def rsi(closes, period=14):
+    """Wilder's RSI. Returns a list aligned to closes (None until warmed)."""
+    n = len(closes)
+    out = [None] * n
+    if n < period + 1:
+        return out
+    gains = losses = 0.0
+    for i in range(1, period + 1):
+        ch = closes[i] - closes[i - 1]
+        gains += max(ch, 0.0)
+        losses += max(-ch, 0.0)
+    avg_gain = gains / period
+    avg_loss = losses / period
+    out[period] = 100.0 if avg_loss == 0 else 100.0 - 100.0 / (1.0 + avg_gain / avg_loss)
+    for i in range(period + 1, n):
+        ch = closes[i] - closes[i - 1]
+        avg_gain = (avg_gain * (period - 1) + max(ch, 0.0)) / period
+        avg_loss = (avg_loss * (period - 1) + max(-ch, 0.0)) / period
+        out[i] = 100.0 if avg_loss == 0 else 100.0 - 100.0 / (1.0 + avg_gain / avg_loss)
+    return out
+
+
+def bollinger(closes, window=20, mult=2.0):
+    """(mid, upper, lower) SMA-based Bollinger bands, aligned to closes (None until warmed)."""
+    mid = sma(closes, window)
+    upper = [None] * len(closes)
+    lower = [None] * len(closes)
+    for i in range(len(closes)):
+        if i + 1 < window:
+            continue
+        seg = closes[i + 1 - window:i + 1]
+        m = mid[i]
+        sd = math.sqrt(sum((x - m) ** 2 for x in seg) / window)
+        upper[i] = m + mult * sd
+        lower[i] = m - mult * sd
+    return mid, upper, lower
+
+
+def vwap(ohlc):
+    """Running VWAP from typical price (h+l+c)/3 with uniform volume (volume not in WC bars).
+    With no real volume this is the running average of typical price — labeled as such by the UI."""
+    out = []
+    cum = 0.0
+    for i, (o, h, l, c) in enumerate(ohlc):
+        tp = (h + l + c) / 3.0
+        cum += tp
+        out.append(cum / (i + 1))
+    return out
+
+
+def studies(ohlc, cfg=None) -> dict:
+    """All chart studies for a bar series, computed from real bars. Returns aligned arrays; the
+    UI overlays whichever the buyer enables. None entries mark not-yet-warmed positions."""
+    cfg = cfg or S.CONFIG_DEFAULTS
+    closes = [b[3] for b in ohlc]
+    if not closes:
+        return {"emaFast": [], "emaSlow": [], "vwap": [], "rsi": [],
+                "bbMid": [], "bbUpper": [], "bbLower": []}
+    mid, upper, lower = bollinger(closes, 20, 2.0)
+    return {"emaFast": [round(x, 6) for x in ema(closes, 8)],
+            "emaSlow": [round(x, 6) for x in ema(closes, 21)],
+            "vwap": [round(x, 6) for x in vwap(ohlc)],
+            "rsi": [None if x is None else round(x, 3) for x in rsi(closes, 14)],
+            "bbMid": [None if x is None else round(x, 6) for x in mid],
+            "bbUpper": [None if x is None else round(x, 6) for x in upper],
+            "bbLower": [None if x is None else round(x, 6) for x in lower]}

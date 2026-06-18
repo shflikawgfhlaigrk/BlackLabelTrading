@@ -49,6 +49,8 @@ final class FeedClient: ObservableObject {
     // creds and mints a per-deployment token — a real deployment would issue per-user tokens).
     func connect(email: String) async {
         connecting = true; defer { connecting = false }
+        // Self-contained: start the bundled backend if the local one isn't already up.
+        await ensureBackendRunning()
         guard let u = url("/auth/signin") else { state = .offline; return }
         var req = URLRequest(url: u); req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -87,6 +89,47 @@ final class FeedClient: ObservableObject {
             lastError = friendly(error)
             return nil
         }
+    }
+
+    // MARK: - Self-contained backend bootstrap. The product SHIPS its own data backend inside the
+    // app bundle (Contents/Resources/backend/launch-backend.sh, stdlib-only Python). When the local
+    // backend on the default URL isn't reachable, the app starts the BUNDLED one so the buyer gets
+    // a working, self-contained feed/store with no manual setup. Only attempted for a localhost
+    // default URL — never auto-spawns anything for a buyer-configured remote host. Idempotent.
+    private var triedBootstrap = false
+    @discardableResult
+    func ensureBackendRunning() async -> Bool {
+        // Only for the default localhost backend; a custom baseURL is the buyer's own choice.
+        let u = baseURL.trimmingCharacters(in: .whitespaces)
+        guard u == Self.defaultURL || u.hasPrefix("http://127.0.0.1") || u.hasPrefix("http://localhost") else { return false }
+        if await healthOK() { return true }
+        guard !triedBootstrap else { return await healthOK() }
+        triedBootstrap = true
+        guard let script = Bundle.main.url(forResource: "launch-backend", withExtension: "sh", subdirectory: "backend")
+                ?? bundledBackendScript() else { return false }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/bash")
+        proc.arguments = [script.path, "--bg"]
+        do { try proc.run() } catch { lastError = "Couldn't start bundled backend"; return false }
+        // Poll briefly for the backend to come up (it binds fast; SQLite store is created empty).
+        for _ in 0..<20 {
+            if await healthOK() { return true }
+            try? await Task.sleep(nanoseconds: 300_000_000)
+        }
+        return await healthOK()
+    }
+    private func bundledBackendScript() -> URL? {
+        // Fallback lookup (subdirectory resource APIs can vary): Resources/backend/launch-backend.sh.
+        let res = Bundle.main.resourceURL?.appendingPathComponent("backend/launch-backend.sh")
+        if let r = res, FileManager.default.fileExists(atPath: r.path) { return r }
+        return nil
+    }
+    private func healthOK() async -> Bool {
+        guard let u = url("/health") else { return false }
+        do {
+            let (_, resp) = try await session.data(from: u)
+            return (resp as? HTTPURLResponse)?.statusCode == 200
+        } catch { return false }
     }
 
     // MARK: - Capture status + symbol catalogue (the honest feed banner).
