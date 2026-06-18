@@ -75,6 +75,7 @@ struct GoldButton: View {
             .font(.system(size: 13.5, weight: .bold, design: .rounded)).foregroundColor(Color(hex: 0x1A1305))
             .padding(.vertical, 11).padding(.horizontal, 18).frame(maxWidth: fill ? .infinity : nil)
             .background(BLTheme.goldGrad).clipShape(Capsule())
+            .holoSheen()                                   // moving iridescent light sweep on the primary CTA
             .overlay(Capsule().stroke(Color.white.opacity(hover ? 0.25 : 0.12), lineWidth: 1))
             .shadow(color: BLTheme.gold.opacity(hover ? 0.55 : 0.28), radius: hover ? 16 : 8, y: 3)
             .scaleEffect(hover ? 1.035 : 1)
@@ -112,9 +113,8 @@ struct Panel<Content: View>: View {
             content()
         }
         .padding(18).frame(maxWidth: .infinity, alignment: .leading)
-        .background(BLTheme.panelGrad).clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(BLTheme.hairline(accent), lineWidth: 1))
-        .shadow(color: Color.black.opacity(0.35), radius: 14, y: 6)
+        // Signature holographic surface — iridescent animated border + glow + pointer 3D tilt.
+        .holoCard(radius: 18)
     }
 }
 
@@ -140,7 +140,6 @@ struct StatusPill: View {
 // Premium hero stat card with icon badge + soft glow.
 struct MetricCard: View {
     let label: String; let value: String; let icon: String; var tint: Color = BLTheme.text
-    @State private var hover = false
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             Image(systemName: icon).font(.system(size: 14, weight: .bold)).foregroundColor(Color(hex: 0x1A1305))
@@ -150,11 +149,8 @@ struct MetricCard: View {
             Text(label.uppercased()).font(.system(size: 10.5, weight: .bold, design: .rounded)).foregroundColor(BLTheme.sub).tracking(0.6)
         }
         .padding(18).frame(maxWidth: .infinity, alignment: .leading)
-        .background(BLTheme.panelGrad).clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).stroke(BLTheme.hairline(), lineWidth: 1))
-        .shadow(color: Color.black.opacity(0.35), radius: 12, y: 5)
-        .scaleEffect(hover ? 1.02 : 1)
-        .onHover { h in withAnimation(.spring(response: 0.35, dampingFraction: 0.7)) { hover = h } }
+        // Holographic stat card (border iridescence + glow + pointer tilt come from the kit).
+        .holoCard(radius: 16)
     }
 }
 
@@ -184,9 +180,11 @@ struct EmptyState: View {
     let icon: String; let title: String; var hint = ""
     var body: some View {
         VStack(spacing: 12) {
+            // Glowing iconographic centerpiece — holographic empty state, never a flat message.
             Image(systemName: icon).font(.system(size: 30, weight: .semibold)).foregroundColor(Color(hex: 0x1A1305))
                 .frame(width: 64, height: 64).background(BLTheme.goldGrad.opacity(0.85)).clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-                .shadow(color: BLTheme.gold.opacity(0.3), radius: 12, y: 4)
+                .holoSheen()
+                .glowPulse()
             Text(title).font(.system(size: 16, weight: .bold, design: .rounded)).foregroundColor(BLTheme.text)
             if !hint.isEmpty {
                 Text(hint).font(.system(size: 12.5, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)

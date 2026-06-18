@@ -3,6 +3,13 @@
 <plist version="1.0"><dict>
   <key>com.apple.security.app-sandbox</key><true/>
   <key>com.apple.security.network.client</key><true/>
-  <key>com.apple.developer.applesignin</key>
-  <array><string>Default</string></array>
+  <!--
+    NOTE: "Sign in with Apple" (com.apple.developer.applesignin) is a RESTRICTED
+    entitlement. AMFI SIGKILLs an ad-hoc-signed app that carries it, because it can
+    only be honored by a build signed with a Developer ID / provisioning profile.
+    It is intentionally omitted from the ad-hoc build so the app launches. A
+    Developer-ID release build (build-developer-id.sh) re-adds it; the Apple button
+    is gated at runtime on AppleSignInSupport.available so we never show an option
+    that can't complete.
+  -->
 </dict></plist>

@@ -34,6 +34,27 @@ struct Trade: Identifiable, Codable, Hashable {
     var pnl: Double = 0
     var notes: String = ""
     var created = Date()
+    // Journal depth fields (optional — default 0/[] so older saved data still decodes).
+    var exit: Double = 0                 // realized exit/fill price (0 = unset)
+    var closed: Date? = nil              // exit timestamp (for hold-time)
+    var maeR: Double = 0                 // max adverse excursion in R (>= 0; 0 = unknown)
+    var mfeR: Double = 0                 // max favorable excursion in R (>= 0; 0 = unknown)
+    var tags: [String] = []             // explicit setup/mistake/emotion tags
+
+    // Hold time in minutes (only when both timestamps exist).
+    var holdMinutes: Double {
+        guard let c = closed else { return 0 }
+        return max(0, c.timeIntervalSince(created) / 60)
+    }
+    // All tags: explicit field + #hashtags parsed from notes (de-duplicated, lowercased).
+    var allTags: [String] {
+        let hash = notes.split(whereSeparator: { $0 == " " || $0 == "\n" || $0 == "," })
+            .compactMap { $0.hasPrefix("#") ? String($0.dropFirst()).lowercased() : nil }
+            .filter { !$0.isEmpty }
+        var seen = Set<String>(); var out: [String] = []
+        for t in (tags.map { $0.lowercased() } + hash) where !t.isEmpty && !seen.contains(t) { seen.insert(t); out.append(t) }
+        return out
+    }
 
     // Risk per unit (absolute distance entry -> stop)
     var riskPerUnit: Double { abs(entry - stop) }
@@ -430,6 +451,28 @@ final class AppModel: ObservableObject {
     }
     func delete(_ t: Trade) { trades.removeAll { $0.id == t.id } }
 
+    // Import broker-CSV rows (already parsed) into the journal. Each becomes a closed Trade
+    // when it has a non-zero P&L (win/loss by sign). Returns the count actually imported.
+    @discardableResult
+    func importTrades(_ rows: [ImportedTrade]) -> Int {
+        var added: [Trade] = []
+        for r in rows {
+            var t = Trade()
+            t.symbol = r.symbol
+            t.direction = r.isLong ? .long : .short
+            t.entry = r.entry; t.exit = r.exit; t.size = max(0, r.qty)
+            t.pnl = r.pnl
+            t.result = r.pnl > 0 ? .win : (r.pnl < 0 ? .loss : .open)
+            t.maeR = max(0, r.maeR); t.mfeR = max(0, r.mfeR)
+            t.tags = r.tags
+            if let o = r.opened { t.created = o }
+            t.closed = r.closed
+            added.append(t)
+        }
+        trades.insert(contentsOf: added, at: 0)
+        return added.count
+    }
+
     // Signal log (honestly-graded session ledger)
     func commit(_ s: SignalLog) { signals.insert(s, at: 0) }
     func deleteSignal(_ s: SignalLog) { signals.removeAll { $0.id == s.id } }
@@ -556,4 +599,123 @@ enum AccountStore {
 final class Session: ObservableObject {
     @Published var signedIn = false
     @Published var email = ""
+}
+
+// MARK: - Local app settings (Google client ID) — on-device only.
+// The Google OAuth button is only shown once a client ID exists. The buyer can paste
+// their own client ID here (UserDefaults) so the option is never silently hidden — we
+// surface the field instead. Falls back to a build-time Info.plist value if present.
+enum AppSettingsStore {
+    static let googleClientIDKey = "com.blacklabel.trading.googleClientID"
+
+    /// The effective Google client ID: the user-entered value (UserDefaults) wins,
+    /// otherwise the build-time Info.plist value (normally empty).
+    static var googleClientID: String {
+        let user = (UserDefaults.standard.string(forKey: googleClientIDKey) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !user.isEmpty { return user }
+        return ((Bundle.main.object(forInfoDictionaryKey: "GoogleClientID") as? String) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+    static func setGoogleClientID(_ id: String) {
+        let v = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        if v.isEmpty { UserDefaults.standard.removeObject(forKey: googleClientIDKey) }
+        else { UserDefaults.standard.set(v, forKey: googleClientIDKey) }
+    }
+}
+
+// MARK: - WealthCharts account connection (on-device only — signals-only, manual execution)
+// HONEST FRAMING: This stores the buyer's OWN WealthCharts account reference on THIS Mac.
+// It is NOT a live broker feed and it does NOT auto-trade or move money. The username and
+// connection note live in UserDefaults; the password (if entered) lives in the macOS
+// Keychain — never in plaintext, never bundled, never sent anywhere by this app.
+struct WealthChartsAccount: Codable, Equatable {
+    var username: String = ""
+    var note: String = ""          // optional free-text label (e.g. "Topstep 50K eval feed")
+    var connectedAt: Date?          // when the user last saved a connection (local only)
+
+    var isConfigured: Bool { !username.trimmingCharacters(in: .whitespaces).isEmpty }
+}
+
+// Keychain helper — generic password item scoped to this app + the WC username.
+enum WCKeychain {
+    private static let service = "com.blacklabel.trading.wealthcharts"
+
+    static func setSecret(_ secret: String, account: String) {
+        let acct = account.isEmpty ? "_default" : account
+        delete(account: acct)
+        guard !secret.isEmpty else { return }
+        let q: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: acct,
+            kSecValueData as String: Data(secret.utf8),
+            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+        ]
+        SecItemAdd(q as CFDictionary, nil)
+    }
+    static func hasSecret(account: String) -> Bool {
+        let acct = account.isEmpty ? "_default" : account
+        let q: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: acct,
+            kSecReturnData as String: false,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+        return SecItemCopyMatching(q as CFDictionary, nil) == errSecSuccess
+    }
+    static func delete(account: String) {
+        let acct = account.isEmpty ? "_default" : account
+        let q: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: acct
+        ]
+        SecItemDelete(q as CFDictionary)
+    }
+}
+
+// Observable store for the WealthCharts connection. Username/note in UserDefaults,
+// password in Keychain. No network calls — purely local persistence.
+final class WealthChartsStore: ObservableObject {
+    @Published var account: WealthChartsAccount { didSet { persist() } }
+    @Published private(set) var hasSecret: Bool = false
+
+    private static let key = "com.blacklabel.trading.wealthcharts.account"
+
+    init() {
+        if let data = UserDefaults.standard.data(forKey: Self.key),
+           let acct = try? JSONDecoder().decode(WealthChartsAccount.self, from: data) {
+            account = acct
+        } else {
+            account = WealthChartsAccount()
+        }
+        hasSecret = WCKeychain.hasSecret(account: account.username)
+    }
+
+    private func persist() {
+        if let data = try? JSONEncoder().encode(account) {
+            UserDefaults.standard.set(data, forKey: Self.key)
+        }
+    }
+
+    /// Save the connection locally. Username/note persist to UserDefaults; the password,
+    /// if provided, goes to the Keychain (this device only). Stamps connectedAt.
+    func save(username: String, password: String, note: String) {
+        let u = username.trimmingCharacters(in: .whitespacesAndNewlines)
+        account.username = u
+        account.note = note.trimmingCharacters(in: .whitespacesAndNewlines)
+        account.connectedAt = Date()
+        if !password.isEmpty { WCKeychain.setSecret(password, account: u) }
+        hasSecret = WCKeychain.hasSecret(account: u)
+    }
+
+    /// Forget the connection entirely — wipes UserDefaults entry and Keychain secret.
+    func disconnect() {
+        WCKeychain.delete(account: account.username)
+        account = WealthChartsAccount()
+        UserDefaults.standard.removeObject(forKey: Self.key)
+        hasSecret = false
+    }
 }

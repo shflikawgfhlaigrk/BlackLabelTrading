@@ -82,12 +82,14 @@ struct EquityCurveCard: View {
 // MARK: - Signals (primary dashboard — user-driven / scenario scoring engine)
 struct SignalsScreen: View {
     @EnvironmentObject var model: AppModel
+    @EnvironmentObject var wc: WealthChartsStore
     @State private var inp = SignalInputs()
     @State private var scenarioIdx = 0
     @State private var committed = false
     @State private var priceStr = "5000"
     @State private var atrStr = "12"
     @State private var pvStr = "50"
+    @State private var showConnectWC = false
 
     private var result: SignalResult { SignalEngine.evaluate(inp) }
     private var gates: [GateCheck] { GateEngine.evaluate(inp, result) }
@@ -103,6 +105,9 @@ struct SignalsScreen: View {
                     Spacer()
                     StatusPill(text: "Scenario", tint: BLTheme.blue)
                 }
+
+                // Reachable WealthCharts entry point from the main dashboard (also in Settings).
+                wealthChartsBanner
 
                 // Hero signal card + composite.
                 signalCard
@@ -199,6 +204,33 @@ struct SignalsScreen: View {
         .onChange(of: priceStr) { _ in pushNumbers() }
         .onChange(of: atrStr) { _ in pushNumbers() }
         .onChange(of: pvStr) { _ in pushNumbers() }
+        .sheet(isPresented: $showConnectWC) { ConnectWealthChartsSheet().environmentObject(wc) }
+    }
+
+    // Reachable WealthCharts connection banner — visible on the primary dashboard.
+    private var wealthChartsBanner: some View {
+        let connected = wc.account.isConfigured
+        return HStack(spacing: 14) {
+            Image(systemName: connected ? "checkmark.seal.fill" : "link.badge.plus")
+                .font(.system(size: 16, weight: .bold)).foregroundColor(Color(hex: 0x1A1305))
+                .frame(width: 38, height: 38)
+                .background(connected ? AnyShapeStyle(LinearGradient(colors: [BLTheme.green, BLTheme.green.opacity(0.7)], startPoint: .top, endPoint: .bottom)) : AnyShapeStyle(BLTheme.goldGrad))
+                .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
+                .shadow(color: (connected ? BLTheme.green : BLTheme.gold).opacity(0.35), radius: 7, y: 2)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(connected ? "WealthCharts account connected" : "Connect your WealthCharts account")
+                    .font(.system(size: 14, weight: .bold, design: .rounded)).foregroundColor(BLTheme.text)
+                Text(connected
+                     ? "\(wc.account.username) · saved on this Mac. Signals-only, manual execution — no live feed wired."
+                     : "Add your WealthCharts account so it's on hand for the engine method. Saved on this Mac — signals-only, never auto-traded.")
+                    .font(.system(size: 11.5, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer()
+            GoldButton(label: connected ? "Manage" : "Connect", icon: connected ? "pencil" : "link") { showConnectWC = true }
+        }
+        .padding(16)
+        .holoCard(radius: 16)
     }
 
     // Hero card.
@@ -255,8 +287,8 @@ struct SignalsScreen: View {
             }
         }
         .padding(22)
-        .background(BLTheme.panelGrad).clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 22, style: .continuous).stroke(BLTheme.hairline(r.direction.tint), lineWidth: 1.2))
+        // Holographic hero surface + a direction-tinted glow on top (semantic long/short colour).
+        .holoCard(radius: 22)
         .shadow(color: r.direction.tint.opacity(0.18), radius: 26, y: 10)
         .animation(.spring(response: 0.4, dampingFraction: 0.8), value: r.direction)
     }
@@ -373,12 +405,26 @@ struct SignalsScreen: View {
 struct JournalScreen: View {
     @EnvironmentObject var model: AppModel
     @State private var editing: Trade?
+    @State private var showImport = false
+    @State private var query = ""
+    @State private var resultFilter: TradeResult? = nil
     let cols = [GridItem(.adaptive(minimum: 220), spacing: 14)]
+
+    // Global search/filter over the journal (symbol / tags / notes + result).
+    private var filtered: [Trade] {
+        model.trades.filter { t in
+            (resultFilter == nil || t.result == resultFilter) &&
+            (query.isEmpty || t.symbol.lowercased().contains(query.lowercased())
+                || t.notes.lowercased().contains(query.lowercased())
+                || t.allTags.contains { $0.contains(query.lowercased()) })
+        }
+    }
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(alignment: .top) {
-                ScreenTitle(title: "Journal", subtitle: "Every trade, with live risk math.", icon: "list.bullet.rectangle.fill")
+                ScreenTitle(title: "Journal", subtitle: "Every trade, with live risk math. Import your broker CSV, tag setups, track MAE/MFE + hold time.", icon: "list.bullet.rectangle.fill")
                 Spacer()
+                GhostButton(label: "Import CSV", icon: "square.and.arrow.down") { showImport = true }
                 GoldButton(label: "Log trade", icon: "plus") { editing = Trade() }
             }.padding(24)
             ScrollView {
@@ -391,20 +437,126 @@ struct JournalScreen: View {
                                    tint: model.totalPnL >= 0 ? BLTheme.green : BLTheme.red)
                     }
                     if model.trades.isEmpty {
-                        EmptyState(icon: "chart.xyaxis.line", title: "No trades logged yet", hint: "Tap “Log trade” to record an entry, stop, and target — the dashboard math updates live.")
+                        EmptyState(icon: "chart.xyaxis.line", title: "No trades logged yet", hint: "Tap “Log trade” to record an entry, stop, and target — or “Import CSV” to bring in your broker export. The dashboard math updates live.")
                             .padding(.top, 30)
                     } else {
-                        LazyVStack(spacing: 10) { ForEach(model.trades) { t in tradeRow(t) } }
+                        // Search + result filter (global).
+                        HStack(spacing: 10) {
+                            HStack(spacing: 7) {
+                                Image(systemName: "magnifyingglass").font(.system(size: 11)).foregroundColor(BLTheme.sub)
+                                TextField("Search symbol, tag, or note…", text: $query).textFieldStyle(.plain).font(.system(size: 12.5, design: .rounded)).foregroundColor(BLTheme.text)
+                            }.padding(.vertical, 8).padding(.horizontal, 11).background(BLTheme.bg2).clipShape(RoundedRectangle(cornerRadius: 9)).overlay(RoundedRectangle(cornerRadius: 9).stroke(BLTheme.stroke, lineWidth: 1))
+                            ForEach([Optional<TradeResult>.none, .some(.win), .some(.loss), .some(.open)], id: \.self) { rf in
+                                Button { resultFilter = rf } label: {
+                                    Text(rf.map { $0.label } ?? "All").font(.system(size: 11.5, weight: .semibold, design: .rounded))
+                                        .foregroundColor(resultFilter == rf ? Color(hex: 0x1A1305) : BLTheme.sub)
+                                        .padding(.vertical, 6).padding(.horizontal, 12)
+                                        .background(resultFilter == rf ? AnyShapeStyle(BLTheme.goldGrad) : AnyShapeStyle(BLTheme.bg2)).clipShape(Capsule())
+                                        .overlay(Capsule().stroke(BLTheme.stroke, lineWidth: 1))
+                                }.buttonStyle(.plain)
+                            }
+                        }
+                        if filtered.isEmpty {
+                            EmptyState(icon: "magnifyingglass", title: "No trades match", hint: "Adjust your search or filter.").padding(.top, 20)
+                        } else {
+                            Text("\(filtered.count) of \(model.trades.count) trades").font(.system(size: 10.5, design: .rounded)).foregroundColor(BLTheme.sub).frame(maxWidth: .infinity, alignment: .leading)
+                            LazyVStack(spacing: 10) { ForEach(filtered) { t in tradeRow(t) } }
+                        }
                     }
                 }
                 .padding(.horizontal, 24).padding(.bottom, 24)
             }
         }
         .sheet(item: $editing) { t in TradeEditor(trade: t).environmentObject(model) }
+        .sheet(isPresented: $showImport) { JournalImportSheet().environmentObject(model) }
     }
     @ViewBuilder private func tradeRow(_ t: Trade) -> some View {
         TradeRowView(trade: t) { editing = t }
             .contextMenu { Button("Delete", role: .destructive) { model.delete(t) } }
+    }
+}
+
+// Broker-CSV journal import: paste/import, auto-map columns, preview, then commit. Honest —
+// only mappable rows import; the mapping + skipped count are shown so nothing is silently faked.
+struct JournalImportSheet: View {
+    @EnvironmentObject var model: AppModel
+    @Environment(\.dismiss) var dismiss
+    @State private var text = ""
+    @State private var parsed: (rows: [ImportedTrade], skipped: Int, mapping: [String: Int])? = nil
+    @State private var imported = 0
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                Text("Import broker CSV").font(.system(size: 18, weight: .heavy, design: .rounded)).foregroundColor(BLTheme.text)
+                Text("Paste your broker/platform trade export. We auto-detect columns (symbol, side, qty, entry/exit, P&L, times, MAE/MFE, tags). Only mappable rows import — nothing is invented.")
+                    .font(.system(size: 11.5, design: .rounded)).foregroundColor(BLTheme.sub).fixedSize(horizontal: false, vertical: true)
+                TextEditor(text: $text).font(.system(size: 11, design: .monospaced)).foregroundColor(BLTheme.text)
+                    .scrollContentBackground(.hidden).padding(8).frame(height: 160)
+                    .background(BLTheme.bg2).clipShape(RoundedRectangle(cornerRadius: 10)).overlay(RoundedRectangle(cornerRadius: 10).stroke(BLTheme.stroke, lineWidth: 1))
+                HStack {
+                    GhostButton(label: "Import file", icon: "doc.badge.plus") { importFile() }
+                    GoldButton(label: "Preview", icon: "eye") { parsed = BrokerCSV.parse(text); imported = 0 }
+                    Spacer()
+                }
+                if let p = parsed {
+                    if p.rows.isEmpty {
+                        EmptyState(icon: "exclamationmark.triangle", title: "No mappable rows",
+                                   hint: "Couldn't find a P&L column or an entry/exit pair. Make sure the first row is a header with recognizable column names.")
+                    } else {
+                        // Mapping summary.
+                        Panel(title: "Detected columns", icon: "checkmark.seal.fill", accent: BLTheme.green) {
+                            FlowTags(p.mapping.keys.sorted())
+                            Text("\(p.rows.count) rows ready · \(p.skipped) skipped").font(.system(size: 11, weight: .semibold, design: .rounded)).foregroundColor(BLTheme.sub)
+                        }
+                        // Preview first 8.
+                        Panel(title: "Preview", icon: "list.bullet", accent: BLTheme.gold) {
+                            ForEach(Array(p.rows.prefix(8).enumerated()), id: \.offset) { (_, r) in
+                                HStack(spacing: 10) {
+                                    Text(r.symbol.isEmpty ? "—" : r.symbol).font(.system(size: 12, weight: .bold, design: .rounded)).foregroundColor(BLTheme.text).frame(width: 60, alignment: .leading)
+                                    StatusPill(text: r.isLong ? "Long" : "Short", tint: r.isLong ? BLTheme.green : BLTheme.red)
+                                    if r.qty > 0 { Text("×\(TradeMath.numTrim(r.qty))").font(.system(size: 11, design: .rounded)).foregroundColor(BLTheme.sub) }
+                                    Spacer()
+                                    Text((r.pnl >= 0 ? "+" : "") + TradeMath.money2(r.pnl)).font(.system(size: 12.5, weight: .heavy, design: .rounded)).monospacedDigit().foregroundColor(r.pnl >= 0 ? BLTheme.green : BLTheme.red)
+                                }.padding(.vertical, 6).padding(.horizontal, 11).background(BLTheme.bg2).clipShape(RoundedRectangle(cornerRadius: 8))
+                            }
+                            if p.rows.count > 8 { Text("+ \(p.rows.count - 8) more").font(.system(size: 10.5, design: .rounded)).foregroundColor(BLTheme.sub) }
+                        }
+                    }
+                }
+                if imported > 0 {
+                    Text("Imported \(imported) trades into your journal.").font(.system(size: 12.5, weight: .bold, design: .rounded)).foregroundColor(BLTheme.green)
+                }
+                HStack { Spacer()
+                    GhostButton(label: imported > 0 ? "Done" : "Cancel") { dismiss() }
+                    if let p = parsed, !p.rows.isEmpty, imported == 0 {
+                        GoldButton(label: "Import \(p.rows.count) trades", icon: "tray.and.arrow.down") {
+                            imported = model.importTrades(p.rows)
+                        }
+                    }
+                }
+            }.padding(24).frame(width: 600)
+        }.frame(width: 600, height: 640).background(BLTheme.bg)
+    }
+    private func importFile() {
+        let panel = NSOpenPanel(); panel.allowedContentTypes = [.commaSeparatedText, .plainText]; panel.allowsMultipleSelection = false
+        panel.begin { resp in
+            if resp == .OK, let url = panel.url, let s = try? String(contentsOf: url, encoding: .utf8) { text = s; parsed = BrokerCSV.parse(s); imported = 0 }
+        }
+    }
+}
+
+// Simple wrapping tag row for the detected-columns summary.
+struct FlowTags: View {
+    let items: [String]
+    init(_ items: [String]) { self.items = items }
+    var body: some View {
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: 80), spacing: 6)], alignment: .leading, spacing: 6) {
+            ForEach(items, id: \.self) { t in
+                Text(t.uppercased()).font(.system(size: 10, weight: .heavy, design: .rounded)).foregroundColor(BLTheme.gold).tracking(0.4)
+                    .padding(.vertical, 4).padding(.horizontal, 9).background(BLTheme.gold.opacity(0.14)).clipShape(Capsule())
+                    .overlay(Capsule().stroke(BLTheme.gold.opacity(0.4), lineWidth: 1))
+            }
+        }
     }
 }
 
@@ -451,6 +603,8 @@ struct TradeEditor: View {
     @State var trade: Trade
     @State private var entry = ""; @State private var stop = ""; @State private var target = ""
     @State private var size = ""; @State private var pnl = ""
+    @State private var exit = ""; @State private var mae = ""; @State private var mfe = ""
+    @State private var tagsText = ""; @State private var hasClose = false
     var body: some View {
         ScrollView {
         VStack(alignment: .leading, spacing: 16) {
@@ -481,27 +635,51 @@ struct TradeEditor: View {
                     .pickerStyle(.segmented).labelsHidden()
             }
             if trade.result != .open {
-                Field(title: "Realized P&L ($)", text: $pnl, prompt: trade.result == .loss ? "-200" : "450")
+                HStack(spacing: 12) {
+                    Field(title: "Realized P&L ($)", text: $pnl, prompt: trade.result == .loss ? "-200" : "450")
+                    Field(title: "Exit price", text: $exit, prompt: "5012")
+                }
+                HStack(spacing: 12) {
+                    Field(title: "MAE (R)", text: $mae, prompt: "0.6")
+                    Field(title: "MFE (R)", text: $mfe, prompt: "2.4")
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("CLOSE TIME").font(.system(size: 10, weight: .bold, design: .rounded)).foregroundColor(BLTheme.sub).tracking(0.5)
+                        HStack {
+                            Toggle("", isOn: $hasClose).labelsHidden().tint(BLTheme.gold)
+                            if hasClose {
+                                DatePicker("", selection: Binding(get: { trade.closed ?? Date() }, set: { trade.closed = $0 }), displayedComponents: [.date, .hourAndMinute])
+                                    .labelsHidden().datePickerStyle(.compact)
+                            } else { Text("open-ended").font(.system(size: 11, design: .rounded)).foregroundColor(BLTheme.sub) }
+                        }
+                    }
+                }
             }
+            Field(title: "Tags (comma-separated)", text: $tagsText, prompt: "breakout, fomo, a-setup")
             VStack(alignment: .leading, spacing: 4) {
                 Text("NOTES").font(.system(size: 10, weight: .bold, design: .rounded)).foregroundColor(BLTheme.sub)
                 TextEditor(text: $trade.notes).font(.system(size: 13, design: .rounded)).foregroundColor(BLTheme.text)
                     .scrollContentBackground(.hidden).padding(8).frame(height: 60).background(BLTheme.bg2).clipShape(RoundedRectangle(cornerRadius: 10))
+                Text("Tip: #hashtags in notes also count as tags in Analytics.").font(.system(size: 10, design: .rounded)).foregroundColor(BLTheme.sub)
             }
             HStack { Spacer()
                 GhostButton(label: "Cancel") { dismiss() }
                 GoldButton(label: "Save trade", icon: "checkmark") { var t = computed(); t.id = trade.id; model.upsert(t); dismiss() }
             }
         }
-        .padding(24).frame(width: 520)
+        .padding(24).frame(width: 540)
         }
-        .frame(width: 520, height: 560).background(BLTheme.bg)
+        .frame(width: 540, height: 700).background(BLTheme.bg)
         .onAppear {
             entry = trade.entry > 0 ? trimmed(trade.entry) : ""
             stop = trade.stop > 0 ? trimmed(trade.stop) : ""
             target = trade.target > 0 ? trimmed(trade.target) : ""
             size = trade.size > 0 ? trimmed(trade.size) : ""
             pnl = trade.pnl != 0 ? trimmed(trade.pnl) : ""
+            exit = trade.exit > 0 ? trimmed(trade.exit) : ""
+            mae = trade.maeR > 0 ? trimmed(trade.maeR) : ""
+            mfe = trade.mfeR > 0 ? trimmed(trade.mfeR) : ""
+            tagsText = trade.tags.joined(separator: ", ")
+            hasClose = trade.closed != nil
         }
     }
     private func trimmed(_ v: Double) -> String { v == v.rounded() ? String(Int(v)) : String(v) }
@@ -510,6 +688,11 @@ struct TradeEditor: View {
         t.entry = Double(entry) ?? 0; t.stop = Double(stop) ?? 0; t.target = Double(target) ?? 0
         t.size = Double(size) ?? 0
         t.pnl = t.result == .open ? 0 : (Double(pnl) ?? 0)
+        t.exit = Double(exit) ?? 0
+        t.maeR = Double(mae) ?? 0
+        t.mfeR = Double(mfe) ?? 0
+        t.closed = (t.result != .open && hasClose) ? (trade.closed ?? Date()) : nil
+        t.tags = tagsText.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces).lowercased() }.filter { !$0.isEmpty }
         return t
     }
 }
@@ -615,15 +798,47 @@ struct SettingsScreen: View {
     @EnvironmentObject var session: Session
     @EnvironmentObject var model: AppModel
     @State private var confirmDelete = false
+    @State private var googleClientID = AppSettingsStore.googleClientID
+    @State private var googleSaved = false
     var body: some View {
         ScrollView { VStack(alignment: .leading, spacing: 20) {
-            ScreenTitle(title: "Settings", subtitle: "Account and app info.", icon: "gearshape.fill")
+            ScreenTitle(title: "Settings", subtitle: "Account, connections, and app info.", icon: "gearshape.fill")
             Panel(title: "Account", icon: "person.crop.circle") {
                 Stat(label: "Signed in as", value: session.email.isEmpty ? "guest" : session.email)
                 HStack {
                     GhostButton(label: "Sign out", icon: "rectangle.portrait.and.arrow.right") { withAnimation { session.signedIn = false } }
                     if session.email != "guest" && !session.email.isEmpty {
                         GhostButton(label: "Delete account", icon: "trash", tint: BLTheme.red) { confirmDelete = true }
+                    }
+                }
+            }
+
+            // Theme / Appearance Studio — the buyer owns the holographic look (live preview + presets).
+            ThemeStudioPanel()
+
+            // Headline ask: a real, reachable place to enter the WealthCharts account.
+            WealthChartsPanel()
+
+            // Make the Google sign-in option configurable rather than silently hidden.
+            Panel(title: "Sign-in providers", icon: "globe") {
+                Text("Both the Apple and Google buttons always appear on the login screen. Apple sign-in runs for real in the signed (provisioned) build; email/password and guest always work. To make the Google button do a real login, paste your own Google DESKTOP OAuth client ID below — it's stored on this Mac, never bundled. A Web client ID will NOT work for the app's loopback flow; create a \"Desktop\" client in the Google Cloud console.")
+                    .font(.system(size: 11.5, design: .rounded)).foregroundColor(BLTheme.sub).fixedSize(horizontal: false, vertical: true)
+                Field(title: "Google Desktop Client ID", text: $googleClientID, prompt: "xxxx…apps.googleusercontent.com")
+                HStack(spacing: 8) {
+                    GoldButton(label: "Save", icon: "checkmark") {
+                        AppSettingsStore.setGoogleClientID(googleClientID)
+                        googleClientID = AppSettingsStore.googleClientID
+                        withAnimation { googleSaved = true }
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { withAnimation { googleSaved = false } }
+                    }
+                    if !googleClientID.isEmpty {
+                        GhostButton(label: "Clear", icon: "xmark", tint: BLTheme.red) {
+                            AppSettingsStore.setGoogleClientID(""); googleClientID = ""
+                        }
+                    }
+                    if googleSaved {
+                        Text("Saved — the Google button now does a real login (sign out to use it).")
+                            .font(.system(size: 11, weight: .semibold, design: .rounded)).foregroundColor(BLTheme.green)
                     }
                 }
             }
@@ -659,5 +874,107 @@ struct SettingsScreen: View {
             StatusPill(text: status, tint: tint)
         }
         .padding(.vertical, 4)
+    }
+}
+
+// MARK: - WealthCharts connection panel (reusable — shown in Settings)
+// HONEST FRAMING: stores the buyer's own WealthCharts account reference on THIS Mac only.
+// Not a live broker feed; does not auto-trade or move money. Username + note → UserDefaults,
+// password → macOS Keychain. The UI states plainly what is and isn't connected.
+struct WealthChartsPanel: View {
+    @EnvironmentObject var wc: WealthChartsStore
+    @State private var showConnect = false
+
+    var body: some View {
+        Panel(title: "WealthCharts account", icon: "link", accent: wc.account.isConfigured ? BLTheme.green : BLTheme.gold) {
+            HStack(spacing: 10) {
+                Image(systemName: wc.account.isConfigured ? "checkmark.seal.fill" : "link.badge.plus")
+                    .font(.system(size: 13, weight: .bold))
+                    .foregroundColor(wc.account.isConfigured ? BLTheme.green : BLTheme.gold)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(wc.account.isConfigured ? "Account saved on this Mac" : "No WealthCharts account connected")
+                        .font(.system(size: 13, weight: .bold, design: .rounded)).foregroundColor(BLTheme.text)
+                    Text(wc.account.isConfigured
+                         ? "Stored locally — signals-only, manual execution. No live feed wired."
+                         : "Add your WealthCharts account to keep it on hand for the engine method.")
+                        .font(.system(size: 11, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer()
+                StatusPill(text: wc.account.isConfigured ? "Saved" : "Not connected",
+                           tint: wc.account.isConfigured ? BLTheme.green : BLTheme.sub)
+            }
+
+            if wc.account.isConfigured {
+                Divider().background(BLTheme.stroke).padding(.vertical, 2)
+                Stat(label: "Username", value: wc.account.username)
+                if !wc.account.note.isEmpty { Stat(label: "Label", value: wc.account.note) }
+                Stat(label: "Password", value: wc.hasSecret ? "Saved in Keychain" : "Not saved")
+                if let when = wc.account.connectedAt {
+                    Stat(label: "Saved", value: when.formatted(date: .abbreviated, time: .shortened))
+                }
+            }
+
+            HStack(spacing: 8) {
+                GoldButton(label: wc.account.isConfigured ? "Update connection" : "Connect WealthCharts",
+                           icon: wc.account.isConfigured ? "pencil" : "link") { showConnect = true }
+                if wc.account.isConfigured {
+                    GhostButton(label: "Disconnect", icon: "xmark.circle", tint: BLTheme.red) { wc.disconnect() }
+                }
+            }.padding(.top, 2)
+
+            Text("Your WealthCharts details stay on this Mac (username & label saved locally, password saved in the macOS Keychain). This app is signals-only — it does not log in for you, auto-trade, move money, or stream a live broker feed. A real WealthCharts data feed is not wired in this build; this saves your account so it's ready for the engine method and manual execution on your own platform.")
+                .font(.system(size: 11, design: .rounded)).foregroundColor(BLTheme.sub)
+                .fixedSize(horizontal: false, vertical: true).padding(.top, 2)
+        }
+        .sheet(isPresented: $showConnect) { ConnectWealthChartsSheet().environmentObject(wc) }
+    }
+}
+
+// Sheet to enter / update the WealthCharts account.
+struct ConnectWealthChartsSheet: View {
+    @EnvironmentObject var wc: WealthChartsStore
+    @Environment(\.dismiss) var dismiss
+    @State private var username = ""
+    @State private var password = ""
+    @State private var note = ""
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                HStack(spacing: 10) {
+                    Image(systemName: "link").font(.system(size: 15, weight: .bold)).foregroundColor(Color(hex: 0x1A1305))
+                        .frame(width: 30, height: 30).background(BLTheme.goldGrad).clipShape(RoundedRectangle(cornerRadius: 9))
+                    Text("Connect WealthCharts").font(.system(size: 18, weight: .heavy, design: .rounded)).foregroundColor(BLTheme.text)
+                }
+                Text("Saved on this Mac only. Signals-only — this does not auto-trade, move money, or stream a live broker feed. The password is stored in the macOS Keychain.")
+                    .font(.system(size: 12, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Field(title: "WealthCharts username / email", text: $username, prompt: "you@wealthcharts.com")
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("PASSWORD (OPTIONAL)").font(.system(size: 10, weight: .bold, design: .rounded)).foregroundColor(BLTheme.sub).tracking(0.6)
+                    SecureField("••••••••", text: $password)
+                        .textFieldStyle(.plain).font(.system(size: 14, weight: .medium, design: .rounded)).foregroundColor(BLTheme.text)
+                        .padding(.vertical, 10).padding(.horizontal, 12)
+                        .background(BLTheme.bg2).clipShape(RoundedRectangle(cornerRadius: 10))
+                        .overlay(RoundedRectangle(cornerRadius: 10).stroke(BLTheme.stroke, lineWidth: 1))
+                    Text("Stored in the macOS Keychain on this device. Leave blank to keep any previously saved password.")
+                        .font(.system(size: 10.5, design: .rounded)).foregroundColor(BLTheme.sub)
+                }
+                Field(title: "Label (optional)", text: $note, prompt: "e.g. Topstep 50K eval")
+
+                HStack { Spacer()
+                    GhostButton(label: "Cancel") { dismiss() }
+                    GoldButton(label: "Save connection", icon: "checkmark") {
+                        wc.save(username: username, password: password, note: note)
+                        dismiss()
+                    }
+                }.padding(.top, 4)
+            }
+            .padding(24).frame(width: 460)
+        }
+        .frame(width: 460, height: 460).background(BLTheme.bg)
+        .onAppear { username = wc.account.username; note = wc.account.note }
     }
 }

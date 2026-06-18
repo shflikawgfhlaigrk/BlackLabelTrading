@@ -2,6 +2,20 @@ import SwiftUI
 import AuthenticationServices
 import CryptoKit
 import AppKit
+import Security
+
+// Whether THIS running build actually carries the restricted "Sign in with Apple"
+// entitlement. Ad-hoc builds omit it (AMFI would SIGKILL the app), so we only show
+// the Apple button when a Developer-ID build granted it — never a button that can't work.
+enum AppleSignInSupport {
+    static let available: Bool = {
+        guard let task = SecTaskCreateFromSelf(nil) else { return false }
+        let val = SecTaskCopyValueForEntitlement(task, "com.apple.developer.applesignin" as CFString, nil)
+        if let arr = val as? [String], !arr.isEmpty { return true }
+        if let b = val as? Bool { return b }
+        return val != nil
+    }()
+}
 
 struct AuthView: View {
     @EnvironmentObject var session: Session
@@ -11,50 +25,46 @@ struct AuthView: View {
     @State private var err = ""
     @State private var glow = false
     @State private var orb = false
+    @State private var note = ""           // inline, non-crashing provider note (e.g. "add a client ID")
     @StateObject private var google = GoogleSignIn()
 
     var body: some View {
         ZStack {
-            RadialGradient(colors: [Color(hex: 0x1A160B), BLTheme.bg2], center: .top, startRadius: 0, endRadius: 850).ignoresSafeArea()
-            // Slow drifting gold orbs for depth + life.
-            Circle().fill(BLTheme.gold.opacity(0.18)).frame(width: 360).blur(radius: 140)
-                .offset(x: orb ? -160 : -240, y: orb ? -160 : -220).scaleEffect(glow ? 1.18 : 0.9)
-            Circle().fill(BLTheme.goldDim.opacity(0.12)).frame(width: 300).blur(radius: 150)
-                .offset(x: orb ? 230 : 280, y: orb ? 240 : 300).scaleEffect(glow ? 1.1 : 0.85)
+            // Holographic first impression: living Aurora background + drifting particle motes.
+            AuroraBackdrop()
+            ParticleField()
 
             VStack(spacing: 18) {
                 ZStack {
                     Circle().fill(BLTheme.gold.opacity(0.18)).frame(width: 150).blur(radius: 40).scaleEffect(glow ? 1.1 : 0.85)
-                    Logo(size: 92)
+                    Logo(size: 92).holoSheen()
                 }
                 VStack(spacing: 5) {
-                    Text("Black Label Trading").font(.system(size: 26, weight: .heavy, design: .rounded)).foregroundStyle(BLTheme.goldGrad)
+                    FoilText("Black Label Trading", size: 26, weight: .heavy, serif: false)
                     Text("A live signal dashboard with a real scoring engine, journal, and risk math.").font(.system(size: 13, weight: .medium, design: .rounded))
                         .foregroundColor(BLTheme.sub).multilineTextAlignment(.center)
                 }
-                // Social sign-in — above email/password, like top apps.
-                // Google is shown only when a client ID is configured, so we never present a button that can't work.
+                // Social sign-in — above email/password, like top apps. BOTH provider buttons ALWAYS
+                // render (owner requirement). A button never no-ops: when a provider can't complete in
+                // THIS build it still taps to a clear inline note that points to the fix (paste a Google
+                // Desktop client ID in Settings, or build the signed app for Apple). When it CAN, it
+                // does the real login. We never ship a dead button and never fake a login.
                 VStack(spacing: 10) {
-                    SignInWithAppleButton(.signIn, onRequest: { req in
-                        req.requestedScopes = [.fullName, .email]
-                    }, onCompletion: { result in handleApple(result) })
-                    .signInWithAppleButtonStyle(.white)
-                    .frame(height: 44).clipShape(Capsule())
-
-                    if googleConfigured {
-                        Button(action: { startGoogle() }) {
-                            HStack(spacing: 8) {
-                                Image(systemName: "globe").font(.system(size: 14, weight: .bold))
-                                Text(google.busy ? "Connecting to Google…" : "Sign in with Google")
-                            }
-                            .font(.system(size: 14, weight: .semibold, design: .rounded)).foregroundColor(BLTheme.text)
-                            .frame(maxWidth: .infinity).frame(height: 44)
-                            .background(BLTheme.bg2).clipShape(Capsule())
-                            .overlay(Capsule().stroke(BLTheme.stroke, lineWidth: 1))
-                        }.buttonStyle(.plain).disabled(google.busy)
-                    }
+                    appleButton
+                    googleButton
                 }
                 .frame(width: 330)
+
+                // Inline, non-crashing provider note (only shown when a button needs setup).
+                if !note.isEmpty {
+                    Text(note)
+                        .font(.system(size: 11.5, weight: .semibold, design: .rounded))
+                        .foregroundColor(BLTheme.gold)
+                        .multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(width: 330)
+                        .transition(.opacity)
+                }
 
                 HStack(spacing: 10) {
                     Rectangle().fill(BLTheme.stroke).frame(height: 1)
@@ -63,8 +73,8 @@ struct AuthView: View {
                 }.frame(width: 330)
 
                 HStack(spacing: 4) {
-                    seg("Sign in", on: !creating) { creating = false; err = "" }
-                    seg("Create account", on: creating) { creating = true; err = "" }
+                    seg("Sign in", on: !creating) { creating = false; err = ""; note = "" }
+                    seg("Create account", on: creating) { creating = true; err = ""; note = "" }
                 }
                 .padding(4).background(BLTheme.bg2).clipShape(Capsule()).overlay(Capsule().stroke(BLTheme.stroke, lineWidth: 1))
 
@@ -79,9 +89,8 @@ struct AuthView: View {
                 .frame(width: 330)
             }
             .padding(38).frame(width: 410)
-            .background(BLTheme.panel.opacity(0.85)).clipShape(RoundedRectangle(cornerRadius: 26, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 26, style: .continuous).stroke(BLTheme.gold.opacity(0.22), lineWidth: 1))
-            .shadow(color: BLTheme.gold.opacity(0.15), radius: 60, y: 12)
+            // The holographic login panel — iridescent border + glow + pointer 3D tilt.
+            .holoCard(radius: 26)
         }
         .frame(minWidth: 820, minHeight: 640)
         .onAppear {
@@ -89,6 +98,55 @@ struct AuthView: View {
             withAnimation(.easeInOut(duration: 7).repeatForever(autoreverses: true)) { orb = true }
         }
     }
+    // MARK: Social buttons — both ALWAYS render; behavior is runtime-gated, never a dead/no-op tap.
+
+    /// Apple button. When this build carries the applesignin entitlement (the signed/provisioned
+    /// build) we use the REAL `SignInWithAppleButton`. When it doesn't (adhoc/dev), we still SHOW a
+    /// pixel-faithful Apple button, but tapping shows a clear, non-crashing note — never a fake login.
+    @ViewBuilder private var appleButton: some View {
+        if appleAvailable {
+            SignInWithAppleButton(.signIn, onRequest: { req in
+                req.requestedScopes = [.fullName, .email]
+            }, onCompletion: { result in handleApple(result) })
+            .signInWithAppleButtonStyle(.white)
+            .frame(height: 44).clipShape(Capsule())
+        } else {
+            Button(action: {
+                withAnimation { note = "Apple Sign-In activates in the signed build. Email, Google, or guest work now." }
+            }) {
+                HStack(spacing: 8) {
+                    Image(systemName: "applelogo").font(.system(size: 15, weight: .medium))
+                    Text("Sign in with Apple")
+                }
+                .font(.system(size: 14, weight: .semibold, design: .rounded))
+                .foregroundColor(.black)
+                .frame(maxWidth: .infinity).frame(height: 44)
+                .background(Color.white)          // opaque, high-contrast — reads sharp
+                .clipShape(Capsule())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Sign in with Apple")
+        }
+    }
+
+    /// Google button — ALWAYS rendered. When a Desktop client ID is configured (Settings/UserDefaults)
+    /// it runs the real PKCE login; otherwise it taps to an inline note pointing to Settings → Sign-in.
+    @ViewBuilder private var googleButton: some View {
+        Button(action: { startGoogle() }) {
+            HStack(spacing: 8) {
+                Image(systemName: "globe").font(.system(size: 14, weight: .bold))
+                Text(google.busy ? "Connecting to Google…" : "Sign in with Google")
+            }
+            .font(.system(size: 14, weight: .semibold, design: .rounded)).foregroundColor(BLTheme.text)
+            .frame(maxWidth: .infinity).frame(height: 44)
+            .background(BLTheme.panel)            // opaque reading surface — sharp text
+            .clipShape(Capsule())
+            .overlay(Capsule().stroke(BLTheme.stroke, lineWidth: 1))
+        }
+        .buttonStyle(.plain).disabled(google.busy)
+        .accessibilityLabel("Sign in with Google")
+    }
+
     @ViewBuilder private func seg(_ l: String, on: Bool, _ tap: @escaping () -> Void) -> some View {
         Button(action: tap) {
             Text(l).font(.system(size: 13, weight: .bold, design: .rounded)).foregroundColor(on ? Color(hex: 0x1A1305) : BLTheme.sub)
@@ -96,12 +154,9 @@ struct AuthView: View {
                 .background(on ? AnyShapeStyle(BLTheme.goldGrad) : AnyShapeStyle(Color.clear)).clipShape(Capsule())
         }.buttonStyle(.plain)
     }
-    /// True only when a real Google OAuth client ID is present in Info.plist — gates the Google button
-    /// so review never sees a sign-in option that can't complete.
-    private var googleConfigured: Bool {
-        !((Bundle.main.object(forInfoDictionaryKey: "GoogleClientID") as? String) ?? "")
-            .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    }
+    /// Apple sign-in runs for real only when this build actually carries the entitlement
+    /// (the signed/provisioned build). The button still SHOWS when it doesn't — it just notes that.
+    private var appleAvailable: Bool { AppleSignInSupport.available }
     private func submit() {
         let r = creating ? AccountStore.create(email, pw) : AccountStore.signIn(email, pw)
         switch r { case .success: session.email = email; enter(); case .failure(let e): withAnimation { err = e.rawValue } }
@@ -127,11 +182,13 @@ struct AuthView: View {
 
     // MARK: Sign in with Google
     private func startGoogle() {
-        err = ""
+        err = ""; note = ""
         google.start { outcome in
             switch outcome {
             case .success(let mail): session.email = mail; enter()
-            case .needsClientID:     withAnimation { err = "Add your Google client ID in settings to enable Google sign-in." }
+            case .needsClientID:
+                // Not an error — guide the user to the prominent Settings field. Never a dead tap.
+                withAnimation { note = "To use Google: open Settings → Sign-in and paste a Google Desktop OAuth client ID. Email, Apple (signed build), or guest work now." }
             case .failure(let msg):  withAnimation { err = msg }
             }
         }
@@ -146,7 +203,7 @@ final class GoogleSignIn: NSObject, ObservableObject, ASWebAuthenticationPresent
     private var session: ASWebAuthenticationSession?
     private var verifier = ""
 
-    private var clientID: String { (Bundle.main.object(forInfoDictionaryKey: "GoogleClientID") as? String) ?? "" }
+    private var clientID: String { AppSettingsStore.googleClientID }
     private let redirectScheme = "com.blacklabel.trading"
     private var redirectURI: String { "com.blacklabel.trading:/oauth2redirect" }
 
