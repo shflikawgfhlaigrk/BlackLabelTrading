@@ -78,7 +78,6 @@ struct GoldButton: View {
             .holoSheen()                                   // moving iridescent light sweep on the primary CTA
             .overlay(Capsule().stroke(Color.white.opacity(hover ? 0.25 : 0.12), lineWidth: 1))
             .shadow(color: BLTheme.gold.opacity(hover ? 0.55 : 0.28), radius: hover ? 16 : 8, y: 3)
-            .scaleEffect(hover ? 1.035 : 1)
         }
         .buttonStyle(.plain).onHover { h in withAnimation(.spring(response: 0.3, dampingFraction: 0.6)) { hover = h } }
     }
@@ -98,6 +97,39 @@ struct GhostButton: View {
         }
         .buttonStyle(.plain).onHover { h in withAnimation(.easeOut(duration: 0.15)) { hover = h } }
     }
+}
+
+// Always-visible close affordance for modal sheets. Prepends a top bar with a clear "✕ Close" pill
+// (Esc-bound) so a presented editor/detail NEVER looks like a dead-end — the Save/Cancel pair often
+// sits at the BOTTOM of long scrolling forms, which reads as "no back button". A prepended bar (not
+// an overlay) never collides with top-right header content.
+struct SheetCloseBar: ViewModifier {
+    @Environment(\.dismiss) private var dismiss
+    func body(content: Content) -> some View {
+        VStack(spacing: 0) {
+            HStack {
+                Spacer()
+                Button { dismiss() } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: "xmark").font(.system(size: 11, weight: .bold))
+                        Text("Close").font(.system(size: 12, weight: .bold, design: .rounded))
+                    }
+                    .foregroundColor(BLTheme.text)
+                    .padding(.vertical, 6).padding(.horizontal, 11)
+                    .background(BLTheme.bg2, in: Capsule())
+                    .overlay(Capsule().stroke(BLTheme.gold.opacity(0.45), lineWidth: 1))
+                }
+                .buttonStyle(.plain).help("Close (Esc)").keyboardShortcut(.cancelAction)
+            }
+            .padding(.horizontal, 14).padding(.top, 12).padding(.bottom, 2)
+            content
+        }
+        .background(BLTheme.bg)
+    }
+}
+extension View {
+    /// Adds an always-visible top-right "Close" button (Esc-bound) above a sheet's content.
+    func sheetCloseBar() -> some View { modifier(SheetCloseBar()) }
 }
 
 struct Panel<Content: View>: View {

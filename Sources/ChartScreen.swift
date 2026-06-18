@@ -163,7 +163,7 @@ struct ChartScreen: View {
             }
         }
         .padding(20)
-        .sheet(isPresented: $showImporter) { importSheet }
+        .sheet(isPresented: $showImporter) { importSheet.sheetCloseBar() }
     }
 
     private var emptyState: some View {

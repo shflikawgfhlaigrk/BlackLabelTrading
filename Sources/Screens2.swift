@@ -185,7 +185,7 @@ struct WatchlistsScreen: View {
                 }
             }
         }
-        .sheet(item: $editing) { s in SymbolEditor(symbol: s, listID: watch.selectedID ?? UUID()).environmentObject(watch) }
+        .sheet(item: $editing) { s in SymbolEditor(symbol: s, listID: watch.selectedID ?? UUID()).environmentObject(watch).sheetCloseBar() }
         .alert("New watchlist", isPresented: $showNewList) {
             TextField("List name", text: $newListName)
             Button("Cancel", role: .cancel) { newListName = "" }
@@ -557,7 +557,7 @@ struct AlertsScreen: View {
                 }
             }.padding(24)
         }
-        .sheet(isPresented: $showNew) { AlertEditor().environmentObject(alerts).environmentObject(watch) }
+        .sheet(isPresented: $showNew) { AlertEditor().environmentObject(alerts).environmentObject(watch).sheetCloseBar() }
     }
 
     @ViewBuilder private func alertRow(_ a: TradeAlert) -> some View {

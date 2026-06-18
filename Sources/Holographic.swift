@@ -288,7 +288,6 @@ struct HoloCard: ViewModifier {
             )
             .shadow(color: .black.opacity(0.5), radius: hover ? 28 : 22, x: 0, y: hover ? 16 : 12)
             .shadow(color: theme.accent.opacity((hover ? 0.22 : 0.12) * glow), radius: hover ? 34 : 28, x: 0, y: 0)
-            .scaleEffect(hover ? 1.012 : 1.0)
 
         // Tilt is OPT-IN. Only when the theme enables it do the rotation3DEffect modifiers exist —
         // otherwise the branch below skips them entirely (zero perspective on text/content).

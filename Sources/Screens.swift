@@ -204,7 +204,7 @@ struct SignalsScreen: View {
         .onChange(of: priceStr) { _ in pushNumbers() }
         .onChange(of: atrStr) { _ in pushNumbers() }
         .onChange(of: pvStr) { _ in pushNumbers() }
-        .sheet(isPresented: $showConnectWC) { ConnectWealthChartsSheet().environmentObject(wc) }
+        .sheet(isPresented: $showConnectWC) { ConnectWealthChartsSheet().environmentObject(wc).sheetCloseBar() }
     }
 
     // Reachable WealthCharts connection banner — visible on the primary dashboard.
@@ -467,8 +467,8 @@ struct JournalScreen: View {
                 .padding(.horizontal, 24).padding(.bottom, 24)
             }
         }
-        .sheet(item: $editing) { t in TradeEditor(trade: t).environmentObject(model) }
-        .sheet(isPresented: $showImport) { JournalImportSheet().environmentObject(model) }
+        .sheet(item: $editing) { t in TradeEditor(trade: t).environmentObject(model).sheetCloseBar() }
+        .sheet(isPresented: $showImport) { JournalImportSheet().environmentObject(model).sheetCloseBar() }
     }
     @ViewBuilder private func tradeRow(_ t: Trade) -> some View {
         TradeRowView(trade: t) { editing = t }
@@ -591,7 +591,6 @@ struct TradeRowView: View {
             .padding(16).background(hover ? BLTheme.panel2 : BLTheme.panel).clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
             .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(hover ? BLTheme.gold.opacity(0.35) : BLTheme.stroke, lineWidth: 1))
             .shadow(color: Color.black.opacity(hover ? 0.3 : 0.15), radius: hover ? 10 : 5, y: 3)
-            .scaleEffect(hover ? 1.008 : 1)
         }.buttonStyle(.plain)
         .onHover { h in withAnimation(.easeOut(duration: 0.15)) { hover = h } }
     }
@@ -927,7 +926,7 @@ struct WealthChartsPanel: View {
                 .font(.system(size: 11, design: .rounded)).foregroundColor(BLTheme.sub)
                 .fixedSize(horizontal: false, vertical: true).padding(.top, 2)
         }
-        .sheet(isPresented: $showConnect) { ConnectWealthChartsSheet().environmentObject(wc) }
+        .sheet(isPresented: $showConnect) { ConnectWealthChartsSheet().environmentObject(wc).sheetCloseBar() }
     }
 }
 
