@@ -159,3 +159,80 @@ enum LiveFold {
         return out
     }
 }
+
+// MARK: - Engine roster from GET /api/screen.
+// Wire: {"rows":[{engine,symbol,edge,warming,winRate,netPts,expectancyR,trades,bars,reason}]}.
+// Every field is the backend's REAL per-(engine,symbol) OOS verdict on the buyer's own captured
+// bars. `edge` is true ONLY when that engine proved held-out edge on real bars; `warming` is true
+// when there aren't enough bars yet. Nothing here is fabricated — an empty/cold store yields [].
+// The UI must NEVER hardcode a win%/net; it shows exactly these decoded values or an empty state.
+struct EngineRow: Equatable, Identifiable {
+    var engine: String
+    var symbol: String
+    var edge: Bool
+    var warming: Bool
+    var winRate: Double
+    var netPts: Double
+    var expectancyR: Double
+    var trades: Int
+    var bars: Int
+    var reason: String
+    var id: String { engine + "|" + symbol }
+}
+
+enum EngineRoster {
+    static func decode(_ obj: [String: Any]) -> [EngineRow] {
+        guard let rows = obj["rows"] as? [[String: Any]] else { return [] }
+        return rows.compactMap { r in
+            guard let e = r["engine"] as? String, let s = r["symbol"] as? String else { return nil }
+            return EngineRow(
+                engine: e, symbol: s,
+                edge: (r["edge"] as? Bool) ?? false,
+                warming: (r["warming"] as? Bool) ?? false,
+                winRate: FeedBars.num(r["winRate"] as Any) ?? 0,
+                netPts: FeedBars.num(r["netPts"] as Any) ?? 0,
+                expectancyR: FeedBars.num(r["expectancyR"] as Any) ?? 0,
+                trades: Int(FeedBars.num(r["trades"] as Any) ?? 0),
+                bars: Int(FeedBars.num(r["bars"] as Any) ?? 0),
+                reason: (r["reason"] as? String) ?? "")
+        }
+    }
+}
+
+// MARK: - Signal journal from GET /api/fires.
+// Real recorded (non-synthetic) edge-gated fires, newest first. outcome/pnl are nil until the
+// daemon grades the signal (honest — never an invented result for an open signal). A row with no
+// engine/direction/entry is skipped rather than coerced into a fake fire.
+struct FireRow: Equatable, Identifiable {
+    var id: Int
+    var engine: String
+    var direction: String
+    var entry: Double
+    var symbol: String?
+    var stop: Double?
+    var target: Double?
+    var rationale: String?
+    var outcome: String?
+    var pnl: Double?
+    var ts: String?
+}
+
+enum FireFeed {
+    static func decode(_ obj: [String: Any]) -> [FireRow] {
+        guard let rows = obj["fires"] as? [[String: Any]] else { return [] }
+        return rows.compactMap { r in
+            guard let e = r["engine"] as? String, let d = r["direction"] as? String,
+                  let entry = FeedBars.num(r["entry"] as Any) else { return nil }
+            return FireRow(
+                id: Int(FeedBars.num(r["id"] as Any) ?? 0),
+                engine: e, direction: d, entry: entry,
+                symbol: r["symbol"] as? String,
+                stop: FeedBars.num(r["stop"] as Any),
+                target: FeedBars.num(r["target"] as Any),
+                rationale: r["rationale"] as? String,
+                outcome: r["outcome"] as? String,
+                pnl: FeedBars.num(r["pnl"] as Any),
+                ts: r["ts"] as? String)
+        }
+    }
+}

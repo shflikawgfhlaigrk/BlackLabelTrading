@@ -1077,6 +1077,37 @@ func testChartScaleDecimals() {
     ok(ChartScale.priceDecimals(step: 0.01) >= 2, "small step -> >=2 decimals")
 }
 
+// ===== Engine roster + fire feed decode (GET /api/screen, /api/fires) =====
+func testEngineRosterDecode() {
+    let obj: [String: Any] = ["rows": [
+        ["engine": "perp", "symbol": "CM.MNQM6", "edge": true, "warming": false,
+         "winRate": 0.9, "netPts": 12.5, "expectancyR": 0.6, "trades": 30, "bars": 120, "reason": "edge proven"],
+        ["engine": "apex", "symbol": "US.SPY", "edge": false, "warming": true,
+         "winRate": 0.0, "netPts": 0.0, "expectancyR": 0.0, "trades": 0, "bars": 12, "reason": "warming"],
+    ]]
+    let rows = EngineRoster.decode(obj)
+    eqi(rows.count, 2, "roster row count")
+    ok(rows[0].engine == "perp" && rows[0].edge && !rows[0].warming, "roster row 0 fields")
+    eq(rows[0].netPts, 12.5, "roster row 0 netPts")
+    eqi(rows[0].trades, 30, "roster row 0 trades")
+    ok(rows[1].warming && !rows[1].edge, "roster row 1 warming")
+    eqi(EngineRoster.decode(["rows": []]).count, 0, "empty roster honest")
+    eqi(EngineRoster.decode([:]).count, 0, "missing rows key honest")
+}
+
+func testFireFeedDecode() {
+    let obj: [String: Any] = ["fires": [
+        ["id": 5, "engine": "bible", "direction": "short", "entry": 100.0, "symbol": "US.QQQ",
+         "stop": 102.0, "target": 96.0, "rationale": "r", "outcome": NSNull(), "pnl": NSNull(), "ts": "2026-06-18 12:00:00"],
+    ]]
+    let fires = FireFeed.decode(obj)
+    eqi(fires.count, 1, "fire count")
+    ok(fires[0].engine == "bible" && fires[0].direction == "short", "fire fields")
+    eq(fires[0].entry, 100.0, "fire entry")
+    ok(fires[0].outcome == nil && fires[0].pnl == nil, "ungraded fire -> nil outcome/pnl (honest)")
+    eqi(FireFeed.decode(["fires": []]).count, 0, "empty fires honest")
+}
+
 // ===== LIVE backend integration test (opt-in via BLT_LIVE_BACKEND=1) =====
 // Boots no process itself — asserts the ALREADY-RUNNING self-contained backend (bltd_api.py)
 // serves a wire format that decodes into REAL Bar/LiveTick values, locking the contract the app
@@ -1146,6 +1177,10 @@ testLiveTickDecode()
 testLiveFold()
 testCaptureStatusState()
 testFeedSymbolsPicker()
+
+// Engine roster + fire feed decode (the /api/screen + /api/fires wire contract)
+testEngineRosterDecode()
+testFireFeedDecode()
 
 // Opt-in live backend integration (locks the end-to-end wire contract on real captured data).
 if ProcessInfo.processInfo.environment["BLT_LIVE_BACKEND"] == "1" {
