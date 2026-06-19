@@ -414,21 +414,22 @@ def _bk_simulate(closes, i, direction, entry, stop, target_r):
     return {"dir": direction, "entry": entry, "exit": last, "held": len(closes) - 1 - i, "r": round(r, 4)}
 
 
-def prove_breakout(ohlc, cfg=None):
+def _bk_trades(ohlc, lookback=LOOKBACK, cfg=None):
+    """Breakout walk over a bar series: long on a close above the prior `lookback` high, short
+    below the prior low; stop at the opposite extreme; fixed reward:risk target. Pure — this is
+    the single canonical breakout generator the gate, screener and full-backtest all share."""
     cfg = cfg or CONFIG_DEFAULTS
-    lookback = cfg.get("lookback", LOOKBACK)
-    oos_frac = cfg.get("oosFrac", OOS_FRAC)
-    min_trades = cfg.get("minTrades", MIN_TRADES)
     target_r = cfg.get("bkTargetR", BK_TARGET_R)
     closes = [b[3] for b in ohlc]
-    split = int(len(closes) * (1.0 - oos_frac))
-    seg = closes[split:]
     trades = []
     i = lookback
-    n = len(seg)
+    n = len(closes)
     while i < n:
-        prior = seg[i - lookback:i]
-        last = seg[i]
+        prior = closes[i - lookback:i]
+        last = closes[i]
+        if not prior:
+            i += 1
+            continue
         if last > max(prior):
             direction, stop = "long", min(prior)
         elif last < min(prior):
@@ -436,13 +437,22 @@ def prove_breakout(ohlc, cfg=None):
         else:
             i += 1
             continue
-        t = _bk_simulate(seg, i, direction, last, stop, target_r)
+        t = _bk_simulate(closes, i, direction, last, stop, target_r)
         if not t:
             i += 1
             continue
         trades.append(t)
         i += max(1, t["held"])
-    s = _summarize(trades, min_trades)
+    return trades
+
+
+def prove_breakout(ohlc, cfg=None):
+    cfg = cfg or CONFIG_DEFAULTS
+    lookback = cfg.get("lookback", LOOKBACK)
+    oos_frac = cfg.get("oosFrac", OOS_FRAC)
+    min_trades = cfg.get("minTrades", MIN_TRADES)
+    split = int(len(ohlc) * (1.0 - oos_frac))
+    s = _summarize(_bk_trades(ohlc[split:], lookback, cfg), min_trades)
     reason = (f"edge proven: OOS expectancy {s['expectancyR']:+.3f}R on {s['trades']} trades"
               if s["edgeProven"] else
               f"not proven: OOS expectancy {s['expectancyR']:+.3f}R on {s['trades']} trades")
@@ -459,6 +469,18 @@ def prove_research(ohlc, cfg=None):
     r = dict(r)
     r["reason"] = r["reason"].replace("expectancy", "research expectancy")
     return r
+
+
+# Registry of per-engine OOS trade generators. Keeps the gate, the screener and the full
+# backtest report in lockstep — every engine's edge is proven from THIS walk, nothing else.
+# research reuses the breakout walk as its tradable OOS proxy (same as prove_research).
+ENGINE_TRADES = {"meanrev": _mr_trades, "breakout": _bk_trades, "research": _bk_trades}
+
+
+def engine_trades(engine, oos_ohlc, lookback, cfg=None):
+    """The OOS trade list for `engine` on a bar segment. Empty list for an unknown engine."""
+    gen = ENGINE_TRADES.get(engine)
+    return gen(oos_ohlc, lookback, cfg) if gen else []
 
 
 PROVERS = {"meanrev": prove_meanrev, "breakout": prove_breakout, "research": prove_research}

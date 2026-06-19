@@ -24,41 +24,13 @@ import bltd_store as S
 # full backtest report (trades + equity curve + headline stats)
 # ===========================================================================
 def _trades_for(engine: str, ohlc, cfg):
-    """The OOS trade list for an engine on a bar series, using the buyer's config. Mirrors the
-    same OOS split + walk the gate uses, so the report and the gate agree exactly."""
+    """The OOS trade list for an engine on a bar series, using the buyer's config. Dispatches
+    through the single canonical per-engine generator registry (bltd_store.engine_trades) so the
+    report, the gate and the screener all walk EXACTLY the same OOS trades — no duplication."""
     oos_frac = cfg.get("oosFrac", S.OOS_FRAC)
     lookback = cfg.get("lookback", S.LOOKBACK)
     split = int(len(ohlc) * (1.0 - oos_frac))
-    oos = ohlc[split:]
-    if engine == "meanrev":
-        return S._mr_trades(oos, lookback, cfg), split
-    if engine in ("breakout", "research"):
-        closes = [b[3] for b in oos]
-        target_r = cfg.get("bkTargetR", S.BK_TARGET_R)
-        trades = []
-        i = lookback
-        n = len(closes)
-        while i < n:
-            prior = closes[i - lookback:i]
-            last = closes[i]
-            if not prior:
-                i += 1
-                continue
-            if last > max(prior):
-                direction, stop = "long", min(prior)
-            elif last < min(prior):
-                direction, stop = "short", max(prior)
-            else:
-                i += 1
-                continue
-            t = S._bk_simulate(closes, i, direction, last, stop, target_r)
-            if not t:
-                i += 1
-                continue
-            trades.append(t)
-            i += max(1, t["held"])
-        return trades, split
-    return [], split
+    return S.engine_trades(engine, ohlc[split:], lookback, cfg), split
 
 
 def _stats(trades):

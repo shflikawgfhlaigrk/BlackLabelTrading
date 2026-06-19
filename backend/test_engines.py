@@ -72,6 +72,27 @@ def test_fib_pos_bounds():
     assert S._fib_pos([7.0, 7.0, 7.0], 3) is None
 
 
+# ===========================================================================
+# Task 2 — trade-generator registry + analytics dispatch
+# ===========================================================================
+def test_engine_trades_dispatch_matches_inline():
+    ohlc = _trend_series()
+    legacy = S._bk_trades(ohlc, 20, S.CONFIG_DEFAULTS)            # canonical breakout walk
+    viareg = S.engine_trades("breakout", ohlc, 20, S.CONFIG_DEFAULTS)
+    assert legacy == viareg
+    assert S.engine_trades("nonexistent", ohlc, 20, S.CONFIG_DEFAULTS) == []
+
+
+def test_analytics_trades_for_matches_gate():
+    # The full-backtest report and the gate must walk the SAME OOS trades.
+    import bltd_analytics as A
+    ohlc = _consensus_uptrend(220)
+    cfg = S.CONFIG_DEFAULTS
+    trades, split = A._trades_for("breakout", ohlc, cfg)
+    oos = ohlc[int(len(ohlc) * (1.0 - cfg["oosFrac"])):]
+    assert trades == S._bk_trades(oos, cfg["lookback"], cfg)
+
+
 if __name__ == "__main__":
     import sys
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
