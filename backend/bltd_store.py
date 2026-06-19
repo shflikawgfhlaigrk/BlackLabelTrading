@@ -743,12 +743,88 @@ def _barber_signal(closes, ohlc, lookback, cfg):
             "rationale": f"barber {d}: consensus in golden pocket (Fib {BARBER_LONG_LO}-{BARBER_LONG_HI})"}
 
 
+# ---- ctx_alpha / ctx_bravo (Context engines: A/B context-strictness split) --
+# Alpha and bravo share the sniper-consensus core (byte-identical in source); the real
+# differentiator is their .env tuning + the context-gate strictness (perp_v2/{grade}/{dir}
+# win-rate gate). The OHLC-faithful A/B lever: alpha = the loose perp consensus; bravo = a
+# strict variant requiring a FULLY-stacked EMA ribbon (not merely 'not-opposite') AND a higher
+# Kaufman-ER floor. The world-model win-rate gate is NON-OHLC (needs the buyer's own graded
+# journal, which ships EMPTY) -> documented gated-out.
+CTXB_ER = 0.45   # ctx_bravo: stricter Kaufman-ER trend gate than alpha (perp default 0.30)
+
+
+def _ctx_dir(closes, ohlc, lookback, strict):
+    if not strict:
+        return _consensus_dir(closes, ohlc, lookback, PERP_FAST, PERP_SLOW, PERP_ER)
+    if len(closes) < PERP_SLOW + 1:
+        return None
+    sdir, _ = _stepgma_dir(closes, PERP_FAST, PERP_SLOW)
+    ribbon = _ribbon_bull(closes)
+    if _kaufman_er(closes, lookback) < CTXB_ER:
+        return None
+    if sdir == "bull" and ribbon is True:
+        return "long"
+    if sdir == "bear" and ribbon is False:
+        return "short"
+    return None
+
+
+def _ctxa_dir(closes, ohlc, lookback, cfg):
+    return _ctx_dir(closes, ohlc, lookback, strict=False)
+
+
+def _ctxb_dir(closes, ohlc, lookback, cfg):
+    return _ctx_dir(closes, ohlc, lookback, strict=True)
+
+
+def _ctxa_trades(ohlc, lookback=LOOKBACK, cfg=None):
+    return _consensus_engine_trades(ohlc, lookback, cfg, _ctxa_dir)
+
+
+def _ctxb_trades(ohlc, lookback=LOOKBACK, cfg=None):
+    return _consensus_engine_trades(ohlc, lookback, cfg, _ctxb_dir)
+
+
+def prove_ctx_alpha(ohlc, cfg=None):
+    """Context Alpha (faithful OHLC core): perp consensus with the looser context profile.
+    GATED-OUT non-OHLC: the world-model win-rate gate (perp_v2/{grade}/{dir}) needs the buyer's
+    own graded journal (ships empty) + the same order-flow/macro voters as perp."""
+    return _consensus_prove(ohlc, cfg, _ctxa_dir, "ctx_alpha")
+
+
+def prove_ctx_bravo(ohlc, cfg=None):
+    """Context Bravo (faithful OHLC core): perp consensus with the STRICTER context profile
+    (full EMA-ribbon stack + higher Kaufman-ER floor). GATED-OUT non-OHLC: the world-model
+    win-rate gate (ships empty) + the same order-flow/macro voters as perp."""
+    return _consensus_prove(ohlc, cfg, _ctxb_dir, "ctx_bravo")
+
+
+def _ctxa_signal(closes, ohlc, lookback, cfg):
+    d = _ctxa_dir(closes, ohlc, lookback, cfg)
+    if not d:
+        return None
+    entry = closes[-1]
+    stop, target = _atr_stop_target(ohlc, entry, d, PERP_ATR_MULT, PERP_TARGET_R)
+    return {"direction": d, "stop": stop, "target": target,
+            "rationale": f"ctx_alpha {d}: consensus (loose context)"}
+
+
+def _ctxb_signal(closes, ohlc, lookback, cfg):
+    d = _ctxb_dir(closes, ohlc, lookback, cfg)
+    if not d:
+        return None
+    entry = closes[-1]
+    stop, target = _atr_stop_target(ohlc, entry, d, PERP_ATR_MULT, PERP_TARGET_R)
+    return {"direction": d, "stop": stop, "target": target,
+            "rationale": f"ctx_bravo {d}: consensus (strict context)"}
+
+
 # Registry of per-engine OOS trade generators. Keeps the gate, the screener and the full
 # backtest report in lockstep — every engine's edge is proven from THIS walk, nothing else.
 # research reuses the breakout walk as its tradable OOS proxy (same as prove_research).
 ENGINE_TRADES = {"meanrev": _mr_trades, "breakout": _bk_trades, "research": _bk_trades,
                  "perp": _perp_trades, "bible": _bible_trades, "apex": _apex_trades,
-                 "barber": _barber_trades}
+                 "barber": _barber_trades, "ctx_alpha": _ctxa_trades, "ctx_bravo": _ctxb_trades}
 
 
 def engine_trades(engine, oos_ohlc, lookback, cfg=None):
@@ -759,7 +835,7 @@ def engine_trades(engine, oos_ohlc, lookback, cfg=None):
 
 PROVERS = {"meanrev": prove_meanrev, "breakout": prove_breakout, "research": prove_research,
            "perp": prove_perp, "bible": prove_bible, "apex": prove_apex,
-           "barber": prove_barber}
+           "barber": prove_barber, "ctx_alpha": prove_ctx_alpha, "ctx_bravo": prove_ctx_bravo}
 
 
 # ===========================================================================

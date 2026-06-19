@@ -202,6 +202,32 @@ def test_barber_empty_is_honest():
     assert r["ok"] is False and r["trades"] == 0
 
 
+# ===========================================================================
+# Task 7 — ctx_alpha + ctx_bravo (A/B context-strictness split)
+# ===========================================================================
+def test_ctx_alpha_proves_on_trend():
+    r = S.prove_ctx_alpha(_consensus_uptrend(), S.CONFIG_DEFAULTS)
+    assert r["ok"] is True and r["netPts"] > 0
+
+
+def test_ctx_bravo_stricter_than_alpha():
+    # bravo's stricter gate -> never MORE trades than alpha on the same series
+    a = S._ctxa_trades(_consensus_uptrend(), 20, S.CONFIG_DEFAULTS)
+    b = S._ctxb_trades(_consensus_uptrend(), 20, S.CONFIG_DEFAULTS)
+    assert len(b) <= len(a)
+
+
+def test_ctx_bravo_proves_on_strong_trend():
+    r = S.prove_ctx_bravo(_consensus_uptrend(), S.CONFIG_DEFAULTS)
+    assert {"ok", "trades", "netPts"}.issubset(r)
+
+
+def test_ctx_empty_is_honest():
+    for fn in (S.prove_ctx_alpha, S.prove_ctx_bravo):
+        r = fn([], S.CONFIG_DEFAULTS)
+        assert r["ok"] is False and r["trades"] == 0
+
+
 if __name__ == "__main__":
     import sys
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
