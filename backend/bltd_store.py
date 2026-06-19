@@ -199,6 +199,88 @@ def ohlc_bars(ticks, bar_seconds: int = 15):
 
 
 # ===========================================================================
+# Pure OHLC indicator helpers — the shared voter primitives the ported engines
+# (bible/apex/perp/barber/ctx_*) compute their signals from. Stdlib-only, no state.
+# These are the OHLC-derivable cores of the real engines' indicator stack (EMA ribbon,
+# StepGMA-style fast/slow slope, Kaufman efficiency-ratio regime, ATR geometry, Fibonacci
+# golden-pocket position). Order-flow voters (CVD, SMT, absorption) and macro voters
+# (entropy/VIX/econ-calendar) are NOT here — they are non-OHLC and are documented as
+# gated-out in each engine's docstring.
+# ===========================================================================
+def _ema(values, span):
+    if not values:
+        return []
+    k = 2.0 / (span + 1.0)
+    out = [values[0]]
+    for v in values[1:]:
+        out.append(out[-1] + k * (v - out[-1]))
+    return out
+
+
+def _kaufman_er(closes, period):
+    """Kaufman efficiency ratio over the last `period` closes: |net change| / sum|change|.
+    1.0 = perfectly trending, ~0 = pure chop. 0.0 when undefined (flat / too few)."""
+    if len(closes) < period + 1:
+        return 0.0
+    seg = closes[-(period + 1):]
+    net = abs(seg[-1] - seg[0])
+    vol = sum(abs(seg[i] - seg[i - 1]) for i in range(1, len(seg)))
+    return (net / vol) if vol > 0 else 0.0
+
+
+def _stepgma_dir(closes, fast, slow):
+    """('bull'|'bear'|'neutral', slope). Direction = sign(fastEMA - slowEMA) on the last bar;
+    slope = normalized 1-bar change of the fast EMA. 'neutral' when the EMAs coincide."""
+    if len(closes) < slow + 1:
+        return ("neutral", 0.0)
+    ef = _ema(closes, fast)
+    es = _ema(closes, slow)
+    diff = ef[-1] - es[-1]
+    slope = (ef[-1] - ef[-2]) / es[-1] if es[-1] else 0.0
+    if diff > 0:
+        return ("bull", slope)
+    if diff < 0:
+        return ("bear", slope)
+    return ("neutral", slope)
+
+
+def _ribbon_bull(closes, spans=(8, 13, 21, 34, 55)):
+    """True if the EMA ribbon is stacked bullish (faster EMA above slower, monotonically),
+    False if stacked bearish, None if mixed/insufficient. Pure momentum confirmation voter."""
+    if len(closes) < max(spans) + 1:
+        return None
+    vals = [_ema(closes, s)[-1] for s in spans]
+    if all(vals[i] > vals[i + 1] for i in range(len(vals) - 1)):
+        return True
+    if all(vals[i] < vals[i + 1] for i in range(len(vals) - 1)):
+        return False
+    return None
+
+
+def _atr(ohlc, period=14):
+    """Mean true range over the last `period` bars. ohlc rows: (o,h,l,c). 0 if too few."""
+    if len(ohlc) < period + 1:
+        return 0.0
+    trs = []
+    for i in range(len(ohlc) - period, len(ohlc)):
+        h, l, pc = ohlc[i][1], ohlc[i][2], ohlc[i - 1][3]
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    return sum(trs) / len(trs) if trs else 0.0
+
+
+def _fib_pos(closes, lookback):
+    """Position of the last close within [swing_low, swing_high] over the last `lookback`
+    closes, in [0,1]. None if the range is flat (no swing). Golden-pocket gate input."""
+    if len(closes) < 2:
+        return None
+    seg = closes[-lookback:] if lookback > 0 else closes
+    lo, hi = min(seg), max(seg)
+    if hi <= lo:
+        return None
+    return (closes[-1] - lo) / (hi - lo)
+
+
+# ===========================================================================
 # Engine math (pure) — ported from utah.product.backtest / research_signal / Engines.swift.
 # OOS-split, edge proven only on the held-out tail. Same numbers as the Swift engines.
 # ===========================================================================
