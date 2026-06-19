@@ -81,6 +81,9 @@ if [ -f "/Applications/$APPNAME.app/Contents/Resources/Assets.car" ]; then
   cp -f "/Applications/$APPNAME.app/Contents/Resources/Assets.car" "$APP/Contents/Resources/" || true
 fi
 
+# --- privacy manifest (REQUIRED, accurate: no tracking, no collection, UserDefaults reason) ---
+[ -f "$SRC/PrivacyInfo.xcprivacy" ] && cp -f "$SRC/PrivacyInfo.xcprivacy" "$APP/Contents/Resources/PrivacyInfo.xcprivacy"
+
 # --- bundle the SELF-CONTAINED data backend (stdlib-only Python; ships NO data) ---
 # The buyer's app captures THEIR OWN WealthCharts feed into THEIR OWN local SQLite store and
 # serves it on 127.0.0.1:8787. These are code only — the store is created empty at runtime.
@@ -92,13 +95,16 @@ if [ -d "$ROOT/backend" ]; then
   chmod +x "$APP/Contents/Resources/backend/launch-backend.sh"
 fi
 
-# --- adhoc sign with entitlements (sandbox + network client) ---
-# NOTE: ad-hoc signing does NOT use --options runtime and the entitlements deliberately
-# exclude the restricted applesignin entitlement — AMFI SIGKILLs an ad-hoc app that carries
-# it. The Apple button is runtime-gated on the entitlement, so the ad-hoc build hides it.
-echo "==> Signing (adhoc) with entitlements"
+# --- adhoc sign with the DEVELOPER-ID entitlements (NO app-sandbox, NO applesignin) ---
+# Trading spawns its bundled Python backend, which the App Store sandbox would forbid — so even
+# this convenience build uses the Developer-ID entitlements (network.client + the hardened-runtime
+# library/dyld exceptions the python backend needs). It deliberately does NOT carry app-sandbox or
+# the restricted applesignin entitlement (AMFI SIGKILLs an ad-hoc app that carries applesignin).
+# The Apple button is runtime-gated on the entitlement, so this build hides it. For a notarizable,
+# distributable bundle use ./build-developer-id.sh (hardened runtime + Developer ID + spctl/notary).
+echo "==> Signing (adhoc) with Developer-ID entitlements"
 codesign --force --deep --sign - \
-  --entitlements "$SRC/app.entitlements" \
+  --entitlements "$SRC/app-developerid.entitlements" \
   "$APP"
 
 echo "==> Built: $APP"
@@ -119,8 +125,10 @@ if [ "${1:-}" == "--install" ]; then
       cp -Rf "$APP/Contents/Resources/backend" "$DEST/Contents/Resources/backend"
     fi
   fi
-  echo "==> Re-signing installed bundle (adhoc, with entitlements)"
-  codesign --force --deep --sign - --entitlements "$SRC/app.entitlements" "$DEST"
+  # Keep the privacy manifest in sync on install too.
+  [ -f "$SRC/PrivacyInfo.xcprivacy" ] && cp -f "$SRC/PrivacyInfo.xcprivacy" "$DEST/Contents/Resources/PrivacyInfo.xcprivacy"
+  echo "==> Re-signing installed bundle (adhoc, with Developer-ID entitlements)"
+  codesign --force --deep --sign - --entitlements "$SRC/app-developerid.entitlements" "$DEST"
   codesign -dv "$DEST" 2>&1 | sed 's/^/    /'
   echo "==> Installed: $DEST"
 fi

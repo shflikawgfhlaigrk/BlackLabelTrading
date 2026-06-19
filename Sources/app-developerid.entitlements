@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  DEVELOPER ID entitlements for Black Label Trading.
+
+  Trading ships OUTSIDE the App Store via Developer ID + Hardened Runtime, because the app
+  spawns its own bundled Python data backend (/bin/bash -> python3 bltd_api.py) to capture the
+  buyer's own WealthCharts feed into a local SQLite store and serve it on 127.0.0.1:8787. The
+  App Store sandbox would forbid that child-process spawn + local server, so:
+
+    * NO com.apple.security.app-sandbox  — the sandbox blocks Process() spawn of /bin/bash,
+      the loopback HTTP server, and reads of ~/Library/Application Support outside the
+      container. Trading is a Developer-ID (non-sandboxed) app, not an App Store app.
+
+    * NO com.apple.developer.applesignin — that restricted entitlement is only honored by a
+      build signed against a provisioning profile that grants it; an ad-hoc or plain
+      Developer-ID signature carrying it is SIGKILLed by AMFI. The Apple Sign-In button is
+      runtime-gated on AppleSignInSupport.available (reads this entitlement live), so when the
+      entitlement is absent the app simply does not offer Apple Sign-In — no fake button.
+
+  Hardened-runtime exceptions, scoped to exactly what the bundled Python backend needs:
+    * disable-library-validation — the spawned system python3 loads its own dylibs/.so
+      extensions that are NOT signed by this team; library validation would otherwise refuse
+      them and the backend would fail to start.
+    * allow-dyld-environment-variables — launch-backend.sh sets PYTHONPATH for the child so it
+      imports the bundled bltd_*.py modules; the hardened runtime strips DYLD/PYTHON* env unless
+      this is granted.
+
+  network.client is kept (the app + backend make outbound localhost/CDP connections). No
+  network.server entitlement is needed: the loopback HTTP server is allowed without the sandbox.
+-->
+<plist version="1.0">
+<dict>
+  <key>com.apple.security.network.client</key>
+  <true/>
+  <key>com.apple.security.cs.disable-library-validation</key>
+  <true/>
+  <key>com.apple.security.cs.allow-dyld-environment-variables</key>
+  <true/>
+</dict>
+</plist>
