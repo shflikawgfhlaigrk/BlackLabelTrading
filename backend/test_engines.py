@@ -119,6 +119,30 @@ def test_perp_signal_long_on_uptrend():
     assert sig is not None and sig["direction"] == "long"
 
 
+# ===========================================================================
+# Task 4 — bible engine (guarded short-biased sniper)
+# ===========================================================================
+def test_bible_blocks_longs():
+    trades = S._bible_trades(_consensus_uptrend(), 20, S.CONFIG_DEFAULTS)
+    assert all(t["dir"] == "short" for t in trades)
+
+
+def test_bible_proves_on_downtrend():
+    r = S.prove_bible(_downtrend(), S.CONFIG_DEFAULTS)
+    assert r["ok"] is True and r["netPts"] > 0
+
+
+def test_bible_signal_never_long():
+    ohlc = _consensus_uptrend()
+    sig = S._bible_signal([b[3] for b in ohlc], ohlc, 20, S.CONFIG_DEFAULTS)
+    assert sig is None or sig["direction"] == "short"
+
+
+def test_bible_empty_is_honest():
+    r = S.prove_bible([], S.CONFIG_DEFAULTS)
+    assert r["ok"] is False and r["trades"] == 0
+
+
 if __name__ == "__main__":
     import sys
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

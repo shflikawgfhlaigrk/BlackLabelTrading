@@ -577,11 +577,52 @@ def _perp_signal(closes, ohlc, lookback, cfg):
             "rationale": f"perp consensus {d}: StepGMA+ribbon aligned, Kaufman ER>={PERP_ER}"}
 
 
+# ---- bible (Perplexity Apex Signal Bible: perp consensus + Bible guards) ----
+BIBLE_REGIME_ER = 0.40   # GUARD_BLOCK_REGIME=TREND_UP: block entries when ER>=this & trending up
+
+
+def _bible_dir(closes, ohlc, lookback, cfg):
+    """Bible = perp consensus with the real engine's guards ported: block LONG side entirely
+    (GUARD_BLOCK_SIDE=LONG), and block any entry while the tape trends UP (30-bar Kaufman ER >=
+    0.40 with up direction, GUARD_BLOCK_REGIME=TREND_UP). Net: short-biased, counter-up-trend.
+    GATED-OUT: the Bible setup-library (non-OHLC patterns) + the same order-flow/macro voters as
+    perp."""
+    d = _consensus_dir(closes, ohlc, lookback, PERP_FAST, PERP_SLOW, PERP_ER)
+    if d == "long":
+        return None                                   # GUARD_BLOCK_SIDE=LONG
+    er = _kaufman_er(closes, 30)
+    sdir, _ = _stepgma_dir(closes, PERP_FAST, PERP_SLOW)
+    if er >= BIBLE_REGIME_ER and sdir == "bull":
+        return None                                   # GUARD_BLOCK_REGIME=TREND_UP
+    return d
+
+
+def _bible_trades(ohlc, lookback=LOOKBACK, cfg=None):
+    return _consensus_engine_trades(ohlc, lookback, cfg, _bible_dir)
+
+
+def prove_bible(ohlc, cfg=None):
+    """Perplexity Apex Signal Bible (faithful OHLC core): short-biased, counter-up-trend
+    momentum (LONG side blocked, TREND_UP regime blocked). GATED-OUT non-OHLC voters: the Bible
+    setup-library patterns, CVD/divergence, entropy, VIX, econ-calendar, SMT, absorption."""
+    return _consensus_prove(ohlc, cfg, _bible_dir, "")
+
+
+def _bible_signal(closes, ohlc, lookback, cfg):
+    d = _bible_dir(closes, ohlc, lookback, cfg)
+    if not d:
+        return None
+    entry = closes[-1]
+    stop, target = _atr_stop_target(ohlc, entry, d, PERP_ATR_MULT, PERP_TARGET_R)
+    return {"direction": d, "stop": stop, "target": target,
+            "rationale": f"bible {d}: short-biased consensus (LONG/TREND_UP blocked)"}
+
+
 # Registry of per-engine OOS trade generators. Keeps the gate, the screener and the full
 # backtest report in lockstep — every engine's edge is proven from THIS walk, nothing else.
 # research reuses the breakout walk as its tradable OOS proxy (same as prove_research).
 ENGINE_TRADES = {"meanrev": _mr_trades, "breakout": _bk_trades, "research": _bk_trades,
-                 "perp": _perp_trades}
+                 "perp": _perp_trades, "bible": _bible_trades}
 
 
 def engine_trades(engine, oos_ohlc, lookback, cfg=None):
@@ -591,7 +632,7 @@ def engine_trades(engine, oos_ohlc, lookback, cfg=None):
 
 
 PROVERS = {"meanrev": prove_meanrev, "breakout": prove_breakout, "research": prove_research,
-           "perp": prove_perp}
+           "perp": prove_perp, "bible": prove_bible}
 
 
 # ===========================================================================
