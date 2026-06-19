@@ -618,11 +618,91 @@ def _bible_signal(closes, ohlc, lookback, cfg):
             "rationale": f"bible {d}: short-biased consensus (LONG/TREND_UP blocked)"}
 
 
+# ---- apex (Apex Prime regime router -> trend continuation) -----------------
+APEX_TREND_ER = 0.45    # Kaufman ER >= this -> TREND regime (apex regime_router intent)
+APEX_RANGE_ER = 0.25    # Kaufman ER <= this -> RANGE regime
+
+
+def _variance_ratio(closes, lookback):
+    """Lo-MacKinlay-style variance ratio proxy (OHLC stand-in for the engine's entropy voter):
+    var(k-step returns)/(k*var(1-step)). ~1 = random walk, >1 = trending, <1 = mean-reverting."""
+    if len(closes) < lookback + 2:
+        return 1.0
+    seg = closes[-(lookback + 1):]
+    r1 = [seg[i] - seg[i - 1] for i in range(1, len(seg))]
+    if len(r1) < 4:
+        return 1.0
+    mean = sum(r1) / len(r1)
+    v1 = sum((x - mean) ** 2 for x in r1) / len(r1)
+    if v1 <= 0:
+        return 1.0
+    k = 2
+    rk = [seg[i] - seg[i - k] for i in range(k, len(seg))]
+    meank = sum(rk) / len(rk)
+    vk = sum((x - meank) ** 2 for x in rk) / len(rk)
+    return (vk / (k * v1)) if v1 > 0 else 1.0
+
+
+def _apex_regime(closes, ohlc, lookback):
+    """Apex regime classification (OHLC core of regime_router): weighted vote of Kaufman-ER
+    (trend strength), variance-ratio (trend persistence proxy for entropy), and StepGMA
+    direction. Returns 'TREND' or 'RANGE'. NON-OHLC voters (Hurst from order flow, $TICK
+    breadth, VIX, macro-calendar) are gated out."""
+    er = _kaufman_er(closes, lookback)
+    vr = _variance_ratio(closes, lookback)
+    sdir, _ = _stepgma_dir(closes, PERP_FAST, PERP_SLOW)
+    trend_votes = range_votes = 0.0
+    if er >= APEX_TREND_ER:
+        trend_votes += 1.5
+    elif er <= APEX_RANGE_ER:
+        range_votes += 1.5
+    if vr > 1.1:
+        trend_votes += 1.0
+    elif vr < 0.9:
+        range_votes += 1.0
+    if sdir in ("bull", "bear"):
+        trend_votes += 1.0
+    else:
+        range_votes += 0.5
+    return "TREND" if trend_votes > range_votes else "RANGE"
+
+
+def _apex_dir(closes, ohlc, lookback, cfg):
+    """Apex trades trend-continuation ONLY in a classified TREND regime; flat otherwise."""
+    if _apex_regime(closes, ohlc, lookback) != "TREND":
+        return None
+    sdir, _ = _stepgma_dir(closes, PERP_FAST, PERP_SLOW)
+    return "long" if sdir == "bull" else ("short" if sdir == "bear" else None)
+
+
+def _apex_trades(ohlc, lookback=LOOKBACK, cfg=None):
+    return _consensus_engine_trades(ohlc, lookback, cfg, _apex_dir)
+
+
+def prove_apex(ohlc, cfg=None):
+    """Apex Prime (faithful OHLC core): regime-gated trend continuation — trades only in a
+    classified TREND regime (Kaufman-ER + variance-ratio + StepGMA vote), flat in RANGE.
+    GATED-OUT non-OHLC: Hurst (order-flow), Shannon/permutation entropy, $TICK/$ADD breadth,
+    VIX, macro-calendar blackouts (ES-settlement/CME-maintenance/FOMC/CPI/NFP), the risk-shell
+    daily-loss kill."""
+    return _consensus_prove(ohlc, cfg, _apex_dir, "")
+
+
+def _apex_signal(closes, ohlc, lookback, cfg):
+    d = _apex_dir(closes, ohlc, lookback, cfg)
+    if not d:
+        return None
+    entry = closes[-1]
+    stop, target = _atr_stop_target(ohlc, entry, d, PERP_ATR_MULT, PERP_TARGET_R)
+    return {"direction": d, "stop": stop, "target": target,
+            "rationale": f"apex {d}: TREND regime (Kaufman ER/var-ratio), continuation"}
+
+
 # Registry of per-engine OOS trade generators. Keeps the gate, the screener and the full
 # backtest report in lockstep — every engine's edge is proven from THIS walk, nothing else.
 # research reuses the breakout walk as its tradable OOS proxy (same as prove_research).
 ENGINE_TRADES = {"meanrev": _mr_trades, "breakout": _bk_trades, "research": _bk_trades,
-                 "perp": _perp_trades, "bible": _bible_trades}
+                 "perp": _perp_trades, "bible": _bible_trades, "apex": _apex_trades}
 
 
 def engine_trades(engine, oos_ohlc, lookback, cfg=None):
@@ -632,7 +712,7 @@ def engine_trades(engine, oos_ohlc, lookback, cfg=None):
 
 
 PROVERS = {"meanrev": prove_meanrev, "breakout": prove_breakout, "research": prove_research,
-           "perp": prove_perp, "bible": prove_bible}
+           "perp": prove_perp, "bible": prove_bible, "apex": prove_apex}
 
 
 # ===========================================================================

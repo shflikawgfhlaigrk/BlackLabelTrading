@@ -143,6 +143,32 @@ def test_bible_empty_is_honest():
     assert r["ok"] is False and r["trades"] == 0
 
 
+# ===========================================================================
+# Task 5 — apex engine (regime-router trend-continuation)
+# ===========================================================================
+def test_apex_regime_trend_vs_range():
+    up = _consensus_uptrend()
+    ch = _chop()
+    assert S._apex_regime([b[3] for b in up], up, 20) == "TREND"
+    assert S._apex_regime([b[3] for b in ch], ch, 20) == "RANGE"
+
+
+def test_apex_flat_in_range():
+    ch = _chop()
+    sig = S._apex_signal([b[3] for b in ch], ch, 20, S.CONFIG_DEFAULTS)
+    assert sig is None
+
+
+def test_apex_proves_on_trend():
+    r = S.prove_apex(_consensus_uptrend(), S.CONFIG_DEFAULTS)
+    assert r["ok"] is True and r["netPts"] > 0
+
+
+def test_apex_empty_is_honest():
+    r = S.prove_apex([], S.CONFIG_DEFAULTS)
+    assert r["ok"] is False and r["trades"] == 0
+
+
 if __name__ == "__main__":
     import sys
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
