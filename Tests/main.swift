@@ -1160,6 +1160,20 @@ func testLiveBackendIntegration() {
             ok((liveObj["gated"] as? Bool) == true || liveObj["symbol"] == nil, "[integration] /api/live honest gated/empty when no tick")
         }
     } else { ok(false, "[integration] /api/live reachable") }
+    // 5) /api/screen exposes the FULL edge-gated engine roster (every engine present, each row a
+    // real OOS verdict on the buyer's own bars — present-or-warming, never fabricated).
+    let roster = ["meanrev", "breakout", "research", "bible", "apex", "perp", "ctx_alpha", "ctx_bravo", "barber"]
+    if let screenObj = liveGET(base, "/api/screen", token: token) {
+        let rows = EngineRoster.decode(screenObj)
+        let present = Set(rows.map { $0.engine })
+        for e in roster { ok(present.contains(e), "[integration] /api/screen exposes engine \(e)") }
+        ok(rows.allSatisfy { $0.winRate >= 0 && $0.winRate <= 1 }, "[integration] screen winRates are real fractions [0,1]")
+    } else { ok(false, "[integration] /api/screen reachable") }
+    // 6) /api/fires decodes into the real (possibly empty) signal journal — never fabricated.
+    if let firesObj = liveGET(base, "/api/fires?limit=20", token: token) {
+        let fires = FireFeed.decode(firesObj)
+        ok(fires.allSatisfy { $0.entry > 0 && !$0.engine.isEmpty }, "[integration] /api/fires rows are real (positive entry, named engine) or empty")
+    } else { ok(false, "[integration] /api/fires reachable") }
 }
 
 // ChartScale axis intelligence
