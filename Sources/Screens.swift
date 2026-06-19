@@ -83,6 +83,7 @@ struct EquityCurveCard: View {
 struct SignalsScreen: View {
     @EnvironmentObject var model: AppModel
     @EnvironmentObject var wc: WealthChartsStore
+    @EnvironmentObject var feed: FeedClient
     @State private var inp = SignalInputs()
     @State private var scenarioIdx = 0
     @State private var committed = false
@@ -90,6 +91,11 @@ struct SignalsScreen: View {
     @State private var atrStr = "12"
     @State private var pvStr = "50"
     @State private var showConnectWC = false
+    // Backend engine fleet (real per-engine OOS verdicts on the buyer's own captured bars) + the
+    // real edge-gated fire journal. Empty until the buyer's WC feed has captured bars — honest.
+    @State private var fleet: [EngineRow] = []
+    @State private var backendFires: [FireRow] = []
+    @State private var fleetLoading = false
 
     private var result: SignalResult { SignalEngine.evaluate(inp) }
     private var gates: [GateCheck] { GateEngine.evaluate(inp, result) }
@@ -108,6 +114,10 @@ struct SignalsScreen: View {
 
                 // Reachable WealthCharts entry point from the main dashboard (also in Settings).
                 wealthChartsBanner
+
+                // The real edge-gated engine fleet (backend /api/screen + /api/fires) — every
+                // engine's honest OOS verdict on the buyer's OWN captured bars.
+                engineFleet
 
                 // Hero signal card + composite.
                 signalCard
@@ -204,7 +214,87 @@ struct SignalsScreen: View {
         .onChange(of: priceStr) { _ in pushNumbers() }
         .onChange(of: atrStr) { _ in pushNumbers() }
         .onChange(of: pvStr) { _ in pushNumbers() }
+        .task { await loadFleet() }
         .sheet(isPresented: $showConnectWC) { ConnectWealthChartsSheet().environmentObject(wc).sheetCloseBar() }
+    }
+
+    // Pull the real engine fleet + fire journal from the buyer's own backend. Honest empties on a
+    // cold store; never blocks the screen.
+    private func loadFleet() async {
+        fleetLoading = true
+        let rows = await feed.engineScreen()
+        let fires = await feed.recentFires()
+        await MainActor.run { fleet = rows; backendFires = fires; fleetLoading = false }
+    }
+
+    // The edge-gated engine fleet, grouped by engine with its real status. NEVER hardcodes a
+    // metric — every value is a decoded EngineRow/FireRow from the buyer's own backend.
+    private var engineFleet: some View {
+        let byEngine = Dictionary(grouping: fleet, by: { $0.engine })
+        let order = ["meanrev", "breakout", "research", "bible", "apex", "perp", "ctx_alpha", "ctx_bravo", "barber"]
+        let engines = order.filter { byEngine[$0] != nil } + byEngine.keys.filter { !order.contains($0) }.sorted()
+        let provenCount = engines.filter { (byEngine[$0] ?? []).contains { $0.edge } }.count
+        return Panel(title: "Engine fleet", icon: "cpu.fill", accent: BLTheme.gold) {
+            HStack(spacing: 8) {
+                Text("Each engine's edge is proven out-of-sample on YOUR captured bars. An engine fires only when it proves real held-out edge — nothing shows live without real math.")
+                    .font(.system(size: 11, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer()
+                if !fleet.isEmpty {
+                    StatusPill(text: "\(provenCount)/\(engines.count) edge-proven", tint: provenCount > 0 ? BLTheme.green : BLTheme.gold)
+                }
+            }
+            if fleet.isEmpty {
+                EmptyState(icon: "cpu", title: fleetLoading ? "Loading engine fleet…" : "Engine fleet idle",
+                           hint: "Connect your WealthCharts feed and let bars accumulate — each engine arms once your own data proves (or disproves) its edge out-of-sample. Nothing is shown until it's real.")
+            } else {
+                VStack(spacing: 8) { ForEach(engines, id: \.self) { e in engineFleetRow(e, byEngine[e] ?? []) } }
+            }
+            if !backendFires.isEmpty {
+                Divider().background(BLTheme.stroke).padding(.vertical, 2)
+                Text("Recent edge-gated fires").font(.system(size: 11, weight: .bold, design: .rounded)).foregroundColor(BLTheme.sub)
+                VStack(spacing: 6) { ForEach(backendFires.prefix(8)) { fireFeedRow($0) } }
+            }
+        }
+    }
+
+    private func engineFleetRow(_ engine: String, _ rows: [EngineRow]) -> some View {
+        let proven = rows.filter { $0.edge }
+        let allWarming = !rows.isEmpty && rows.allSatisfy { $0.warming }
+        let best = proven.max(by: { $0.netPts < $1.netPts }) ?? rows.max(by: { $0.netPts < $1.netPts })
+        let tint = !proven.isEmpty ? BLTheme.green : (allWarming ? BLTheme.gold : BLTheme.sub)
+        let status = !proven.isEmpty ? "EDGE" : (allWarming ? "WARMING" : "NO EDGE")
+        return HStack(spacing: 12) {
+            Image(systemName: "bolt.horizontal.circle.fill").font(.system(size: 14, weight: .bold)).foregroundColor(tint)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(engine).font(.system(size: 13, weight: .bold, design: .rounded)).foregroundColor(BLTheme.text)
+                Text(best?.reason ?? "no symbols captured yet").font(.system(size: 10, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub).lineLimit(1)
+            }
+            Spacer()
+            if let b = best, !proven.isEmpty {
+                VStack(alignment: .trailing, spacing: 2) {
+                    Text("\(TradeMath.pct(b.winRate*100)) · \(String(format: "%+.1f", b.netPts)) pts").font(.system(size: 11, weight: .bold, design: .rounded)).foregroundColor(BLTheme.text).monospacedDigit()
+                    Text("\(b.trades) OOS trades on \(b.symbol)").font(.system(size: 9.5, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+                }
+            }
+            StatusPill(text: status, tint: tint)
+        }
+        .padding(12).background(BLTheme.panel2).clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 11, style: .continuous).stroke(BLTheme.stroke, lineWidth: 1))
+    }
+
+    private func fireFeedRow(_ f: FireRow) -> some View {
+        let up = f.direction.lowercased() == "long"
+        return HStack(spacing: 10) {
+            Image(systemName: up ? "arrow.up.right.circle.fill" : "arrow.down.right.circle.fill")
+                .font(.system(size: 12, weight: .bold)).foregroundColor(up ? BLTheme.green : BLTheme.red)
+            Text(f.engine).font(.system(size: 11.5, weight: .bold, design: .rounded)).foregroundColor(BLTheme.text)
+            Text(f.symbol ?? "—").font(.system(size: 11, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+            Spacer()
+            Text("@ \(TradeMath.num(f.entry))").font(.system(size: 11, weight: .semibold, design: .rounded)).foregroundColor(BLTheme.text).monospacedDigit()
+            if let ts = f.ts { Text(ts).font(.system(size: 9.5, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub) }
+        }
+        .padding(.vertical, 6).padding(.horizontal, 10).background(BLTheme.bg2).clipShape(RoundedRectangle(cornerRadius: 9))
     }
 
     // Reachable WealthCharts connection banner — visible on the primary dashboard.

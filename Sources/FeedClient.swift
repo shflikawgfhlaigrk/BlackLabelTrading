@@ -166,6 +166,20 @@ final class FeedClient: ObservableObject {
         return LiveTick.decode(obj)
     }
 
+    // MARK: - Backend engine fleet (GET /api/screen): every engine's REAL per-symbol OOS verdict
+    // on the buyer's own captured bars. Empty store -> [] (honest; engines render "warming").
+    // Nothing fabricated — the rows are exactly what the gate proved (or couldn't) on real bars.
+    func engineScreen() async -> [EngineRow] {
+        guard signedIn, let obj = await getJSON("/api/screen") else { return [] }
+        return EngineRoster.decode(obj)
+    }
+
+    // MARK: - Signal journal (GET /api/fires): real edge-gated fires recorded from the live feed.
+    func recentFires(limit: Int = 50) async -> [FireRow] {
+        guard signedIn, let obj = await getJSON("/api/fires?limit=\(limit)") else { return [] }
+        return FireFeed.decode(obj)
+    }
+
     // MARK: - Connect the buyer's own WealthCharts session (launches the product-owned debug
     // Chrome at WC sign-in; reports REAL reachability). Signals-only — opens a login, nothing else.
     func launchCapture() async {
