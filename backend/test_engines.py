@@ -228,6 +228,54 @@ def test_ctx_empty_is_honest():
         assert r["ok"] is False and r["trades"] == 0
 
 
+# ===========================================================================
+# Task 8 — full-roster registration + capture live-fire dispatch
+# ===========================================================================
+ROSTER = ["meanrev", "breakout", "research", "bible", "apex", "perp",
+          "ctx_alpha", "ctx_bravo", "barber"]
+
+
+def test_roster_registered_everywhere():
+    for e in ROSTER:
+        assert e in S.PROVERS, f"{e} missing from PROVERS"
+        assert e in S.ENGINE_TRADES, f"{e} missing from ENGINE_TRADES"
+        assert e in S._KNOWN_ENGINES, f"{e} missing from _KNOWN_ENGINES"
+        assert e in S.CONFIG_DEFAULTS["engines"], f"{e} missing from default engines"
+
+
+def test_capture_signal_dispatch_covers_roster():
+    import bltd_capture as C
+    assert set(C.ENGINES) == set(ROSTER)
+    for e in C.ENGINES:
+        assert e in S.PROVERS
+
+
+def test_capture_signal_produces_each_new_engine_direction():
+    # The live-fire _signal path must yield a real signal (or honest None) for every engine
+    # on a series that triggers it — never crash, never an unknown-engine surprise.
+    import bltd_capture as C
+
+    class _StubStore:
+        def config(self):
+            return S.CONFIG_DEFAULTS
+
+    cap = C.Capture(_StubStore(), bar_seconds=15, lookback=20, edge_gate=True)
+    up = _consensus_uptrend()
+    dn = _downtrend()
+    # perp/apex/ctx_* go long on the uptrend; bible goes short on the downtrend
+    assert cap._signal("perp", up)["direction"] == "long"
+    assert cap._signal("apex", up)["direction"] == "long"
+    assert cap._signal("ctx_alpha", up)["direction"] == "long"
+    bsig = cap._signal("bible", dn)
+    assert bsig is not None and bsig["direction"] == "short"
+    assert cap._signal("bible", up) is None or cap._signal("bible", up)["direction"] == "short"
+
+
+def test_config_sanitizes_to_known_engines_only():
+    clean = S._sanitize({"engines": ["perp", "bogus", "apex"]})
+    assert clean["engines"] == ["perp", "apex"]   # unknown dropped, known kept in order
+
+
 if __name__ == "__main__":
     import sys
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

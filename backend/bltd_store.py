@@ -47,7 +47,11 @@ def default_config_path() -> str:
 # value is range-clamped so a bad write can never crash or de-honest the gate.
 # ---------------------------------------------------------------------------
 CONFIG_DEFAULTS = {
-    "engines": ["meanrev", "breakout", "research"],   # which engines may fire
+    # The full ported engine roster (meanrev/breakout/research + the AceOS ports). Every name
+    # here is registered in PROVERS + ENGINE_TRADES and has a live-fire signal; the edge gate
+    # decides per (engine,symbol) whether it may actually fire on the buyer's own bars.
+    "engines": ["meanrev", "breakout", "research", "bible", "apex", "perp",
+                "ctx_alpha", "ctx_bravo", "barber"],   # which engines may fire
     "lookback": 20,            # bars of context for the signal window
     "barSeconds": 15,          # bucket size of a closed bar
     "oosFrac": 0.4,            # held-out fraction for the OOS edge proof
@@ -77,7 +81,8 @@ _CONFIG_RANGES = {
     "accountSize": (0.0, 1e9), "riskPerTradePct": (0.0, 100.0),
     "maxDailyLossPct": (0.0, 100.0), "maxTrades": (0, 100000),
 }
-_KNOWN_ENGINES = ("meanrev", "breakout", "research")
+_KNOWN_ENGINES = ("meanrev", "breakout", "research", "bible", "apex", "perp",
+                  "ctx_alpha", "ctx_bravo", "barber")
 
 
 def _clamp(key, val):

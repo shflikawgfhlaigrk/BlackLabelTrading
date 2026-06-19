@@ -39,7 +39,8 @@ CDP_HOSTS = ("127.0.0.1", "[::1]")
 WC_HOST = "wealthcharts.com"   # matches app.wealthcharts.com / www.wealthcharts.com
 BAR_SECONDS = int(os.environ.get("BLTD_BAR_SECONDS", "15"))
 LOOKBACK = int(os.environ.get("BLTD_LOOKBACK", "20"))
-ENGINES = ("meanrev", "breakout", "research")
+ENGINES = ("meanrev", "breakout", "research", "bible", "apex", "perp",
+           "ctx_alpha", "ctx_bravo", "barber")
 EDGE_GATE = os.environ.get("BLTD_EDGE_GATE", "1") != "0"
 MAX_BARS = 400
 
@@ -345,6 +346,14 @@ class Capture:
         except Exception as exc:  # noqa: BLE001 — alerting is best-effort
             log.info("alert webhook failed: %s", exc)
 
+    # Live-fire signal functions for the ported AceOS engines (same geometry their gate proves).
+    # meanrev + breakout/research stay inline below; everything else dispatches here so the live
+    # signal matches the prover exactly (no drift between what fires and what backtested).
+    _SIG = {
+        "perp": S._perp_signal, "bible": S._bible_signal, "apex": S._apex_signal,
+        "barber": S._barber_signal, "ctx_alpha": S._ctxa_signal, "ctx_bravo": S._ctxb_signal,
+    }
+
     def _signal(self, engine: str, ohlc):
         """Current live signal for *engine* on the latest bar — same geometry the gate proves."""
         closes = [b[3] for b in ohlc]
@@ -368,6 +377,9 @@ class Capture:
                         "target": entry - S.MR_TGT_FRAC * (entry - mean),
                         "rationale": f"z={z:.2f} >= {S.MR_Z}: revert down to mean"}
             return None
+        fn = self._SIG.get(engine)
+        if fn:
+            return fn(closes, ohlc, self.lookback, self.store.config())
         # breakout / research are momentum-directional on the lookback range
         prior = closes[-self.lookback - 1:-1]
         if len(prior) < self.lookback:
