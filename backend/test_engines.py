@@ -169,6 +169,39 @@ def test_apex_empty_is_honest():
     assert r["ok"] is False and r["trades"] == 0
 
 
+# ===========================================================================
+# Task 6 — barber engine (consensus + Fibonacci golden-pocket gate)
+# ===========================================================================
+def _trend_with_pullbacks(n=260):
+    series = []
+    p = 100.0
+    for i in range(n):
+        p += 0.8 if i % 5 else -1.6   # net up with a 1-in-5 pullback into the retracement band
+        series.append((p,) * 4)
+    return series
+
+
+def test_barber_verdict_is_internally_consistent():
+    r = S.prove_barber(_trend_with_pullbacks(), S.CONFIG_DEFAULTS)
+    assert {"ok", "trades", "netPts", "expectancyR"}.issubset(r)
+    # whenever the gate says edge, it MUST be backed by positive expectancy + enough trades
+    assert (r["ok"] is False) or (r["expectancyR"] > 0 and r["trades"] >= S.MIN_TRADES)
+
+
+def test_barber_fib_gate_filters_a_pure_ramp():
+    # a pure ramp keeps fib_pos pinned at the swing top (~1.0), outside the long golden pocket
+    # [0.34,0.42] -> barber takes far fewer entries than the unguarded perp consensus.
+    ramp = _consensus_uptrend(200)
+    barber = S._barber_trades(ramp, 20, S.CONFIG_DEFAULTS)
+    perp = S._perp_trades(ramp, 20, S.CONFIG_DEFAULTS)
+    assert len(barber) < len(perp)
+
+
+def test_barber_empty_is_honest():
+    r = S.prove_barber([], S.CONFIG_DEFAULTS)
+    assert r["ok"] is False and r["trades"] == 0
+
+
 if __name__ == "__main__":
     import sys
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

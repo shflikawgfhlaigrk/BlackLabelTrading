@@ -698,11 +698,57 @@ def _apex_signal(closes, ohlc, lookback, cfg):
             "rationale": f"apex {d}: TREND regime (Kaufman ER/var-ratio), continuation"}
 
 
+# ---- barber (Ace Barber: consensus + Fibonacci golden-pocket entry gate) ----
+BARBER_FIB_LB = 60
+BARBER_LONG_LO, BARBER_LONG_HI = 0.34, 0.42     # golden pocket (long retracement)
+BARBER_SHORT_LO, BARBER_SHORT_HI = 0.58, 0.66   # golden pocket (short retracement)
+
+
+def _barber_dir(closes, ohlc, lookback, cfg):
+    """Barber sniper consensus + Fibonacci golden-pocket entry gate. A consensus LONG only fires
+    when the last close sits in the [0.34,0.42] retracement of the swing; a SHORT in [0.58,0.66].
+    GATED-OUT non-OHLC voters: CVD/divergence, SMT, session-DNA, order-flow absorption, FVG
+    context, entropy, VIX, econ-calendar."""
+    d = _consensus_dir(closes, ohlc, lookback, PERP_FAST, PERP_SLOW, PERP_ER)
+    if not d:
+        return None
+    pos = _fib_pos(closes, BARBER_FIB_LB)
+    if pos is None:
+        return None
+    if d == "long" and not (BARBER_LONG_LO <= pos <= BARBER_LONG_HI):
+        return None
+    if d == "short" and not (BARBER_SHORT_LO <= pos <= BARBER_SHORT_HI):
+        return None
+    return d
+
+
+def _barber_trades(ohlc, lookback=LOOKBACK, cfg=None):
+    return _consensus_engine_trades(ohlc, lookback, cfg, _barber_dir)
+
+
+def prove_barber(ohlc, cfg=None):
+    """Ace Barber (faithful OHLC core): consensus momentum with a Fibonacci golden-pocket entry
+    filter and ATR stop / 2:1 target geometry. GATED-OUT non-OHLC voters: CVD/divergence, SMT,
+    session-DNA, order-flow absorption, FVG context, entropy, VIX, econ-calendar."""
+    return _consensus_prove(ohlc, cfg, _barber_dir, "")
+
+
+def _barber_signal(closes, ohlc, lookback, cfg):
+    d = _barber_dir(closes, ohlc, lookback, cfg)
+    if not d:
+        return None
+    entry = closes[-1]
+    stop, target = _atr_stop_target(ohlc, entry, d, PERP_ATR_MULT, PERP_TARGET_R)
+    return {"direction": d, "stop": stop, "target": target,
+            "rationale": f"barber {d}: consensus in golden pocket (Fib {BARBER_LONG_LO}-{BARBER_LONG_HI})"}
+
+
 # Registry of per-engine OOS trade generators. Keeps the gate, the screener and the full
 # backtest report in lockstep — every engine's edge is proven from THIS walk, nothing else.
 # research reuses the breakout walk as its tradable OOS proxy (same as prove_research).
 ENGINE_TRADES = {"meanrev": _mr_trades, "breakout": _bk_trades, "research": _bk_trades,
-                 "perp": _perp_trades, "bible": _bible_trades, "apex": _apex_trades}
+                 "perp": _perp_trades, "bible": _bible_trades, "apex": _apex_trades,
+                 "barber": _barber_trades}
 
 
 def engine_trades(engine, oos_ohlc, lookback, cfg=None):
@@ -712,7 +758,8 @@ def engine_trades(engine, oos_ohlc, lookback, cfg=None):
 
 
 PROVERS = {"meanrev": prove_meanrev, "breakout": prove_breakout, "research": prove_research,
-           "perp": prove_perp, "bible": prove_bible, "apex": prove_apex}
+           "perp": prove_perp, "bible": prove_bible, "apex": prove_apex,
+           "barber": prove_barber}
 
 
 # ===========================================================================
