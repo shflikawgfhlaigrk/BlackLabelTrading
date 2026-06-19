@@ -471,10 +471,117 @@ def prove_research(ohlc, cfg=None):
     return r
 
 
+# ===========================================================================
+# Ported AceOS engines (faithful OHLC cores). Each ports the OHLC-supportable signal of the real
+# engine; non-OHLC voters (CVD/order-flow, entropy, VIX, econ-calendar, SMT, absorption,
+# session-DNA, world-model win-rate) are documented as GATED-OUT in each prover's docstring and
+# are NOT invented. All share the consensus + ATR-geometry primitives below so the roster is DRY.
+# ===========================================================================
+PERP_FAST, PERP_SLOW = 8, 21
+PERP_ER = 0.30          # Kaufman ER floor: only trade when a real trend is present
+PERP_ATR_MULT = 0.8     # stop = 0.8 * ATR (faithful to the sniper engine geometry)
+PERP_TARGET_R = 2.0     # 2:1 reward:risk (faithful)
+
+
+def _consensus_dir(closes, ohlc, lookback, fast, slow, er_floor):
+    """The OHLC-derivable sniper consensus: StepGMA direction + EMA-ribbon stack + Kaufman-ER
+    trend gate. Returns 'long'/'short'/None. (Order-flow CVD/SMT/absorption + entropy/VIX/econ
+    voters from the real engine are NON-OHLC and intentionally omitted — documented gated-out.)"""
+    if len(closes) < slow + 1:
+        return None
+    sdir, _ = _stepgma_dir(closes, fast, slow)
+    ribbon = _ribbon_bull(closes)
+    if _kaufman_er(closes, lookback) < er_floor:
+        return None                       # no trend present -> stand aside
+    if sdir == "bull" and ribbon is not False:
+        return "long"
+    if sdir == "bear" and ribbon is not True:
+        return "short"
+    return None
+
+
+def _atr_stop_target(ohlc, entry, direction, atr_mult, target_r):
+    """ATR-based stop/target faithful to the sniper geometry. Falls back to a 0.4% stop when
+    ATR is undefined so the geometry is always well-formed (never a zero-risk trade)."""
+    atr = _atr(ohlc, 14) or (entry * 0.004)
+    stop_d = max(atr * atr_mult, abs(entry) * 1e-4)
+    if direction == "long":
+        return entry - stop_d, entry + target_r * stop_d
+    return entry + stop_d, entry - target_r * stop_d
+
+
+def _consensus_engine_trades(ohlc, lookback, cfg, dir_fn):
+    """Shared OOS walk for the consensus-family engines. `dir_fn(closes, ohlc, lookback, cfg)`
+    yields 'long'/'short'/None on each bar; geometry is the shared ATR stop/2:1 target."""
+    cfg = cfg or CONFIG_DEFAULTS
+    closes = [b[3] for b in ohlc]
+    trades = []
+    i = lookback
+    n = len(ohlc)
+    while i < n:
+        sub = ohlc[:i + 1]
+        d = dir_fn(closes[:i + 1], sub, lookback, cfg)
+        if not d:
+            i += 1
+            continue
+        entry = closes[i]
+        stop, target = _atr_stop_target(sub, entry, d, PERP_ATR_MULT, PERP_TARGET_R)
+        t = _mr_simulate_ohlc(ohlc, i, d, entry, stop, target, MR_MAX_HOLD)
+        if not t:
+            i += 1
+            continue
+        trades.append(t)
+        i += max(1, t["held"])
+    return trades
+
+
+def _consensus_prove(ohlc, cfg, dir_fn, label):
+    """Shared OOS edge proof for the consensus-family engines."""
+    cfg = cfg or CONFIG_DEFAULTS
+    oos_frac = cfg.get("oosFrac", OOS_FRAC)
+    lookback = cfg.get("lookback", LOOKBACK)
+    min_trades = cfg.get("minTrades", MIN_TRADES)
+    split = int(len(ohlc) * (1.0 - oos_frac))
+    s = _summarize(_consensus_engine_trades(ohlc[split:], lookback, cfg, dir_fn), min_trades)
+    reason = (f"edge proven: OOS expectancy {s['expectancyR']:+.3f}R / net {s['netPts']:+.2f} pts on {s['trades']} trades"
+              if s["edgeProven"] else
+              f"not proven: OOS expectancy {s['expectancyR']:+.3f}R on {s['trades']} trades")
+    return {"ok": s["edgeProven"], "reason": f"{label}: {reason}" if label else reason, **s}
+
+
+# ---- perp (Perplexity V2 sniper consensus, unguarded + symmetric) ----------
+def _perp_dir(closes, ohlc, lookback, cfg):
+    return _consensus_dir(closes, ohlc, lookback, PERP_FAST, PERP_SLOW, PERP_ER)
+
+
+def _perp_trades(ohlc, lookback=LOOKBACK, cfg=None):
+    return _consensus_engine_trades(ohlc, lookback, cfg, _perp_dir)
+
+
+def prove_perp(ohlc, cfg=None):
+    """Perplexity V2 'sniper' consensus (faithful OHLC core): trend-confirmed momentum
+    (StepGMA direction + EMA-ribbon stack + Kaufman-ER trend gate), symmetric long/short, ATR
+    stop / 2:1 target. GATED-OUT non-OHLC voters: CVD + CVD divergence, Shannon entropy, VIX
+    panic, econ-calendar, SMT divergence, order-flow absorption, session-DNA. Edge proven only
+    on the held-out tail."""
+    return _consensus_prove(ohlc, cfg, _perp_dir, "")
+
+
+def _perp_signal(closes, ohlc, lookback, cfg):
+    d = _perp_dir(closes, ohlc, lookback, cfg)
+    if not d:
+        return None
+    entry = closes[-1]
+    stop, target = _atr_stop_target(ohlc, entry, d, PERP_ATR_MULT, PERP_TARGET_R)
+    return {"direction": d, "stop": stop, "target": target,
+            "rationale": f"perp consensus {d}: StepGMA+ribbon aligned, Kaufman ER>={PERP_ER}"}
+
+
 # Registry of per-engine OOS trade generators. Keeps the gate, the screener and the full
 # backtest report in lockstep — every engine's edge is proven from THIS walk, nothing else.
 # research reuses the breakout walk as its tradable OOS proxy (same as prove_research).
-ENGINE_TRADES = {"meanrev": _mr_trades, "breakout": _bk_trades, "research": _bk_trades}
+ENGINE_TRADES = {"meanrev": _mr_trades, "breakout": _bk_trades, "research": _bk_trades,
+                 "perp": _perp_trades}
 
 
 def engine_trades(engine, oos_ohlc, lookback, cfg=None):
@@ -483,7 +590,8 @@ def engine_trades(engine, oos_ohlc, lookback, cfg=None):
     return gen(oos_ohlc, lookback, cfg) if gen else []
 
 
-PROVERS = {"meanrev": prove_meanrev, "breakout": prove_breakout, "research": prove_research}
+PROVERS = {"meanrev": prove_meanrev, "breakout": prove_breakout, "research": prove_research,
+           "perp": prove_perp}
 
 
 # ===========================================================================

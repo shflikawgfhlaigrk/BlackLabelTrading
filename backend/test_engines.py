@@ -93,6 +93,32 @@ def test_analytics_trades_for_matches_gate():
     assert trades == S._bk_trades(oos, cfg["lookback"], cfg)
 
 
+# ===========================================================================
+# Task 3 — perp engine (clean symmetric momentum consensus)
+# ===========================================================================
+def test_perp_proves_on_trend():
+    r = S.prove_perp(_consensus_uptrend(), S.CONFIG_DEFAULTS)
+    assert {"ok", "reason", "trades", "winRate", "netPts", "expectancyR"}.issubset(r)
+    assert r["ok"] is True
+    assert r["netPts"] > 0
+
+
+def test_perp_no_edge_on_chop():
+    r = S.prove_perp(_chop(), S.CONFIG_DEFAULTS)
+    assert r["ok"] is False
+
+
+def test_perp_empty_is_honest():
+    r = S.prove_perp([], S.CONFIG_DEFAULTS)
+    assert r["ok"] is False and r["trades"] == 0
+
+
+def test_perp_signal_long_on_uptrend():
+    ohlc = _consensus_uptrend()
+    sig = S._perp_signal([b[3] for b in ohlc], ohlc, 20, S.CONFIG_DEFAULTS)
+    assert sig is not None and sig["direction"] == "long"
+
+
 if __name__ == "__main__":
     import sys
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
