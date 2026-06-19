@@ -47,11 +47,11 @@ def default_config_path() -> str:
 # value is range-clamped so a bad write can never crash or de-honest the gate.
 # ---------------------------------------------------------------------------
 CONFIG_DEFAULTS = {
-    # The full ported engine roster (meanrev/breakout/research + the AceOS ports). Every name
+    # The full engine roster (meanrev/breakout/research + the consensus-family engines). Every name
     # here is registered in PROVERS + ENGINE_TRADES and has a live-fire signal; the edge gate
     # decides per (engine,symbol) whether it may actually fire on the buyer's own bars.
-    "engines": ["meanrev", "breakout", "research", "bible", "apex", "perp",
-                "ctx_alpha", "ctx_bravo", "barber"],   # which engines may fire
+    "engines": ["meanrev", "breakout", "research", "momentum", "structure", "regime",
+                "channel", "context_a", "context_b"],   # which engines may fire
     "lookback": 20,            # bars of context for the signal window
     "barSeconds": 15,          # bucket size of a closed bar
     "oosFrac": 0.4,            # held-out fraction for the OOS edge proof
@@ -81,8 +81,8 @@ _CONFIG_RANGES = {
     "accountSize": (0.0, 1e9), "riskPerTradePct": (0.0, 100.0),
     "maxDailyLossPct": (0.0, 100.0), "maxTrades": (0, 100000),
 }
-_KNOWN_ENGINES = ("meanrev", "breakout", "research", "bible", "apex", "perp",
-                  "ctx_alpha", "ctx_bravo", "barber")
+_KNOWN_ENGINES = ("meanrev", "breakout", "research", "momentum", "structure", "regime",
+                  "channel", "context_a", "context_b")
 
 
 def _clamp(key, val):
@@ -204,8 +204,8 @@ def ohlc_bars(ticks, bar_seconds: int = 15):
 
 
 # ===========================================================================
-# Pure OHLC indicator helpers — the shared voter primitives the ported engines
-# (bible/apex/perp/barber/ctx_*) compute their signals from. Stdlib-only, no state.
+# Pure OHLC indicator helpers — the shared voter primitives the consensus-family engines
+# (momentum/structure/regime/channel/context_*) compute their signals from. Stdlib-only, no state.
 # These are the OHLC-derivable cores of the real engines' indicator stack (EMA ribbon,
 # StepGMA-style fast/slow slope, Kaufman efficiency-ratio regime, ATR geometry, Fibonacci
 # golden-pocket position). Order-flow voters (CVD, SMT, absorption) and macro voters
@@ -477,15 +477,15 @@ def prove_research(ohlc, cfg=None):
 
 
 # ===========================================================================
-# Ported AceOS engines (faithful OHLC cores). Each ports the OHLC-supportable signal of the real
-# engine; non-OHLC voters (CVD/order-flow, entropy, VIX, econ-calendar, SMT, absorption,
+# Consensus-family engines (faithful OHLC cores). Each implements the OHLC-supportable signal of
+# its archetype; non-OHLC voters (CVD/order-flow, entropy, VIX, econ-calendar, SMT, absorption,
 # session-DNA, world-model win-rate) are documented as GATED-OUT in each prover's docstring and
 # are NOT invented. All share the consensus + ATR-geometry primitives below so the roster is DRY.
 # ===========================================================================
-PERP_FAST, PERP_SLOW = 8, 21
-PERP_ER = 0.30          # Kaufman ER floor: only trade when a real trend is present
-PERP_ATR_MULT = 0.8     # stop = 0.8 * ATR (faithful to the sniper engine geometry)
-PERP_TARGET_R = 2.0     # 2:1 reward:risk (faithful)
+MO_FAST, MO_SLOW = 8, 21
+MO_ER = 0.30          # Kaufman ER floor: only trade when a real trend is present
+MO_ATR_MULT = 0.8     # stop = 0.8 * ATR (momentum-family geometry)
+MO_TARGET_R = 2.0     # 2:1 reward:risk
 
 
 def _consensus_dir(closes, ohlc, lookback, fast, slow, er_floor):
@@ -530,7 +530,7 @@ def _consensus_engine_trades(ohlc, lookback, cfg, dir_fn):
             i += 1
             continue
         entry = closes[i]
-        stop, target = _atr_stop_target(sub, entry, d, PERP_ATR_MULT, PERP_TARGET_R)
+        stop, target = _atr_stop_target(sub, entry, d, MO_ATR_MULT, MO_TARGET_R)
         t = _mr_simulate_ohlc(ohlc, i, d, entry, stop, target, MR_MAX_HOLD)
         if not t:
             i += 1
@@ -554,78 +554,77 @@ def _consensus_prove(ohlc, cfg, dir_fn, label):
     return {"ok": s["edgeProven"], "reason": f"{label}: {reason}" if label else reason, **s}
 
 
-# ---- perp (Perplexity V2 sniper consensus, unguarded + symmetric) ----------
-def _perp_dir(closes, ohlc, lookback, cfg):
-    return _consensus_dir(closes, ohlc, lookback, PERP_FAST, PERP_SLOW, PERP_ER)
+# ---- momentum (trend-confirmed momentum consensus, unguarded + symmetric) --
+def _momentum_dir(closes, ohlc, lookback, cfg):
+    return _consensus_dir(closes, ohlc, lookback, MO_FAST, MO_SLOW, MO_ER)
 
 
-def _perp_trades(ohlc, lookback=LOOKBACK, cfg=None):
-    return _consensus_engine_trades(ohlc, lookback, cfg, _perp_dir)
+def _momentum_trades(ohlc, lookback=LOOKBACK, cfg=None):
+    return _consensus_engine_trades(ohlc, lookback, cfg, _momentum_dir)
 
 
-def prove_perp(ohlc, cfg=None):
-    """Perplexity V2 'sniper' consensus (faithful OHLC core): trend-confirmed momentum
+def prove_momentum(ohlc, cfg=None):
+    """Momentum (faithful OHLC core): trend-confirmed momentum
     (StepGMA direction + EMA-ribbon stack + Kaufman-ER trend gate), symmetric long/short, ATR
     stop / 2:1 target. GATED-OUT non-OHLC voters: CVD + CVD divergence, Shannon entropy, VIX
     panic, econ-calendar, SMT divergence, order-flow absorption, session-DNA. Edge proven only
     on the held-out tail."""
-    return _consensus_prove(ohlc, cfg, _perp_dir, "")
+    return _consensus_prove(ohlc, cfg, _momentum_dir, "")
 
 
-def _perp_signal(closes, ohlc, lookback, cfg):
-    d = _perp_dir(closes, ohlc, lookback, cfg)
+def _momentum_signal(closes, ohlc, lookback, cfg):
+    d = _momentum_dir(closes, ohlc, lookback, cfg)
     if not d:
         return None
     entry = closes[-1]
-    stop, target = _atr_stop_target(ohlc, entry, d, PERP_ATR_MULT, PERP_TARGET_R)
+    stop, target = _atr_stop_target(ohlc, entry, d, MO_ATR_MULT, MO_TARGET_R)
     return {"direction": d, "stop": stop, "target": target,
-            "rationale": f"perp consensus {d}: StepGMA+ribbon aligned, Kaufman ER>={PERP_ER}"}
+            "rationale": f"momentum consensus {d}: StepGMA+ribbon aligned, Kaufman ER>={MO_ER}"}
 
 
-# ---- bible (Perplexity Apex Signal Bible: perp consensus + Bible guards) ----
-BIBLE_REGIME_ER = 0.40   # GUARD_BLOCK_REGIME=TREND_UP: block entries when ER>=this & trending up
+# ---- structure (guarded, short-biased counter-trend consensus) -------------
+STRUCT_REGIME_ER = 0.40   # block entries when 30-bar Kaufman ER >= this & trending up
 
 
-def _bible_dir(closes, ohlc, lookback, cfg):
-    """Bible = perp consensus with the real engine's guards ported: block LONG side entirely
-    (GUARD_BLOCK_SIDE=LONG), and block any entry while the tape trends UP (30-bar Kaufman ER >=
-    0.40 with up direction, GUARD_BLOCK_REGIME=TREND_UP). Net: short-biased, counter-up-trend.
-    GATED-OUT: the Bible setup-library (non-OHLC patterns) + the same order-flow/macro voters as
-    perp."""
-    d = _consensus_dir(closes, ohlc, lookback, PERP_FAST, PERP_SLOW, PERP_ER)
+def _structure_dir(closes, ohlc, lookback, cfg):
+    """Structure = momentum consensus with structural guards: block LONG side entirely, and
+    block any entry while the tape trends UP (30-bar Kaufman ER >= 0.40 with up direction). Net:
+    short-biased, counter-up-trend. GATED-OUT: non-OHLC setup-library patterns + the same
+    order-flow/macro voters as momentum."""
+    d = _consensus_dir(closes, ohlc, lookback, MO_FAST, MO_SLOW, MO_ER)
     if d == "long":
-        return None                                   # GUARD_BLOCK_SIDE=LONG
+        return None                                   # block LONG side
     er = _kaufman_er(closes, 30)
-    sdir, _ = _stepgma_dir(closes, PERP_FAST, PERP_SLOW)
-    if er >= BIBLE_REGIME_ER and sdir == "bull":
-        return None                                   # GUARD_BLOCK_REGIME=TREND_UP
+    sdir, _ = _stepgma_dir(closes, MO_FAST, MO_SLOW)
+    if er >= STRUCT_REGIME_ER and sdir == "bull":
+        return None                                   # block TREND_UP regime
     return d
 
 
-def _bible_trades(ohlc, lookback=LOOKBACK, cfg=None):
-    return _consensus_engine_trades(ohlc, lookback, cfg, _bible_dir)
+def _structure_trades(ohlc, lookback=LOOKBACK, cfg=None):
+    return _consensus_engine_trades(ohlc, lookback, cfg, _structure_dir)
 
 
-def prove_bible(ohlc, cfg=None):
-    """Perplexity Apex Signal Bible (faithful OHLC core): short-biased, counter-up-trend
-    momentum (LONG side blocked, TREND_UP regime blocked). GATED-OUT non-OHLC voters: the Bible
-    setup-library patterns, CVD/divergence, entropy, VIX, econ-calendar, SMT, absorption."""
-    return _consensus_prove(ohlc, cfg, _bible_dir, "")
+def prove_structure(ohlc, cfg=None):
+    """Structure (faithful OHLC core): short-biased, counter-up-trend momentum (LONG side
+    blocked, up-trend regime blocked). GATED-OUT non-OHLC voters: setup-library patterns,
+    CVD/divergence, entropy, VIX, econ-calendar, SMT, absorption."""
+    return _consensus_prove(ohlc, cfg, _structure_dir, "")
 
 
-def _bible_signal(closes, ohlc, lookback, cfg):
-    d = _bible_dir(closes, ohlc, lookback, cfg)
+def _structure_signal(closes, ohlc, lookback, cfg):
+    d = _structure_dir(closes, ohlc, lookback, cfg)
     if not d:
         return None
     entry = closes[-1]
-    stop, target = _atr_stop_target(ohlc, entry, d, PERP_ATR_MULT, PERP_TARGET_R)
+    stop, target = _atr_stop_target(ohlc, entry, d, MO_ATR_MULT, MO_TARGET_R)
     return {"direction": d, "stop": stop, "target": target,
-            "rationale": f"bible {d}: short-biased consensus (LONG/TREND_UP blocked)"}
+            "rationale": f"structure {d}: short-biased consensus (LONG/up-trend blocked)"}
 
 
-# ---- apex (Apex Prime regime router -> trend continuation) -----------------
-APEX_TREND_ER = 0.45    # Kaufman ER >= this -> TREND regime (apex regime_router intent)
-APEX_RANGE_ER = 0.25    # Kaufman ER <= this -> RANGE regime
+# ---- regime (regime router -> trend continuation) --------------------------
+REGIME_TREND_ER = 0.45    # Kaufman ER >= this -> TREND regime
+REGIME_RANGE_ER = 0.25    # Kaufman ER <= this -> RANGE regime
 
 
 def _variance_ratio(closes, lookback):
@@ -648,18 +647,18 @@ def _variance_ratio(closes, lookback):
     return (vk / (k * v1)) if v1 > 0 else 1.0
 
 
-def _apex_regime(closes, ohlc, lookback):
-    """Apex regime classification (OHLC core of regime_router): weighted vote of Kaufman-ER
+def _regime_class(closes, ohlc, lookback):
+    """Regime classification (OHLC core of the regime router): weighted vote of Kaufman-ER
     (trend strength), variance-ratio (trend persistence proxy for entropy), and StepGMA
     direction. Returns 'TREND' or 'RANGE'. NON-OHLC voters (Hurst from order flow, $TICK
     breadth, VIX, macro-calendar) are gated out."""
     er = _kaufman_er(closes, lookback)
     vr = _variance_ratio(closes, lookback)
-    sdir, _ = _stepgma_dir(closes, PERP_FAST, PERP_SLOW)
+    sdir, _ = _stepgma_dir(closes, MO_FAST, MO_SLOW)
     trend_votes = range_votes = 0.0
-    if er >= APEX_TREND_ER:
+    if er >= REGIME_TREND_ER:
         trend_votes += 1.5
-    elif er <= APEX_RANGE_ER:
+    elif er <= REGIME_RANGE_ER:
         range_votes += 1.5
     if vr > 1.1:
         trend_votes += 1.0
@@ -672,100 +671,98 @@ def _apex_regime(closes, ohlc, lookback):
     return "TREND" if trend_votes > range_votes else "RANGE"
 
 
-def _apex_dir(closes, ohlc, lookback, cfg):
-    """Apex trades trend-continuation ONLY in a classified TREND regime; flat otherwise."""
-    if _apex_regime(closes, ohlc, lookback) != "TREND":
+def _regime_dir(closes, ohlc, lookback, cfg):
+    """Regime trades trend-continuation ONLY in a classified TREND regime; flat otherwise."""
+    if _regime_class(closes, ohlc, lookback) != "TREND":
         return None
-    sdir, _ = _stepgma_dir(closes, PERP_FAST, PERP_SLOW)
+    sdir, _ = _stepgma_dir(closes, MO_FAST, MO_SLOW)
     return "long" if sdir == "bull" else ("short" if sdir == "bear" else None)
 
 
-def _apex_trades(ohlc, lookback=LOOKBACK, cfg=None):
-    return _consensus_engine_trades(ohlc, lookback, cfg, _apex_dir)
+def _regime_trades(ohlc, lookback=LOOKBACK, cfg=None):
+    return _consensus_engine_trades(ohlc, lookback, cfg, _regime_dir)
 
 
-def prove_apex(ohlc, cfg=None):
-    """Apex Prime (faithful OHLC core): regime-gated trend continuation — trades only in a
+def prove_regime(ohlc, cfg=None):
+    """Regime (faithful OHLC core): regime-gated trend continuation — trades only in a
     classified TREND regime (Kaufman-ER + variance-ratio + StepGMA vote), flat in RANGE.
     GATED-OUT non-OHLC: Hurst (order-flow), Shannon/permutation entropy, $TICK/$ADD breadth,
     VIX, macro-calendar blackouts (ES-settlement/CME-maintenance/FOMC/CPI/NFP), the risk-shell
     daily-loss kill."""
-    return _consensus_prove(ohlc, cfg, _apex_dir, "")
+    return _consensus_prove(ohlc, cfg, _regime_dir, "")
 
 
-def _apex_signal(closes, ohlc, lookback, cfg):
-    d = _apex_dir(closes, ohlc, lookback, cfg)
+def _regime_signal(closes, ohlc, lookback, cfg):
+    d = _regime_dir(closes, ohlc, lookback, cfg)
     if not d:
         return None
     entry = closes[-1]
-    stop, target = _atr_stop_target(ohlc, entry, d, PERP_ATR_MULT, PERP_TARGET_R)
+    stop, target = _atr_stop_target(ohlc, entry, d, MO_ATR_MULT, MO_TARGET_R)
     return {"direction": d, "stop": stop, "target": target,
-            "rationale": f"apex {d}: TREND regime (Kaufman ER/var-ratio), continuation"}
+            "rationale": f"regime {d}: TREND regime (Kaufman ER/var-ratio), continuation"}
 
 
-# ---- barber (Ace Barber: consensus + Fibonacci golden-pocket entry gate) ----
-BARBER_FIB_LB = 60
-BARBER_LONG_LO, BARBER_LONG_HI = 0.34, 0.42     # golden pocket (long retracement)
-BARBER_SHORT_LO, BARBER_SHORT_HI = 0.58, 0.66   # golden pocket (short retracement)
+# ---- channel (consensus + Fibonacci golden-pocket entry gate) --------------
+CHAN_FIB_LB = 60
+CHAN_LONG_LO, CHAN_LONG_HI = 0.34, 0.42     # golden pocket (long retracement)
+CHAN_SHORT_LO, CHAN_SHORT_HI = 0.58, 0.66   # golden pocket (short retracement)
 
 
-def _barber_dir(closes, ohlc, lookback, cfg):
-    """Barber sniper consensus + Fibonacci golden-pocket entry gate. A consensus LONG only fires
-    when the last close sits in the [0.34,0.42] retracement of the swing; a SHORT in [0.58,0.66].
-    GATED-OUT non-OHLC voters: CVD/divergence, SMT, session-DNA, order-flow absorption, FVG
-    context, entropy, VIX, econ-calendar."""
-    d = _consensus_dir(closes, ohlc, lookback, PERP_FAST, PERP_SLOW, PERP_ER)
+def _channel_dir(closes, ohlc, lookback, cfg):
+    """Channel = momentum consensus + Fibonacci golden-pocket entry gate. A consensus LONG only
+    fires when the last close sits in the [0.34,0.42] retracement of the swing; a SHORT in
+    [0.58,0.66]. GATED-OUT non-OHLC voters: CVD/divergence, SMT, session-DNA, order-flow
+    absorption, FVG context, entropy, VIX, econ-calendar."""
+    d = _consensus_dir(closes, ohlc, lookback, MO_FAST, MO_SLOW, MO_ER)
     if not d:
         return None
-    pos = _fib_pos(closes, BARBER_FIB_LB)
+    pos = _fib_pos(closes, CHAN_FIB_LB)
     if pos is None:
         return None
-    if d == "long" and not (BARBER_LONG_LO <= pos <= BARBER_LONG_HI):
+    if d == "long" and not (CHAN_LONG_LO <= pos <= CHAN_LONG_HI):
         return None
-    if d == "short" and not (BARBER_SHORT_LO <= pos <= BARBER_SHORT_HI):
+    if d == "short" and not (CHAN_SHORT_LO <= pos <= CHAN_SHORT_HI):
         return None
     return d
 
 
-def _barber_trades(ohlc, lookback=LOOKBACK, cfg=None):
-    return _consensus_engine_trades(ohlc, lookback, cfg, _barber_dir)
+def _channel_trades(ohlc, lookback=LOOKBACK, cfg=None):
+    return _consensus_engine_trades(ohlc, lookback, cfg, _channel_dir)
 
 
-def prove_barber(ohlc, cfg=None):
-    """Ace Barber (faithful OHLC core): consensus momentum with a Fibonacci golden-pocket entry
+def prove_channel(ohlc, cfg=None):
+    """Channel (faithful OHLC core): consensus momentum with a Fibonacci golden-pocket entry
     filter and ATR stop / 2:1 target geometry. GATED-OUT non-OHLC voters: CVD/divergence, SMT,
     session-DNA, order-flow absorption, FVG context, entropy, VIX, econ-calendar."""
-    return _consensus_prove(ohlc, cfg, _barber_dir, "")
+    return _consensus_prove(ohlc, cfg, _channel_dir, "")
 
 
-def _barber_signal(closes, ohlc, lookback, cfg):
-    d = _barber_dir(closes, ohlc, lookback, cfg)
+def _channel_signal(closes, ohlc, lookback, cfg):
+    d = _channel_dir(closes, ohlc, lookback, cfg)
     if not d:
         return None
     entry = closes[-1]
-    stop, target = _atr_stop_target(ohlc, entry, d, PERP_ATR_MULT, PERP_TARGET_R)
+    stop, target = _atr_stop_target(ohlc, entry, d, MO_ATR_MULT, MO_TARGET_R)
     return {"direction": d, "stop": stop, "target": target,
-            "rationale": f"barber {d}: consensus in golden pocket (Fib {BARBER_LONG_LO}-{BARBER_LONG_HI})"}
+            "rationale": f"channel {d}: consensus in golden pocket (Fib {CHAN_LONG_LO}-{CHAN_LONG_HI})"}
 
 
-# ---- ctx_alpha / ctx_bravo (Context engines: A/B context-strictness split) --
-# Alpha and bravo share the sniper-consensus core (byte-identical in source); the real
-# differentiator is their .env tuning + the context-gate strictness (perp_v2/{grade}/{dir}
-# win-rate gate). The OHLC-faithful A/B lever: alpha = the loose perp consensus; bravo = a
-# strict variant requiring a FULLY-stacked EMA ribbon (not merely 'not-opposite') AND a higher
-# Kaufman-ER floor. The world-model win-rate gate is NON-OHLC (needs the buyer's own graded
-# journal, which ships EMPTY) -> documented gated-out.
-CTXB_ER = 0.45   # ctx_bravo: stricter Kaufman-ER trend gate than alpha (perp default 0.30)
+# ---- context_a / context_b (Context engines: A/B context-strictness split) -
+# A and B share the momentum-consensus core; the OHLC-faithful A/B lever: A = the loose momentum
+# consensus; B = a strict variant requiring a FULLY-stacked EMA ribbon (not merely 'not-opposite')
+# AND a higher Kaufman-ER floor. The world-model win-rate gate is NON-OHLC (needs the buyer's own
+# graded journal, which ships EMPTY) -> documented gated-out.
+CTX_B_ER = 0.45   # context_b: stricter Kaufman-ER trend gate than context_a (default 0.30)
 
 
 def _ctx_dir(closes, ohlc, lookback, strict):
     if not strict:
-        return _consensus_dir(closes, ohlc, lookback, PERP_FAST, PERP_SLOW, PERP_ER)
-    if len(closes) < PERP_SLOW + 1:
+        return _consensus_dir(closes, ohlc, lookback, MO_FAST, MO_SLOW, MO_ER)
+    if len(closes) < MO_SLOW + 1:
         return None
-    sdir, _ = _stepgma_dir(closes, PERP_FAST, PERP_SLOW)
+    sdir, _ = _stepgma_dir(closes, MO_FAST, MO_SLOW)
     ribbon = _ribbon_bull(closes)
-    if _kaufman_er(closes, lookback) < CTXB_ER:
+    if _kaufman_er(closes, lookback) < CTX_B_ER:
         return None
     if sdir == "bull" and ribbon is True:
         return "long"
@@ -774,62 +771,63 @@ def _ctx_dir(closes, ohlc, lookback, strict):
     return None
 
 
-def _ctxa_dir(closes, ohlc, lookback, cfg):
+def _context_a_dir(closes, ohlc, lookback, cfg):
     return _ctx_dir(closes, ohlc, lookback, strict=False)
 
 
-def _ctxb_dir(closes, ohlc, lookback, cfg):
+def _context_b_dir(closes, ohlc, lookback, cfg):
     return _ctx_dir(closes, ohlc, lookback, strict=True)
 
 
-def _ctxa_trades(ohlc, lookback=LOOKBACK, cfg=None):
-    return _consensus_engine_trades(ohlc, lookback, cfg, _ctxa_dir)
+def _context_a_trades(ohlc, lookback=LOOKBACK, cfg=None):
+    return _consensus_engine_trades(ohlc, lookback, cfg, _context_a_dir)
 
 
-def _ctxb_trades(ohlc, lookback=LOOKBACK, cfg=None):
-    return _consensus_engine_trades(ohlc, lookback, cfg, _ctxb_dir)
+def _context_b_trades(ohlc, lookback=LOOKBACK, cfg=None):
+    return _consensus_engine_trades(ohlc, lookback, cfg, _context_b_dir)
 
 
-def prove_ctx_alpha(ohlc, cfg=None):
-    """Context Alpha (faithful OHLC core): perp consensus with the looser context profile.
-    GATED-OUT non-OHLC: the world-model win-rate gate (perp_v2/{grade}/{dir}) needs the buyer's
-    own graded journal (ships empty) + the same order-flow/macro voters as perp."""
-    return _consensus_prove(ohlc, cfg, _ctxa_dir, "ctx_alpha")
+def prove_context_a(ohlc, cfg=None):
+    """Context A (faithful OHLC core): momentum consensus with the looser context profile.
+    GATED-OUT non-OHLC: the world-model win-rate gate needs the buyer's own graded journal
+    (ships empty) + the same order-flow/macro voters as momentum."""
+    return _consensus_prove(ohlc, cfg, _context_a_dir, "context_a")
 
 
-def prove_ctx_bravo(ohlc, cfg=None):
-    """Context Bravo (faithful OHLC core): perp consensus with the STRICTER context profile
+def prove_context_b(ohlc, cfg=None):
+    """Context B (faithful OHLC core): momentum consensus with the STRICTER context profile
     (full EMA-ribbon stack + higher Kaufman-ER floor). GATED-OUT non-OHLC: the world-model
-    win-rate gate (ships empty) + the same order-flow/macro voters as perp."""
-    return _consensus_prove(ohlc, cfg, _ctxb_dir, "ctx_bravo")
+    win-rate gate (ships empty) + the same order-flow/macro voters as momentum."""
+    return _consensus_prove(ohlc, cfg, _context_b_dir, "context_b")
 
 
-def _ctxa_signal(closes, ohlc, lookback, cfg):
-    d = _ctxa_dir(closes, ohlc, lookback, cfg)
+def _context_a_signal(closes, ohlc, lookback, cfg):
+    d = _context_a_dir(closes, ohlc, lookback, cfg)
     if not d:
         return None
     entry = closes[-1]
-    stop, target = _atr_stop_target(ohlc, entry, d, PERP_ATR_MULT, PERP_TARGET_R)
+    stop, target = _atr_stop_target(ohlc, entry, d, MO_ATR_MULT, MO_TARGET_R)
     return {"direction": d, "stop": stop, "target": target,
-            "rationale": f"ctx_alpha {d}: consensus (loose context)"}
+            "rationale": f"context_a {d}: consensus (loose context)"}
 
 
-def _ctxb_signal(closes, ohlc, lookback, cfg):
-    d = _ctxb_dir(closes, ohlc, lookback, cfg)
+def _context_b_signal(closes, ohlc, lookback, cfg):
+    d = _context_b_dir(closes, ohlc, lookback, cfg)
     if not d:
         return None
     entry = closes[-1]
-    stop, target = _atr_stop_target(ohlc, entry, d, PERP_ATR_MULT, PERP_TARGET_R)
+    stop, target = _atr_stop_target(ohlc, entry, d, MO_ATR_MULT, MO_TARGET_R)
     return {"direction": d, "stop": stop, "target": target,
-            "rationale": f"ctx_bravo {d}: consensus (strict context)"}
+            "rationale": f"context_b {d}: consensus (strict context)"}
 
 
 # Registry of per-engine OOS trade generators. Keeps the gate, the screener and the full
 # backtest report in lockstep — every engine's edge is proven from THIS walk, nothing else.
 # research reuses the breakout walk as its tradable OOS proxy (same as prove_research).
 ENGINE_TRADES = {"meanrev": _mr_trades, "breakout": _bk_trades, "research": _bk_trades,
-                 "perp": _perp_trades, "bible": _bible_trades, "apex": _apex_trades,
-                 "barber": _barber_trades, "ctx_alpha": _ctxa_trades, "ctx_bravo": _ctxb_trades}
+                 "momentum": _momentum_trades, "structure": _structure_trades,
+                 "regime": _regime_trades, "channel": _channel_trades,
+                 "context_a": _context_a_trades, "context_b": _context_b_trades}
 
 
 def engine_trades(engine, oos_ohlc, lookback, cfg=None):
@@ -839,8 +837,8 @@ def engine_trades(engine, oos_ohlc, lookback, cfg=None):
 
 
 PROVERS = {"meanrev": prove_meanrev, "breakout": prove_breakout, "research": prove_research,
-           "perp": prove_perp, "bible": prove_bible, "apex": prove_apex,
-           "barber": prove_barber, "ctx_alpha": prove_ctx_alpha, "ctx_bravo": prove_ctx_bravo}
+           "momentum": prove_momentum, "structure": prove_structure, "regime": prove_regime,
+           "channel": prove_channel, "context_a": prove_context_a, "context_b": prove_context_b}
 
 
 # ===========================================================================
@@ -879,6 +877,15 @@ LIVE_BAR_WINDOW = 600     # feedLive: a bar recorded in the last 10 min
 LIVE_TICK_WINDOW = 30     # liveTicks: a tick in the last 30 s
 EDGE_TTL = 120            # cache edge verdicts for 2 min (matches Utah's TTL intent)
 
+# One-time, idempotent rename migration. The engine roster moved from internal codenames to
+# generic customer-facing ids; any fire rows captured under the old id are relabelled in place so
+# the journal stays consistent. Safe + a no-op on the empty store this product ships with (an
+# UPDATE that matches nothing changes nothing).
+_RENAMED_ENGINES = {
+    "perp": "momentum", "bible": "structure", "apex": "regime",
+    "barber": "channel", "ctx_alpha": "context_a", "ctx_bravo": "context_b",
+}
+
 
 class Store:
     """The product's own SQLite-backed data + analysis store. Thread-safe (one lock; the
@@ -896,6 +903,10 @@ class Store:
                 os.makedirs(d, exist_ok=True)
             with self._connect() as cx:
                 cx.executescript(SCHEMA)
+                # Idempotent: relabel any fires captured under the old engine codenames.
+                for old, new in _RENAMED_ENGINES.items():
+                    cx.execute("UPDATE fires SET engine=? WHERE engine=?", (new, old))
+                cx.commit()
             self._ok = True
         except Exception:  # noqa: BLE001 — unwritable path: store stays "offline", never crashes
             self._ok = False

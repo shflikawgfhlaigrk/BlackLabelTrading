@@ -181,6 +181,26 @@ struct EngineRow: Equatable, Identifiable {
 }
 
 enum EngineRoster {
+    // Display order for the engine fleet (generic, customer-facing ids — never internal codenames).
+    static let order = ["meanrev", "breakout", "research", "momentum", "structure", "regime",
+                        "channel", "context_a", "context_b"]
+
+    // Clean human label for an engine id. Pure formatting — maps a known id to its display name
+    // and title-cases any unknown id (e.g. a buyer-added engine). NEVER invents data, only labels.
+    static let labels: [String: String] = [
+        "meanrev": "Mean Reversion", "breakout": "Breakout", "research": "Research",
+        "momentum": "Momentum", "structure": "Structure", "regime": "Regime",
+        "channel": "Channel", "context_a": "Context A", "context_b": "Context B",
+    ]
+
+    static func label(for engine: String) -> String {
+        if let l = labels[engine] { return l }
+        // Unknown id: humanize ("foo_bar" -> "Foo Bar") rather than show a raw token.
+        return engine.split(whereSeparator: { $0 == "_" || $0 == "-" })
+            .map { $0.prefix(1).uppercased() + $0.dropFirst() }
+            .joined(separator: " ")
+    }
+
     static func decode(_ obj: [String: Any]) -> [EngineRow] {
         guard let rows = obj["rows"] as? [[String: Any]] else { return [] }
         return rows.compactMap { r in

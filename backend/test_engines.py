@@ -1,6 +1,6 @@
 """Black Label Trading — backend engine test suite (pure stdlib; pytest-optional).
 
-TDD for the ported engine roster (bible/apex/perp/barber/ctx_alpha/ctx_bravo) + the shared
+TDD for the engine roster (momentum/structure/regime/channel/context_a/context_b) + the shared
 OHLC indicator helpers and the trade-generator registry. Each engine asserts: a deterministic
 synthetic OHLC series that SHOULD prove edge does; one that should NOT doesn't; and empty bars
 yield an honest empty result (no fabrication). Runnable via `python3 -m pytest test_engines.py`
@@ -94,83 +94,83 @@ def test_analytics_trades_for_matches_gate():
 
 
 # ===========================================================================
-# Task 3 — perp engine (clean symmetric momentum consensus)
+# Task 3 — momentum engine (clean symmetric momentum consensus)
 # ===========================================================================
-def test_perp_proves_on_trend():
-    r = S.prove_perp(_consensus_uptrend(), S.CONFIG_DEFAULTS)
+def test_momentum_proves_on_trend():
+    r = S.prove_momentum(_consensus_uptrend(), S.CONFIG_DEFAULTS)
     assert {"ok", "reason", "trades", "winRate", "netPts", "expectancyR"}.issubset(r)
     assert r["ok"] is True
     assert r["netPts"] > 0
 
 
-def test_perp_no_edge_on_chop():
-    r = S.prove_perp(_chop(), S.CONFIG_DEFAULTS)
+def test_momentum_no_edge_on_chop():
+    r = S.prove_momentum(_chop(), S.CONFIG_DEFAULTS)
     assert r["ok"] is False
 
 
-def test_perp_empty_is_honest():
-    r = S.prove_perp([], S.CONFIG_DEFAULTS)
+def test_momentum_empty_is_honest():
+    r = S.prove_momentum([], S.CONFIG_DEFAULTS)
     assert r["ok"] is False and r["trades"] == 0
 
 
-def test_perp_signal_long_on_uptrend():
+def test_momentum_signal_long_on_uptrend():
     ohlc = _consensus_uptrend()
-    sig = S._perp_signal([b[3] for b in ohlc], ohlc, 20, S.CONFIG_DEFAULTS)
+    sig = S._momentum_signal([b[3] for b in ohlc], ohlc, 20, S.CONFIG_DEFAULTS)
     assert sig is not None and sig["direction"] == "long"
 
 
 # ===========================================================================
-# Task 4 — bible engine (guarded short-biased sniper)
+# Task 4 — structure engine (guarded short-biased counter-trend)
 # ===========================================================================
-def test_bible_blocks_longs():
-    trades = S._bible_trades(_consensus_uptrend(), 20, S.CONFIG_DEFAULTS)
+def test_structure_blocks_longs():
+    trades = S._structure_trades(_consensus_uptrend(), 20, S.CONFIG_DEFAULTS)
     assert all(t["dir"] == "short" for t in trades)
 
 
-def test_bible_proves_on_downtrend():
-    r = S.prove_bible(_downtrend(), S.CONFIG_DEFAULTS)
+def test_structure_proves_on_downtrend():
+    r = S.prove_structure(_downtrend(), S.CONFIG_DEFAULTS)
     assert r["ok"] is True and r["netPts"] > 0
 
 
-def test_bible_signal_never_long():
+def test_structure_signal_never_long():
     ohlc = _consensus_uptrend()
-    sig = S._bible_signal([b[3] for b in ohlc], ohlc, 20, S.CONFIG_DEFAULTS)
+    sig = S._structure_signal([b[3] for b in ohlc], ohlc, 20, S.CONFIG_DEFAULTS)
     assert sig is None or sig["direction"] == "short"
 
 
-def test_bible_empty_is_honest():
-    r = S.prove_bible([], S.CONFIG_DEFAULTS)
+def test_structure_empty_is_honest():
+    r = S.prove_structure([], S.CONFIG_DEFAULTS)
     assert r["ok"] is False and r["trades"] == 0
 
 
 # ===========================================================================
-# Task 5 — apex engine (regime-router trend-continuation)
+# Task 5 — regime engine (regime-router trend-continuation)
 # ===========================================================================
-def test_apex_regime_trend_vs_range():
+def test_regime_class_trend_vs_range():
     up = _consensus_uptrend()
     ch = _chop()
-    assert S._apex_regime([b[3] for b in up], up, 20) == "TREND"
-    assert S._apex_regime([b[3] for b in ch], ch, 20) == "RANGE"
+    assert S._regime_class([b[3] for b in up], up, 20) == "TREND"
+    assert S._regime_class([b[3] for b in ch], ch, 20) == "RANGE"
 
 
-def test_apex_flat_in_range():
+def test_regime_flat_in_range():
     ch = _chop()
-    sig = S._apex_signal([b[3] for b in ch], ch, 20, S.CONFIG_DEFAULTS)
+    sig = S._regime_signal([b[3] for b in ch], ch, 20, S.CONFIG_DEFAULTS)
     assert sig is None
 
 
-def test_apex_proves_on_trend():
-    r = S.prove_apex(_consensus_uptrend(), S.CONFIG_DEFAULTS)
+def test_regime_proves_on_trend():
+    r = S.prove_regime(_consensus_uptrend(), S.CONFIG_DEFAULTS)
     assert r["ok"] is True and r["netPts"] > 0
 
 
-def test_apex_empty_is_honest():
-    r = S.prove_apex([], S.CONFIG_DEFAULTS)
+def test_regime_empty_is_honest():
+    r = S.prove_regime([], S.CONFIG_DEFAULTS)
     assert r["ok"] is False and r["trades"] == 0
 
 
 # ===========================================================================
-# Task 6 — barber engine (consensus + Fibonacci golden-pocket gate)
+# Task 6 — channel engine (consensus + Fibonacci golden-pocket gate)
 # ===========================================================================
 def _trend_with_pullbacks(n=260):
     series = []
@@ -181,49 +181,49 @@ def _trend_with_pullbacks(n=260):
     return series
 
 
-def test_barber_verdict_is_internally_consistent():
-    r = S.prove_barber(_trend_with_pullbacks(), S.CONFIG_DEFAULTS)
+def test_channel_verdict_is_internally_consistent():
+    r = S.prove_channel(_trend_with_pullbacks(), S.CONFIG_DEFAULTS)
     assert {"ok", "trades", "netPts", "expectancyR"}.issubset(r)
     # whenever the gate says edge, it MUST be backed by positive expectancy + enough trades
     assert (r["ok"] is False) or (r["expectancyR"] > 0 and r["trades"] >= S.MIN_TRADES)
 
 
-def test_barber_fib_gate_filters_a_pure_ramp():
+def test_channel_fib_gate_filters_a_pure_ramp():
     # a pure ramp keeps fib_pos pinned at the swing top (~1.0), outside the long golden pocket
-    # [0.34,0.42] -> barber takes far fewer entries than the unguarded perp consensus.
+    # [0.34,0.42] -> channel takes far fewer entries than the unguarded momentum consensus.
     ramp = _consensus_uptrend(200)
-    barber = S._barber_trades(ramp, 20, S.CONFIG_DEFAULTS)
-    perp = S._perp_trades(ramp, 20, S.CONFIG_DEFAULTS)
-    assert len(barber) < len(perp)
+    channel = S._channel_trades(ramp, 20, S.CONFIG_DEFAULTS)
+    momentum = S._momentum_trades(ramp, 20, S.CONFIG_DEFAULTS)
+    assert len(channel) < len(momentum)
 
 
-def test_barber_empty_is_honest():
-    r = S.prove_barber([], S.CONFIG_DEFAULTS)
+def test_channel_empty_is_honest():
+    r = S.prove_channel([], S.CONFIG_DEFAULTS)
     assert r["ok"] is False and r["trades"] == 0
 
 
 # ===========================================================================
-# Task 7 — ctx_alpha + ctx_bravo (A/B context-strictness split)
+# Task 7 — context_a + context_b (A/B context-strictness split)
 # ===========================================================================
-def test_ctx_alpha_proves_on_trend():
-    r = S.prove_ctx_alpha(_consensus_uptrend(), S.CONFIG_DEFAULTS)
+def test_context_a_proves_on_trend():
+    r = S.prove_context_a(_consensus_uptrend(), S.CONFIG_DEFAULTS)
     assert r["ok"] is True and r["netPts"] > 0
 
 
-def test_ctx_bravo_stricter_than_alpha():
-    # bravo's stricter gate -> never MORE trades than alpha on the same series
-    a = S._ctxa_trades(_consensus_uptrend(), 20, S.CONFIG_DEFAULTS)
-    b = S._ctxb_trades(_consensus_uptrend(), 20, S.CONFIG_DEFAULTS)
+def test_context_b_stricter_than_a():
+    # context_b's stricter gate -> never MORE trades than context_a on the same series
+    a = S._context_a_trades(_consensus_uptrend(), 20, S.CONFIG_DEFAULTS)
+    b = S._context_b_trades(_consensus_uptrend(), 20, S.CONFIG_DEFAULTS)
     assert len(b) <= len(a)
 
 
-def test_ctx_bravo_proves_on_strong_trend():
-    r = S.prove_ctx_bravo(_consensus_uptrend(), S.CONFIG_DEFAULTS)
+def test_context_b_proves_on_strong_trend():
+    r = S.prove_context_b(_consensus_uptrend(), S.CONFIG_DEFAULTS)
     assert {"ok", "trades", "netPts"}.issubset(r)
 
 
-def test_ctx_empty_is_honest():
-    for fn in (S.prove_ctx_alpha, S.prove_ctx_bravo):
+def test_context_empty_is_honest():
+    for fn in (S.prove_context_a, S.prove_context_b):
         r = fn([], S.CONFIG_DEFAULTS)
         assert r["ok"] is False and r["trades"] == 0
 
@@ -231,8 +231,8 @@ def test_ctx_empty_is_honest():
 # ===========================================================================
 # Task 8 — full-roster registration + capture live-fire dispatch
 # ===========================================================================
-ROSTER = ["meanrev", "breakout", "research", "bible", "apex", "perp",
-          "ctx_alpha", "ctx_bravo", "barber"]
+ROSTER = ["meanrev", "breakout", "research", "momentum", "structure", "regime",
+          "channel", "context_a", "context_b"]
 
 
 def test_roster_registered_everywhere():
@@ -262,18 +262,18 @@ def test_capture_signal_produces_each_new_engine_direction():
     cap = C.Capture(_StubStore(), bar_seconds=15, lookback=20, edge_gate=True)
     up = _consensus_uptrend()
     dn = _downtrend()
-    # perp/apex/ctx_* go long on the uptrend; bible goes short on the downtrend
-    assert cap._signal("perp", up)["direction"] == "long"
-    assert cap._signal("apex", up)["direction"] == "long"
-    assert cap._signal("ctx_alpha", up)["direction"] == "long"
-    bsig = cap._signal("bible", dn)
+    # momentum/regime/context_* go long on the uptrend; structure goes short on the downtrend
+    assert cap._signal("momentum", up)["direction"] == "long"
+    assert cap._signal("regime", up)["direction"] == "long"
+    assert cap._signal("context_a", up)["direction"] == "long"
+    bsig = cap._signal("structure", dn)
     assert bsig is not None and bsig["direction"] == "short"
-    assert cap._signal("bible", up) is None or cap._signal("bible", up)["direction"] == "short"
+    assert cap._signal("structure", up) is None or cap._signal("structure", up)["direction"] == "short"
 
 
 def test_config_sanitizes_to_known_engines_only():
-    clean = S._sanitize({"engines": ["perp", "bogus", "apex"]})
-    assert clean["engines"] == ["perp", "apex"]   # unknown dropped, known kept in order
+    clean = S._sanitize({"engines": ["momentum", "bogus", "regime"]})
+    assert clean["engines"] == ["momentum", "regime"]   # unknown dropped, known kept in order
 
 
 if __name__ == "__main__":

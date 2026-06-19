@@ -1080,14 +1080,14 @@ func testChartScaleDecimals() {
 // ===== Engine roster + fire feed decode (GET /api/screen, /api/fires) =====
 func testEngineRosterDecode() {
     let obj: [String: Any] = ["rows": [
-        ["engine": "perp", "symbol": "CM.MNQM6", "edge": true, "warming": false,
+        ["engine": "momentum", "symbol": "CM.MNQM6", "edge": true, "warming": false,
          "winRate": 0.9, "netPts": 12.5, "expectancyR": 0.6, "trades": 30, "bars": 120, "reason": "edge proven"],
-        ["engine": "apex", "symbol": "US.SPY", "edge": false, "warming": true,
+        ["engine": "regime", "symbol": "US.SPY", "edge": false, "warming": true,
          "winRate": 0.0, "netPts": 0.0, "expectancyR": 0.0, "trades": 0, "bars": 12, "reason": "warming"],
     ]]
     let rows = EngineRoster.decode(obj)
     eqi(rows.count, 2, "roster row count")
-    ok(rows[0].engine == "perp" && rows[0].edge && !rows[0].warming, "roster row 0 fields")
+    ok(rows[0].engine == "momentum" && rows[0].edge && !rows[0].warming, "roster row 0 fields")
     eq(rows[0].netPts, 12.5, "roster row 0 netPts")
     eqi(rows[0].trades, 30, "roster row 0 trades")
     ok(rows[1].warming && !rows[1].edge, "roster row 1 warming")
@@ -1095,14 +1095,31 @@ func testEngineRosterDecode() {
     eqi(EngineRoster.decode([:]).count, 0, "missing rows key honest")
 }
 
+func testEngineLabels() {
+    // Generic customer-facing labels for every roster id; unknown ids humanize, never raw tokens.
+    ok(EngineRoster.label(for: "momentum") == "Momentum", "label momentum")
+    ok(EngineRoster.label(for: "structure") == "Structure", "label structure")
+    ok(EngineRoster.label(for: "regime") == "Regime", "label regime")
+    ok(EngineRoster.label(for: "channel") == "Channel", "label channel")
+    ok(EngineRoster.label(for: "context_a") == "Context A", "label context_a")
+    ok(EngineRoster.label(for: "context_b") == "Context B", "label context_b")
+    ok(EngineRoster.label(for: "meanrev") == "Mean Reversion", "label meanrev")
+    ok(EngineRoster.label(for: "my_engine") == "My Engine", "label humanizes unknown id")
+    // No internal codename ever leaks through the order list.
+    for e in EngineRoster.order {
+        ok(!["perp", "bible", "apex", "barber", "ctx_alpha", "ctx_bravo"].contains(e),
+           "order has no codename: \(e)")
+    }
+}
+
 func testFireFeedDecode() {
     let obj: [String: Any] = ["fires": [
-        ["id": 5, "engine": "bible", "direction": "short", "entry": 100.0, "symbol": "US.QQQ",
+        ["id": 5, "engine": "structure", "direction": "short", "entry": 100.0, "symbol": "US.QQQ",
          "stop": 102.0, "target": 96.0, "rationale": "r", "outcome": NSNull(), "pnl": NSNull(), "ts": "2026-06-18 12:00:00"],
     ]]
     let fires = FireFeed.decode(obj)
     eqi(fires.count, 1, "fire count")
-    ok(fires[0].engine == "bible" && fires[0].direction == "short", "fire fields")
+    ok(fires[0].engine == "structure" && fires[0].direction == "short", "fire fields")
     eq(fires[0].entry, 100.0, "fire entry")
     ok(fires[0].outcome == nil && fires[0].pnl == nil, "ungraded fire -> nil outcome/pnl (honest)")
     eqi(FireFeed.decode(["fires": []]).count, 0, "empty fires honest")
@@ -1162,7 +1179,7 @@ func testLiveBackendIntegration() {
     } else { ok(false, "[integration] /api/live reachable") }
     // 5) /api/screen exposes the FULL edge-gated engine roster (every engine present, each row a
     // real OOS verdict on the buyer's own bars — present-or-warming, never fabricated).
-    let roster = ["meanrev", "breakout", "research", "bible", "apex", "perp", "ctx_alpha", "ctx_bravo", "barber"]
+    let roster = ["meanrev", "breakout", "research", "momentum", "structure", "regime", "channel", "context_a", "context_b"]
     if let screenObj = liveGET(base, "/api/screen", token: token) {
         let rows = EngineRoster.decode(screenObj)
         let present = Set(rows.map { $0.engine })
@@ -1194,6 +1211,7 @@ testFeedSymbolsPicker()
 
 // Engine roster + fire feed decode (the /api/screen + /api/fires wire contract)
 testEngineRosterDecode()
+testEngineLabels()
 testFireFeedDecode()
 
 // Opt-in live backend integration (locks the end-to-end wire contract on real captured data).

@@ -231,7 +231,7 @@ struct SignalsScreen: View {
     // metric — every value is a decoded EngineRow/FireRow from the buyer's own backend.
     private var engineFleet: some View {
         let byEngine = Dictionary(grouping: fleet, by: { $0.engine })
-        let order = ["meanrev", "breakout", "research", "bible", "apex", "perp", "ctx_alpha", "ctx_bravo", "barber"]
+        let order = EngineRoster.order
         let engines = order.filter { byEngine[$0] != nil } + byEngine.keys.filter { !order.contains($0) }.sorted()
         let provenCount = engines.filter { (byEngine[$0] ?? []).contains { $0.edge } }.count
         return Panel(title: "Engine fleet", icon: "cpu.fill", accent: BLTheme.gold) {
@@ -267,7 +267,7 @@ struct SignalsScreen: View {
         return HStack(spacing: 12) {
             Image(systemName: "bolt.horizontal.circle.fill").font(.system(size: 14, weight: .bold)).foregroundColor(tint)
             VStack(alignment: .leading, spacing: 2) {
-                Text(engine).font(.system(size: 13, weight: .bold, design: .rounded)).foregroundColor(BLTheme.text)
+                Text(EngineRoster.label(for: engine)).font(.system(size: 13, weight: .bold, design: .rounded)).foregroundColor(BLTheme.text)
                 Text(best?.reason ?? "no symbols captured yet").font(.system(size: 10, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub).lineLimit(1)
             }
             Spacer()
@@ -288,7 +288,7 @@ struct SignalsScreen: View {
         return HStack(spacing: 10) {
             Image(systemName: up ? "arrow.up.right.circle.fill" : "arrow.down.right.circle.fill")
                 .font(.system(size: 12, weight: .bold)).foregroundColor(up ? BLTheme.green : BLTheme.red)
-            Text(f.engine).font(.system(size: 11.5, weight: .bold, design: .rounded)).foregroundColor(BLTheme.text)
+            Text(EngineRoster.label(for: f.engine)).font(.system(size: 11.5, weight: .bold, design: .rounded)).foregroundColor(BLTheme.text)
             Text(f.symbol ?? "—").font(.system(size: 11, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
             Spacer()
             Text("@ \(TradeMath.num(f.entry))").font(.system(size: 11, weight: .semibold, design: .rounded)).foregroundColor(BLTheme.text).monospacedDigit()

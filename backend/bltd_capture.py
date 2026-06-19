@@ -39,8 +39,8 @@ CDP_HOSTS = ("127.0.0.1", "[::1]")
 WC_HOST = "wealthcharts.com"   # matches app.wealthcharts.com / www.wealthcharts.com
 BAR_SECONDS = int(os.environ.get("BLTD_BAR_SECONDS", "15"))
 LOOKBACK = int(os.environ.get("BLTD_LOOKBACK", "20"))
-ENGINES = ("meanrev", "breakout", "research", "bible", "apex", "perp",
-           "ctx_alpha", "ctx_bravo", "barber")
+ENGINES = ("meanrev", "breakout", "research", "momentum", "structure", "regime",
+           "channel", "context_a", "context_b")
 EDGE_GATE = os.environ.get("BLTD_EDGE_GATE", "1") != "0"
 MAX_BARS = 400
 
@@ -346,12 +346,13 @@ class Capture:
         except Exception as exc:  # noqa: BLE001 — alerting is best-effort
             log.info("alert webhook failed: %s", exc)
 
-    # Live-fire signal functions for the ported AceOS engines (same geometry their gate proves).
+    # Live-fire signal functions for the consensus-family engines (same geometry their gate proves).
     # meanrev + breakout/research stay inline below; everything else dispatches here so the live
     # signal matches the prover exactly (no drift between what fires and what backtested).
     _SIG = {
-        "perp": S._perp_signal, "bible": S._bible_signal, "apex": S._apex_signal,
-        "barber": S._barber_signal, "ctx_alpha": S._ctxa_signal, "ctx_bravo": S._ctxb_signal,
+        "momentum": S._momentum_signal, "structure": S._structure_signal,
+        "regime": S._regime_signal, "channel": S._channel_signal,
+        "context_a": S._context_a_signal, "context_b": S._context_b_signal,
     }
 
     def _signal(self, engine: str, ohlc):
