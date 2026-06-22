@@ -34,6 +34,15 @@ struct AuthView: View {
             AuroraBackdrop()
             ParticleField()
 
+            // The login panel can be taller than a short window (esp. once the Google/Apple inline
+            // note appears). Centering an over-tall VStack pushed the BOTTOM control ("Continue as
+            // guest") past the window's hittable bounds — it rendered but could never receive a click
+            // (the dead-button bug). Wrapping the panel in a ScrollView guarantees EVERY control —
+            // including the last one — is always reachable and hittable at any window size / display
+            // scale. A GeometryReader sizes the scroll content to AT LEAST the viewport height so
+            // the panel CENTERS when there's headroom and only SCROLLS when the window is too short.
+            GeometryReader { geo in
+            ScrollView(.vertical, showsIndicators: false) {
             VStack(spacing: 18) {
                 ZStack {
                     Circle().fill(BLTheme.gold.opacity(0.18)).frame(width: 150).blur(radius: 40).scaleEffect(glow ? 1.1 : 0.85)
@@ -91,6 +100,14 @@ struct AuthView: View {
             .padding(38).frame(width: 410)
             // The holographic login panel — iridescent border + glow + pointer 3D tilt.
             .holoCard(radius: 26)
+            // Vertical breathing room so the panel never sits flush against the window edges; the
+            // ScrollView absorbs any overflow on short windows so no control is ever clipped/unhittable.
+            .padding(.vertical, 28)
+            // Fill AT LEAST the viewport so the panel centers vertically when the window is tall
+            // enough; on a short window the natural (taller) content height wins and it scrolls.
+            .frame(maxWidth: .infinity, minHeight: geo.size.height, alignment: .center)
+            }
+            }
         }
         .frame(minWidth: 820, minHeight: 640)
         .onAppear {

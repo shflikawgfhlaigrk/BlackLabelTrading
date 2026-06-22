@@ -216,7 +216,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var window: NSWindow!
     func applicationDidFinishLaunching(_ n: Notification) {
         if let img = BLTheme.icon() { NSApp.applicationIconImage = img }
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1080, height: 720),
+        // Height 860 so the login panel (logo + title + social + email/pw + guest, ~760pt tall)
+        // fits fully WITHOUT the bottom "Continue as guest" control spilling past the window's
+        // hittable bounds (the dead-button bug). The AuthView also wraps the panel in a ScrollView
+        // as a belt-and-suspenders safety net for very short screens.
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1120, height: 860),
                           styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
                           backing: .buffered, defer: false)
         window.title = "Black Label Trading"
