@@ -111,26 +111,33 @@ echo "==> Built: $APP"
 codesign -dv "$APP" 2>&1 | sed 's/^/    /'
 
 if [ "${1:-}" == "--install" ]; then
-  echo "==> Installing executable into /Applications/$APPNAME.app"
+  echo "==> Installing into /Applications/$APPNAME.app (atomic stage → verify → swap)"
   DEST="/Applications/$APPNAME.app"
-  if [ ! -d "$DEST" ]; then
-    echo "    No existing bundle — copying whole .app"
-    cp -Rf "$APP" "$DEST"
-  else
-    cp -f "$APP/Contents/MacOS/$BIN_NAME" "$DEST/Contents/MacOS/$BIN_NAME"
-    cp -f "$APP/Contents/Info.plist" "$DEST/Contents/Info.plist"
-    # Keep the bundled self-contained backend (code only) in sync on install.
-    if [ -d "$APP/Contents/Resources/backend" ]; then
-      rm -rf "$DEST/Contents/Resources/backend"
-      cp -Rf "$APP/Contents/Resources/backend" "$DEST/Contents/Resources/backend"
-    fi
-  fi
-  # Keep the privacy manifest in sync on install too.
-  [ -f "$SRC/PrivacyInfo.xcprivacy" ] && cp -f "$SRC/PrivacyInfo.xcprivacy" "$DEST/Contents/Resources/PrivacyInfo.xcprivacy"
-  echo "==> Re-signing installed bundle (adhoc, with Developer-ID entitlements)"
-  codesign --force --deep --sign - --entitlements "$SRC/app-developerid.entitlements" "$DEST"
+  # §5.9 ATOMIC install (was: cp -Rf "$APP" "$DEST" straight into the live path on
+  # first install / in-place file copies + in-place re-sign). A kill mid-copy (3600s
+  # dispatch timeout / crash / disk-full) left a half-written DOA bundle in
+  # /Applications a buyer can't launch. Fix: stage the freshly built, complete bundle
+  # (icon/fonts/Assets.car/backend already assembled above) to a sibling, re-sign +
+  # verify the STAGE, then atomically rename it into place. Matches the proven
+  # Homefront/Sovereign/Marketing pattern (support-escalation P0 nonatomic-install).
+  STAGE="$DEST.staging.$$"
+  OLD="$DEST.old.$$"
+  rm -rf "$STAGE" "$OLD"
+  # Keep the privacy manifest in sync inside the fresh bundle before staging.
+  [ -f "$SRC/PrivacyInfo.xcprivacy" ] && cp -f "$SRC/PrivacyInfo.xcprivacy" "$APP/Contents/Resources/PrivacyInfo.xcprivacy"
+  echo "==> Staging build into $STAGE"
+  cp -Rf "$APP" "$STAGE"
+  echo "==> Re-signing staged bundle (adhoc, with Developer-ID entitlements)"
+  codesign --force --deep --sign - --entitlements "$SRC/app-developerid.entitlements" "$STAGE"
+  # Verify the staged bundle is whole + signed BEFORE disturbing the live bundle.
+  [ -f "$STAGE/Contents/Info.plist" ] || { echo "ABORT: staged bundle incomplete (no Info.plist)"; rm -rf "$STAGE"; exit 1; }
+  codesign --verify --deep --strict "$STAGE" || { echo "ABORT: staged bundle fails codesign"; rm -rf "$STAGE"; exit 1; }
+  # Atomic swap — keep a rollback copy until the rename lands.
+  [ -d "$DEST" ] && mv "$DEST" "$OLD"
+  mv "$STAGE" "$DEST"
+  rm -rf "$OLD"
   codesign -dv "$DEST" 2>&1 | sed 's/^/    /'
-  echo "==> Installed: $DEST"
+  echo "==> Installed (atomic): $DEST"
 fi
 
 echo "==> DONE"
