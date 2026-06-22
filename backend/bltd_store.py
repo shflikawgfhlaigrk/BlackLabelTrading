@@ -155,7 +155,18 @@ def _f(v):
 def parse_candle(payload: str):
     """One WC WebSocket frame string -> {symbol, close, open, high, low, epoch} or None.
     PURE. Returns None for keepalives / non-candle / malformed / value-less frames so junk
-    never crashes the capture or fabricates a price."""
+    never crashes the capture or fabricates a price.
+
+    WC sends TWO live candle shapes on the same socket:
+      * the realtime BAR shape carries a real Unix epoch in ``cepoch``
+        (e.g. {"co":...,"cM":...,"cm":...,"cc":...,"cepoch":1781045182,"type":"rt"});
+      * the intraday TICK shape carries ``cts`` (exchange-session seconds, NOT a Unix epoch)
+        and NO ``cepoch`` (e.g. {"cnu":1,"co":...,"cc":...,"cts":72427,"cq":"..."}).
+    Both are genuine candles for the symbol. We accept BOTH: a real ``cepoch`` is preserved;
+    otherwise ``epoch`` is None and the capture loop stamps the tick with its true ARRIVAL
+    wall-clock (we never coerce ``cts`` into a fabricated epoch). Dropping the ``cts`` shape was
+    the bug that silently starved the store of every live tick when WC emitted the tick variant,
+    so the chart never filled after Connect."""
     try:
         obj = json.loads(payload)
     except (ValueError, TypeError):
@@ -170,11 +181,12 @@ def parse_candle(payload: str):
     if not isinstance(candle, dict) or not symbol:
         return None
     close = _f(candle.get("cc"))
-    epoch = candle.get("cepoch")
-    if close is None or epoch is None:
-        return None
+    if close is None:
+        return None                          # no price -> junk, never fabricate one
+    raw_epoch = candle.get("cepoch")
+    epoch = int(raw_epoch) if raw_epoch is not None else None
     return {"symbol": symbol, "close": close, "open": _f(candle.get("co")),
-            "high": _f(candle.get("cM")), "low": _f(candle.get("cm")), "epoch": int(epoch)}
+            "high": _f(candle.get("cM")), "low": _f(candle.get("cm")), "epoch": epoch}
 
 
 def normalize_epoch(epoch: int, arrival: float, step: int = 900) -> int:

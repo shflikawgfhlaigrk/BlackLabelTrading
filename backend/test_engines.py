@@ -276,6 +276,71 @@ def test_config_sanitizes_to_known_engines_only():
     assert clean["engines"] == ["momentum", "regime"]   # unknown dropped, known kept in order
 
 
+# ---- WC candle frame parsing (BOTH live shapes WC actually sends) -----------
+# WC's realtime feed sends two candle frame variants on the same socket:
+#   1. the historical/realtime bar shape with a real Unix epoch in `cepoch`
+#   2. the intraday tick shape that carries `cts` (exchange-session seconds, NOT a Unix
+#      epoch) and no `cepoch`. Both are genuine candles for the same symbol; dropping the
+#      `cts` shape (the prior bug) silently starved the store of every live tick whenever WC
+#      was emitting the tick variant -> the chart never filled. We must accept both, never
+#      fabricate a timestamp, and let the capture loop stamp the no-embedded-epoch ticks with
+#      their real arrival wall-clock.
+def test_parse_candle_cepoch_shape():
+    frame = ('{"cmd":"feed","data":{"type":"candle","c":"US.SPY","candle":'
+             '{"co":100.0,"cM":101.0,"cm":99.0,"cc":100.5,"cepoch":1781045182,"type":"rt"}}}')
+    cd = S.parse_candle(frame)
+    assert cd is not None
+    assert cd["symbol"] == "US.SPY" and cd["close"] == 100.5
+    assert cd["epoch"] == 1781045182          # real embedded epoch preserved
+
+
+def test_parse_candle_cts_shape_kept_with_no_epoch():
+    # The exact intraday tick shape observed live on app.wealthcharts.com (cts, no cepoch).
+    frame = ('{"cmd":"feed","data":{"type":"candle","c":"CM.ESU6","candle":'
+             '{"cnu":1,"co":7546.50,"cm":7546.50,"cM":7546.50,"cc":7546.50,"cts":72427,"cq":"x"}}}')
+    cd = S.parse_candle(frame)
+    assert cd is not None, "cts-shape candle must NOT be dropped"
+    assert cd["symbol"] == "CM.ESU6" and cd["close"] == 7546.50
+    assert cd["epoch"] is None                # no real epoch -> None (never fabricated)
+
+
+def test_parse_candle_drops_valueless_and_nonfeed():
+    assert S.parse_candle('{"cmd":"keepalive","ref":1}') is None
+    # candle with neither a close nor an epoch is junk -> dropped
+    assert S.parse_candle('{"cmd":"feed","data":{"type":"candle","c":"X","candle":{}}}') is None
+    # bidask frame is not a candle
+    assert S.parse_candle('{"cmd":"feed","data":{"type":"bidask","c":"X"}}') is None
+
+
+def test_on_candle_uses_arrival_when_epoch_missing():
+    # A cts-shape candle (epoch None) must be persisted as a tick stamped at its ARRIVAL time,
+    # not crash and not be dropped. Proves the store actually receives the live price.
+    import bltd_capture as C
+
+    recorded = {}
+
+    class _StubStore:
+        def config(self):
+            return S.CONFIG_DEFAULTS
+
+        def record_tick(self, sym, price, ep):
+            recorded[sym] = (price, ep)
+
+        def record_bars(self, *a, **k):
+            return 0
+
+        def ohlc(self, *a, **k):
+            return []
+
+    cap = C.Capture(_StubStore(), bar_seconds=15, lookback=20, edge_gate=True)
+    arrival = 1781853600.0
+    cap.on_candle({"symbol": "CM.ESU6", "close": 7546.5, "epoch": None}, arrival=arrival)
+    assert "CM.ESU6" in recorded, "no-epoch candle must still record a live tick"
+    price, ep = recorded["CM.ESU6"]
+    assert price == 7546.5
+    assert ep == int(arrival)                 # stamped at the real arrival wall-clock
+
+
 if __name__ == "__main__":
     import sys
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

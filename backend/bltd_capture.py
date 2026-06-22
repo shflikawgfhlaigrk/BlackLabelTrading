@@ -280,8 +280,13 @@ class Capture:
         *arrival* is the wall-clock when this tick reached us (defaults to now). Live ticks
         arrive within ~2s of their stamp, so the skew correction is a no-op live; the param
         lets a deterministic replay treat each tick as arriving at its own stamp (the same
-        invariant), instead of all-at-once."""
-        ep = S.normalize_epoch(cd["epoch"], time.time() if arrival is None else arrival)
+        invariant), instead of all-at-once.
+
+        Some WC tick frames (the `cts` shape) carry NO real epoch (parse_candle returns
+        epoch=None). Those are live ticks arriving right now, so their honest timestamp IS the
+        arrival wall-clock — we stamp them with arrival directly rather than fabricating one."""
+        now = time.time() if arrival is None else arrival
+        ep = int(now) if cd.get("epoch") is None else S.normalize_epoch(cd["epoch"], now)
         sym = cd["symbol"]
         if self.symbol_filter and sym not in self.symbol_filter:
             return                                     # buyer's watchlist allow-list (if set)
