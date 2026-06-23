@@ -271,6 +271,79 @@ def test_capture_signal_produces_each_new_engine_direction():
     assert cap._signal("structure", up) is None or cap._signal("structure", up)["direction"] == "short"
 
 
+def _capture_stub_store():
+    class _StubStore:
+        def config(self): return {}
+        def record_tick(self, *a, **k): pass
+        def record_bars(self, *a, **k): return 0
+        def ohlc(self, *a, **k): return []
+    return _StubStore()
+
+
+def test_stream_once_rehooks_on_silent_stall():
+    # ROOT-CAUSE LOCK: when the WC hook goes silent (frames stop arriving) while still
+    # "connected", stream_once must STOP — so main() re-hooks on a FRESH attach — instead of
+    # spinning on a dead socket forever (which froze the store ~21 min and dropped the chart to
+    # "connected · quiet"). WC streams candles continuously while a chart is open (even a flat
+    # market prints repeat candles), so "no candle for stall_seconds" reliably means a dead hook.
+    import bltd_capture as C
+    state = {"t": 0.0, "silent": False}
+
+    def clock():
+        state["t"] += 100.0 if state["silent"] else 1.0
+        return state["t"]
+
+    frames = ["C", "C", "C"]                       # three candles, then silence forever
+
+    class _WS:
+        def __init__(self): self.i = 0
+        def recv_text(self):
+            if self.i < len(frames):
+                self.i += 1
+                return frames[self.i - 1]
+            state["silent"] = True                 # hook has gone quiet
+            return None
+        def close(self): pass
+
+    orig = C._frame_candle
+    C._frame_candle = lambda raw: {"symbol": "CM.ESU6", "close": 1.0, "epoch": None} if raw == "C" else None
+    try:
+        res = C.stream_once(_capture_stub_store(), stall_seconds=45, _ws=_WS(), _clock=clock)
+    finally:
+        C._frame_candle = orig
+    assert res.get("stalled") is True, f"silent hook must trigger a re-hook, got {res}"
+    assert res["candles"] == 3, res
+
+
+def test_stream_once_no_false_stall_while_candles_flow():
+    # A healthy, streaming feed must NOT trip the watchdog (no false re-hook mid-stream).
+    import bltd_capture as C
+    state = {"t": 0.0}
+
+    def clock():
+        state["t"] += 1.0
+        return state["t"]
+
+    frames = ["C"] * 10
+
+    class _WS:
+        def __init__(self): self.i = 0
+        def recv_text(self):
+            if self.i < len(frames):
+                self.i += 1
+                return frames[self.i - 1]
+            return None
+        def close(self): pass
+
+    orig = C._frame_candle
+    C._frame_candle = lambda raw: {"symbol": "CM.ESU6", "close": 1.0, "epoch": None} if raw == "C" else None
+    try:
+        res = C.stream_once(_capture_stub_store(), stall_seconds=45, max_seconds=5, _ws=_WS(), _clock=clock)
+    finally:
+        C._frame_candle = orig
+    assert not res.get("stalled"), f"healthy stream must not trip the watchdog: {res}"
+
+
 def test_config_sanitizes_to_known_engines_only():
     clean = S._sanitize({"engines": ["momentum", "bogus", "regime"]})
     assert clean["engines"] == ["momentum", "regime"]   # unknown dropped, known kept in order

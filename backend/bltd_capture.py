@@ -43,6 +43,12 @@ ENGINES = ("meanrev", "breakout", "research", "momentum", "structure", "regime",
            "channel", "context_a", "context_b")
 EDGE_GATE = os.environ.get("BLTD_EDGE_GATE", "1") != "0"
 MAX_BARS = 400
+# Stall watchdog: WC streams candles continuously while a chart is open (a flat market still
+# prints repeat candles), so NO candle for this many seconds means the attached hook went silently
+# dead (WC's realtime socket churned / the page navigated and reset our Network domain) — NOT a
+# quiet market. When that happens stream_once returns so main() re-hooks on a FRESH attach, which
+# resumes candles immediately. Keeps the chart LIVE while connected instead of stalling at "quiet".
+STALL_SECONDS = float(os.environ.get("BLTD_STALL_SECONDS", "45"))
 
 
 # ===========================================================================
@@ -400,21 +406,37 @@ class Capture:
         return None
 
 
-def stream_once(store: S.Store, *, max_seconds: float = None) -> dict:
-    """Attach to the live WC feed and capture until the connection drops (or *max_seconds*).
-    Returns a summary. Never raises — a dropped hook just returns."""
-    page = pick_wc_page(cdp_pages())
-    if not page:
-        return {"available": False, "reason": "no logged-in WC page on CDP"}
+def stream_once(store: S.Store, *, max_seconds: float = None, stall_seconds: float = None,
+                _ws=None, _clock=time.monotonic) -> dict:
+    """Attach to the live WC feed and capture until the connection drops, *max_seconds* elapses,
+    or the feed STALLS — no candle parsed within *stall_seconds* (a silently-dead hook). On a
+    stall we return with ``stalled=True`` so main() re-hooks on a FRESH attach, which resumes
+    candles immediately (this is what keeps the chart LIVE while the buyer stays connected,
+    instead of freezing at "connected · quiet"). Never raises — a dropped hook just returns.
+
+    ``_ws`` / ``_clock`` are injection seams for tests; production always builds a real WSClient
+    and uses the monotonic clock."""
+    stall = STALL_SECONDS if stall_seconds is None else stall_seconds
+    ws = _ws
+    if ws is None:
+        page = pick_wc_page(cdp_pages())
+        if not page:
+            return {"available": False, "reason": "no logged-in WC page on CDP"}
     cap = Capture(store)
-    ws = None
     frames = candles = 0
-    t0 = time.monotonic()
+    t0 = _clock()
+    last_candle = t0          # arm the watchdog from attach so a never-starting hook re-hooks too
+    stalled = False
     try:
-        ws = WSClient(page["webSocketDebuggerUrl"])
-        ws.send(json.dumps({"id": 1, "method": "Network.enable"}))
+        if _ws is None:
+            ws = WSClient(page["webSocketDebuggerUrl"])
+            ws.send(json.dumps({"id": 1, "method": "Network.enable"}))
         while True:
-            if max_seconds is not None and time.monotonic() - t0 >= max_seconds:
+            now = _clock()
+            if max_seconds is not None and now - t0 >= max_seconds:
+                break
+            if stall and now - last_candle >= stall:
+                stalled = True
                 break
             raw = ws.recv_text()
             if not raw:
@@ -423,14 +445,19 @@ def stream_once(store: S.Store, *, max_seconds: float = None) -> dict:
             cd = _frame_candle(raw)
             if cd:
                 candles += 1
+                last_candle = _clock()
                 cap.on_candle(cd)
     except Exception as exc:  # noqa: BLE001 — hook dropped / chrome closed
         log.info("capture: hook ended (%s)", exc)
     finally:
         if ws:
             ws.close()
-    return {"available": True, "frames": frames, "candles": candles,
-            "symbols": list(cap.last_key.keys())}
+    res = {"available": True, "frames": frames, "candles": candles,
+           "symbols": list(cap.last_key.keys())}
+    if stalled:
+        res["stalled"] = True
+        log.info("capture: feed stalled (no candle in %.0fs) — re-hooking on a fresh attach", stall)
+    return res
 
 
 def _frame_candle(raw: str):
