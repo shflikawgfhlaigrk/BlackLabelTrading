@@ -38,6 +38,29 @@ let base = args.count > 2 ? args[2] : "http://127.0.0.1:8787"
 var symbol = args.count > 1 ? args[1] : ""
 
 print("== Black Label Trading — chart render proof ==")
+
+// CSV MODE: if the first arg is a .csv path, render real OHLC straight from that file (a dense
+// proof with no live backend). Honest — these are real bars from the file, never fabricated.
+if symbol.lowercased().hasSuffix(".csv") {
+    guard let text = try? String(contentsOfFile: symbol, encoding: .utf8) else {
+        print("FATAL: cannot read CSV \(symbol)"); exit(2)
+    }
+    let parsed = BarCSV.parse(text)
+    guard !parsed.bars.isEmpty else { print("FATAL: no bars parsed (skipped \(parsed.skipped))"); exit(5) }
+    let bars = parsed.bars
+    let sym = (symbol as NSString).lastPathComponent.replacingOccurrences(of: ".csv", with: "")
+    print("CSV mode: \(bars.count) real bars from \(symbol) (skipped \(parsed.skipped))")
+    let lp = bars.last?.close
+    _ = ChartRender.renderPNG(bars: bars, symbol: sym, title: "\(sym) · Candles · \(bars.count) bars",
+        indicators: RenderIndicators(lastPriceLine: lp), showVolume: true, to: "/tmp/bltd_chart_candles.png")
+    let ind = RenderIndicators(ema1: 9, ema2: 21, vwapWindow: min(bars.count, 50), rsiPeriod: 14,
+        bollinger: (period: 20, k: 2), crosshairIndex: max(0, bars.count - 8), lastPriceLine: lp)
+    _ = ChartRender.renderPNG(bars: bars, symbol: sym, title: "\(sym) · EMA·VWAP·BB·RSI · \(bars.count) bars",
+        indicators: ind, showVolume: true, to: "/tmp/bltd_chart_indicators.png")
+    print("PROOF OK — dense CSV render (\(bars.count) bars).")
+    exit(0)
+}
+
 print("backend: \(base)")
 
 // 1) Sign in (local backend mints a per-deployment token; same handshake as FeedClient).
@@ -81,7 +104,7 @@ let p1 = "/tmp/bltd_chart_candles.png"
 let ok1 = ChartRender.renderPNG(
     bars: bars, symbol: symbol,
     title: "\(symbol) · Candles · \(bars.count) bars",
-    indicators: RenderIndicators(),    // bare candles
+    indicators: RenderIndicators(lastPriceLine: lastPrice ?? bars.last?.close),   // bare candles + last-price flag
     showVolume: true, to: p1)
 print(ok1 ? "WROTE \(p1)" : "FAILED \(p1)")
 

@@ -235,6 +235,89 @@ enum ChartScale {
         if step >= 1 { return step.truncatingRemainder(dividingBy: 1) == 0 ? 0 : 2 }
         return max(0, min(6, Int(ceil(-log10(step))) + 1))
     }
+
+    // Robust auto-fit domain. Like priceDomain but resistant to a single session-gap candle
+    // blowing out the vertical scale (the "one giant bar squashes everything" defect): fit to
+    // the 1st/99th percentile of the lows/highs, then expand back JUST enough to still contain
+    // every real wick — never clipping real data — but capped so one outlier can't triple the
+    // range. Honest: derived ONLY from the supplied candles, never widened to hide a move.
+    static func robustDomain(_ candles: [Candle], padFrac: Double = 0.08) -> (lo: Double, hi: Double) {
+        let lows = candles.map(\.low).sorted()
+        let highs = candles.map(\.high).sorted()
+        guard let absMin = lows.first, let absMax = highs.last, absMax > absMin else {
+            return priceDomain(low: candles.first?.low ?? 0, high: candles.first?.high ?? 1, padFrac: padFrac)
+        }
+        func pct(_ s: [Double], _ q: Double) -> Double {
+            let idx = Int((Double(s.count - 1) * q).rounded())
+            return s[min(max(idx, 0), s.count - 1)]
+        }
+        let p1 = pct(lows, 0.01), p99 = pct(highs, 0.99)
+        let core = max(p99 - p1, (absMax - absMin) * 0.001)
+        var lo = p1 - core * padFrac
+        var hi = p99 + core * padFrac
+        let maxStretch = core * 1.5    // cap how far one outlier wick may stretch the scale
+        lo = max(min(lo, absMin), p1 - maxStretch)
+        hi = min(max(hi, absMax), p99 + maxStretch)
+        return niceBounds(lo: lo, hi: hi)
+    }
+
+    // Snap a [lo,hi] outward to the surrounding nice tick lines for clean gridlines.
+    private static func niceBounds(lo: Double, hi: Double) -> (lo: Double, hi: Double) {
+        guard hi > lo else { return (lo, hi) }
+        let step = niceNum((hi - lo) / 5, ceil: true)
+        guard step > 0 else { return (lo, hi) }
+        return ((lo / step).rounded(.down) * step, (hi / step).rounded(.up) * step)
+    }
+
+    // Time-aware x-axis ticks for a gap-free candle index. Returns the indices to LABEL with a
+    // round-clock time string + which ones are session breaks (a real time gap > 4× the modal
+    // bar spacing). This lets labels land on clean clock times (09:30, 09:45, 10:00…) and lets
+    // overnight/weekend holes be shown as SESSION BREAKS instead of mystery whitespace — fixing
+    // the "labels jump 20:13→20:25→02:30 and read broken" defect. Pure Foundation; shared by the
+    // headless renderer and the live SwiftUI screen so both axes agree.
+    struct TimeTick { public let index: Int; public let label: String; public let isSessionBreak: Bool }
+    static func timeTicks(_ dates: [Date], maxLabels: Int = 7) -> [TimeTick] {
+        guard dates.count > 1 else {
+            return dates.isEmpty ? [] : [TimeTick(index: 0, label: "", isSessionBreak: false)]
+        }
+        // Modal spacing from POSITIVE deltas only, so duplicate/equal timestamps (e.g. sub-minute
+        // bars stored at minute precision) can't collapse it to ~0 and make every step look like a
+        // session break.
+        var deltas: [Double] = []
+        for i in 1..<dates.count { let d = dates[i].timeIntervalSince(dates[i-1]); if d > 0 { deltas.append(d) } }
+        let dtMode: Double = deltas.isEmpty ? 60 : max(deltas.sorted()[deltas.count / 2], 1)
+        let span = max(dates.last!.timeIntervalSince(dates.first!), dtMode)
+        let multiDay = span > 86_400
+        // smallest nice time step (sec) giving <= maxLabels intervals over the visible span
+        let ladder: [Double] = [60, 120, 300, 900, 1800, 3600, 7200, 14400, 21600, 43200, 86400]
+        var stepSec = ladder.first { span / $0 <= Double(maxLabels) } ?? 86_400
+        if stepSec < dtMode { stepSec = dtMode }
+
+        let f = DateFormatter(); f.locale = Locale(identifier: "en_US_POSIX")
+        let cal = Calendar(identifier: .gregorian)
+        var ticks: [TimeTick] = []
+        var lastBucket = Double.nan
+        var lastLabelDay = -1
+        for i in 0..<dates.count {
+            let d = dates[i]
+            let isBreak = i > 0 && dates[i].timeIntervalSince(dates[i-1]) > dtMode * 4
+            let bucket = (d.timeIntervalSinceReferenceDate / stepSec).rounded(.down)
+            guard bucket != lastBucket || isBreak else { continue }
+            lastBucket = bucket
+            let day = cal.ordinality(of: .day, in: .era, for: d) ?? 0
+            if multiDay && day != lastLabelDay {
+                f.dateFormat = "MMM d"; lastLabelDay = day
+            } else {
+                f.dateFormat = "HH:mm"
+            }
+            ticks.append(TimeTick(index: i, label: f.string(from: d), isSessionBreak: isBreak))
+        }
+        if ticks.isEmpty {
+            f.dateFormat = multiDay ? "MMM d" : "HH:mm"
+            ticks.append(TimeTick(index: 0, label: f.string(from: dates[0]), isSessionBreak: false))
+        }
+        return ticks
+    }
 }
 
 // MARK: - Fibonacci retracement / extension levels between a swing low and high.

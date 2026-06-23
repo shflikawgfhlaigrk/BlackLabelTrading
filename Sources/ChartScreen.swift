@@ -480,11 +480,18 @@ struct ChartScreen: View {
     // MARK: Price chart card (candles + overlays + drawing layer + crosshair)
     private var priceChartCard: some View {
         let vis = visible
-        let loRaw = vis.map(\.low).min() ?? 0
-        let hiRaw = vis.map(\.high).max() ?? 1
-        // Shared auto-fit (nice padding) — identical math to the headless render proof.
-        let dom = ChartScale.priceDomain(low: loRaw, high: hiRaw)
+        // Robust auto-fit — identical math to the headless render proof; one session-gap candle
+        // can't squash the rest of the chart.
+        let dom = ChartScale.robustDomain(vis)
         let yDomain = dom.lo...dom.hi
+        // Round-clock x-axis ticks + session breaks (shared with the headless renderer). timeTicks
+        // returns positions within `vis`; map them to the candle index the chart plots on.
+        let xTicks = ChartScale.timeTicks(vis.map(\.date), maxLabels: 7).compactMap { t -> (idx: Int, label: String, brk: Bool)? in
+            guard t.index >= 0, t.index < vis.count else { return nil }
+            return (vis[t.index].index, t.label, t.isSessionBreak)
+        }
+        let xTickLabels = Dictionary(xTicks.map { ($0.idx, $0.label) }, uniquingKeysWith: { a, _ in a })
+        let sessionBreaks = xTicks.filter(\.brk).map(\.idx)
         // Nice-tick gridline values for the y-axis (1/2/2.5/5 × 10ⁿ steps).
         let yTicks = ChartScale.ticks(lo: dom.lo, hi: dom.hi, target: 7)
         let xLo = vis.first?.index ?? 0
@@ -513,9 +520,15 @@ struct ChartScreen: View {
                         RectangleMark(x: .value("i", c.index),
                                       yStart: .value("o", c.up ? c.open : c.close),
                                       yEnd: .value("c", c.up ? c.close : c.open),
-                                      width: .ratio(0.62))
+                                      width: .ratio(0.72))
                             .foregroundStyle(c.up ? BLTheme.green : BLTheme.red).cornerRadius(1.5)
                     }
+                }
+                // Dotted gold session separators (overnight/weekend gaps) — explains the holes.
+                ForEach(sessionBreaks, id: \.self) { bi in
+                    RuleMark(x: .value("sep", bi))
+                        .foregroundStyle(BLTheme.gold.opacity(0.18))
+                        .lineStyle(StrokeStyle(lineWidth: 1, dash: [2,4]))
                 }
                 overlayMarks(smaS, color: BLTheme.gold, name: "SMA")
                 overlayMarks(emaS, color: BLTheme.goldHi, name: "EMA")
@@ -551,9 +564,9 @@ struct ChartScreen: View {
             .chartYScale(domain: yDomain, type: (ind.logScale && dom.lo > 0) ? .log : .linear)
             .chartYAxis { AxisMarks(position: .trailing, values: yTicks) { v in AxisGridLine().foregroundStyle(BLTheme.stroke.opacity(0.4))
                 AxisValueLabel { if let d = v.as(Double.self) { Text(TradeMath.num(d)).font(.system(size: 9)).foregroundStyle(BLTheme.sub) } } } }
-            .chartXAxis { AxisMarks { v in AxisGridLine().foregroundStyle(BLTheme.stroke.opacity(0.3))
-                AxisValueLabel { if let i = v.as(Int.self), let c = candles.first(where: { $0.index == i }) {
-                    Text(c.date.formatted(date: .abbreviated, time: .omitted)).font(.system(size: 8)).foregroundStyle(BLTheme.sub) } } } }
+            .chartXAxis { AxisMarks(values: xTicks.map(\.idx)) { v in AxisGridLine().foregroundStyle(BLTheme.stroke.opacity(0.3))
+                AxisValueLabel { if let i = v.as(Int.self), let lbl = xTickLabels[i] {
+                    Text(lbl).font(.system(size: 8)).monospacedDigit().foregroundStyle(BLTheme.sub) } } } }
             .frame(height: 360)
             .chartOverlay { proxy in
                 GeometryReader { geo in
@@ -758,8 +771,8 @@ struct ChartScreen: View {
             Panel(title: "Volume", icon: "chart.bar.fill", accent: BLTheme.gold) {
                 Chart {
                     ForEach(vis) { c in
-                        BarMark(x: .value("i", c.index), y: .value("vol", c.volume), width: .ratio(0.62))
-                            .foregroundStyle((c.up ? BLTheme.green : BLTheme.red).opacity(0.55))
+                        BarMark(x: .value("i", c.index), y: .value("vol", c.volume), width: .ratio(0.72))
+                            .foregroundStyle((c.up ? BLTheme.green : BLTheme.red).opacity(0.30))
                     }
                 }
                 .frame(height: 90).chartXScale(domain: paneXDomain)

@@ -14,8 +14,8 @@ enum BLTheme {
     static let stroke = Color(hex: 0x26262B)
     static let text   = Color(hex: 0xEDEDED)
     static let sub    = Color(hex: 0x8C8C8C)
-    static let green  = Color(hex: 0x6FD08C)
-    static let red    = Color(hex: 0xFF6B6B)
+    static let green  = Color(hex: 0x2BD49B)
+    static let red    = Color(hex: 0xF0616D)
     static let blue   = Color(hex: 0x6FA8FF)
 
     static var goldGrad: LinearGradient { LinearGradient(colors: [goldHi, gold, goldDim], startPoint: .topLeading, endPoint: .bottomTrailing) }
