@@ -892,8 +892,65 @@ func testHoloPresetApplyAndPersist() {
     ok(custom.matchingPresetName == nil, "custom-tuned theme has no built-in preset match")
 }
 
+// ===== Analytics honest-empty contract (§5.1/§5.2) =====
+// Empty / insufficient input must yield a zeroed, FINITE report — never a fabricated win-rate,
+// an infinite profit factor, a NaN (0/0), or a Sharpe minted from one lucky trade. This locks
+// the exact first-run state a buyer sees on their own empty journal before any real trade exists
+// — the most lie-prone surface in the product (the screenshot-able performance report).
+func testAnalyticsEmpty() {
+    let r = Analytics.report([])
+    eqi(r.trades, 0, "empty report.trades")
+    eqi(r.wins, 0, "empty report.wins")
+    eqi(r.losses, 0, "empty report.losses")
+    eqi(r.breakeven, 0, "empty report.breakeven")
+    eq(r.netPnL, 0, "empty report.netPnL")
+    eq(r.grossProfit, 0, "empty report.grossProfit")
+    eq(r.grossLoss, 0, "empty report.grossLoss")
+    eq(r.winRate, 0, "empty report.winRate")            // never a fabricated %
+    eq(r.profitFactor, 0, "empty report.profitFactor")  // 0, NOT .infinity
+    eq(r.expectancyDollar, 0, "empty report.expectancyDollar")
+    eq(r.expectancyR, 0, "empty report.expectancyR")
+    eq(r.avgWin, 0, "empty report.avgWin")
+    eq(r.avgLoss, 0, "empty report.avgLoss")
+    eq(r.payoffRatio, 0, "empty report.payoffRatio")
+    eq(r.largestWin, 0, "empty report.largestWin")
+    eq(r.largestLoss, 0, "empty report.largestLoss")
+    eqi(r.maxWinStreak, 0, "empty report.maxWinStreak")
+    eqi(r.maxLossStreak, 0, "empty report.maxLossStreak")
+    eq(r.maxDrawdown, 0, "empty report.maxDrawdown")
+    eq(r.maxRunup, 0, "empty report.maxRunup")
+    eq(r.longWinRate, 0, "empty report.longWinRate")
+    eq(r.shortWinRate, 0, "empty report.shortWinRate")
+    // No division-by-zero artifact may leak into a displayed number.
+    ok(r.winRate.isFinite && r.profitFactor.isFinite && r.expectancyDollar.isFinite
+        && r.expectancyR.isFinite && r.payoffRatio.isFinite, "empty report all-finite (no NaN/inf)")
+}
+
+func testRiskPanelEmptyAndSingle() {
+    // No trades -> a zeroed risk panel: no Sharpe/Sortino/SQN/Kelly conjured from nothing.
+    let e = Analytics.riskPanel([])
+    eqi(e.sampleSize, 0, "empty riskPanel.sampleSize")
+    eq(e.sharpe, 0, "empty riskPanel.sharpe")
+    eq(e.sortino, 0, "empty riskPanel.sortino")
+    eq(e.sqn, 0, "empty riskPanel.sqn")
+    eq(e.kelly, 0, "empty riskPanel.kelly")
+    eq(e.halfKelly, 0, "empty riskPanel.halfKelly")
+    eq(e.streakZ, 0, "empty riskPanel.streakZ")
+    ok(!e.streaksNonRandom, "empty riskPanel not flagged non-random")
+    // A SINGLE trade is not a track record: dispersion stats (Sharpe/Sortino/SQN) need n>1, so
+    // one lucky +5R must NOT mint a finite Sharpe. sampleSize reports the 1 honestly.
+    let one = Analytics.riskPanel([TradeStat(direction: .long, pnl: 100, r: 5, date: day(0))])
+    eqi(one.sampleSize, 1, "single-trade riskPanel.sampleSize")
+    eq(one.sharpe, 0, "single-trade riskPanel.sharpe stays 0 (n<2)")
+    eq(one.sortino, 0, "single-trade riskPanel.sortino stays 0 (n<2)")
+    eq(one.sqn, 0, "single-trade riskPanel.sqn stays 0 (n<2)")
+    ok(one.sharpe.isFinite && one.sqn.isFinite, "single-trade risk metrics finite (no NaN/inf)")
+}
+
 print("Running Black Label Trading engine tests...")
 testAnalyticsCore()
+testAnalyticsEmpty()
+testRiskPanelEmptyAndSingle()
 testProfitFactorInfinite()
 testStreaksAndDrawdown()
 testRiskPanel()
