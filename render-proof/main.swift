@@ -57,6 +57,21 @@ if symbol.lowercased().hasSuffix(".csv") {
         bollinger: (period: 20, k: 2), crosshairIndex: max(0, bars.count - 8), lastPriceLine: lp)
     _ = ChartRender.renderPNG(bars: bars, symbol: sym, title: "\(sym) · EMA·VWAP·BB·RSI · \(bars.count) bars",
         indicators: ind, showVolume: true, to: "/tmp/bltd_chart_indicators.png")
+
+    // PNG #3 — the engine-trade overlay (entry/stop/target). The levels are a SAMPLE long setup
+    // computed from the bars' OWN ATR (real bar math), NOT a claimed trade outcome — the engine is
+    // labeled "sample" and the title says SAMPLE so it can never be read as a track record. This
+    // proves the edge-gate-transparency overlay renders; the LIVE app draws real recorded fires.
+    if let entry = lp, let atr = Indicators.atr(bars, 14).last ?? nil, atr > 0 {
+        let sampleFire = RenderFire(direction: "long", engine: "sample", entry: entry,
+                                    stop: entry - atr, target: entry + 2 * atr, outcome: nil)
+        let find = RenderIndicators(ema1: 9, ema2: 21, vwapWindow: min(bars.count, 50),
+            crosshairIndex: max(0, bars.count - 6), lastPriceLine: lp, fire: sampleFire)
+        _ = ChartRender.renderPNG(bars: bars, symbol: sym,
+            title: "\(sym) · SAMPLE setup overlay (entry/stop/target from ATR) · \(bars.count) bars",
+            indicators: find, showVolume: true, to: "/tmp/bltd_chart_fire.png")
+        print("WROTE /tmp/bltd_chart_fire.png (sample entry/stop/target overlay from real ATR=\(String(format: "%.4f", atr)))")
+    }
     print("PROOF OK — dense CSV render (\(bars.count) bars).")
     exit(0)
 }
@@ -99,6 +114,22 @@ if let live = httpJSON("GET", base + "/api/live?symbol=\(symbol.addingPercentEnc
 let span = "\(bars.first!.date.formatted(date: .abbreviated, time: .shortened)) → \(bars.last!.date.formatted(date: .abbreviated, time: .shortened))"
 print("span: \(span)")
 
+// 4b) Real active engine signal (if any) for the entry/stop/target overlay — edge-gate transparency.
+// Pulled from /api/fires (newest matching the symbol). HONEST: nil when there is no real fire; a fire
+// with no stop/target draws only the legs it actually has. Nothing is fabricated.
+func num(_ v: Any?) -> Double? { if let d = v as? Double { return d }; if let i = v as? Int { return Double(i) }; if let s = v as? String { return Double(s) }; return nil }
+var activeFire: RenderFire? = nil
+if let fobj = httpJSON("GET", base + "/api/fires?limit=40&symbol=\(symbol.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? symbol)", token: token),
+   let rows = fobj["fires"] as? [[String: Any]],
+   let r = rows.first(where: { ($0["symbol"] as? String) == symbol || $0["symbol"] == nil }),
+   let dir = r["direction"] as? String, let eng = r["engine"] as? String, let entry = num(r["entry"]) {
+    activeFire = RenderFire(direction: dir, engine: eng, entry: entry,
+                            stop: num(r["stop"]), target: num(r["target"]), outcome: r["outcome"] as? String)
+    print("active fire: \(eng) \(dir) entry=\(entry) stop=\(num(r["stop"]) ?? .nan) tgt=\(num(r["target"]) ?? .nan)")
+} else {
+    print("active fire: none (flat — no overlay, honest)")
+}
+
 // 5) Render PNG #1 — clean candlesticks + auto-fit nice-tick price axis + time axis + volume.
 let p1 = "/tmp/bltd_chart_candles.png"
 let ok1 = ChartRender.renderPNG(
@@ -117,6 +148,7 @@ let ind = RenderIndicators(
     bollinger: (period: 20, k: 2),
     crosshairIndex: max(0, bars.count - 8),  // crosshair near the latest bar for the OHLC readout
     lastPriceLine: lastPrice ?? bars.last?.close,
+    fire: activeFire,                        // entry/stop/target overlay (real signal, or nil = none)
     logScale: false)
 let ok2 = ChartRender.renderPNG(
     bars: bars, symbol: symbol,

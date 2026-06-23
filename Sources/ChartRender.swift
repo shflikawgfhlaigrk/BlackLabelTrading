@@ -43,6 +43,19 @@ enum RenderPalette {
     }
 }
 
+// An active (or just-closed) engine signal to overlay on the chart: entry / stop / target lines.
+// Mirrors the live SwiftUI ChartScreen's `activeFire` overlay so the render proof shows the SAME
+// edge-gate-transparency lines. HONEST: only ever built from a real recorded FireRow; a nil leg
+// (no stop / no target) is simply not drawn — never invented.
+struct RenderFire {
+    var direction: String          // "long" / "short"
+    var engine: String             // which engine fired (shown on the entry tag)
+    var entry: Double
+    var stop: Double? = nil
+    var target: Double? = nil
+    var outcome: String? = nil     // nil = open (label "ENTRY"); set = closed (label "EXIT <outcome>")
+}
+
 // What to draw on top of the candles. Mirrors ChartIndicatorSet (the SwiftUI toggles) so the
 // render proof and the live chart show the same overlays from the same math.
 struct RenderIndicators {
@@ -54,6 +67,7 @@ struct RenderIndicators {
     var bollinger: (period: Int, k: Double)? = nil
     var crosshairIndex: Int? = nil  // candle index to draw the crosshair + OHLC readout at
     var lastPriceLine: Double? = nil
+    var fire: RenderFire? = nil   // active engine signal: entry/stop/target overlay (edge-gate transparency)
     var logScale = false
 }
 
@@ -223,6 +237,13 @@ enum ChartRender {
             }
         }
 
+        // ---- Engine trade overlay: entry / stop / target (edge-gate transparency) ----
+        // Drawn ONLY from a real recorded fire; nil legs are skipped, never fabricated. This is the
+        // headless twin of the live SwiftUI ChartScreen.activeFire overlay so the proof matches the app.
+        if let f = ind.fire {
+            drawFire(ctx, f, rect: priceRect, decimals: decimals, yPrice: { yPrice($0, priceRect) })
+        }
+
         // ---- Crosshair + OHLC readout ----
         if let ci = ind.crosshairIndex, ci >= 0, ci < n {
             let c = candles[ci]
@@ -325,6 +346,60 @@ enum ChartRender {
             drawText(ctx, val, at: CGPoint(x: x, y: p.y), size: 10.5, color: col, bold: true)
             x += CGFloat(val.count) * 6.8 + 8
         }
+    }
+
+    // Draw the active engine signal: entry (gold), stop (red), target (green) horizontal lines,
+    // each with a price tag on the right gutter. Entry tag also carries direction + engine. Honest:
+    // a nil stop/target is simply not drawn. Tags are vertically nudged apart so they never overlap.
+    private static func drawFire(_ ctx: CGContext, _ f: RenderFire, rect: CGRect, decimals: Int,
+                                 yPrice: (Double) -> CGFloat) {
+        let isLong = f.direction.lowercased().hasPrefix("l")
+        let arrow = isLong ? "▲" : "▼"
+        let verb = f.outcome == nil ? "ENTRY" : "EXIT \(f.outcome!.uppercased())"
+        // (price, leftLabel, color, lineWidth, dash) per leg — only the legs that exist.
+        var legs: [(Double, String, CGColor, CGFloat, [CGFloat])] = [
+            (f.entry, "\(arrow) \(f.direction.uppercased()) \(verb) · \(f.engine)", RenderPalette.gold, 1.4, [6,3])
+        ]
+        if let st = f.stop   { legs.append((st, "STOP", RenderPalette.red, 1.0, [4,3])) }
+        if let tg = f.target { legs.append((tg, "TGT",  RenderPalette.green, 1.0, [4,3])) }
+
+        ctx.saveGState(); ctx.clip(to: rect)
+        for (price, _, col, w, dash) in legs {
+            let y = yPrice(price)
+            guard y >= rect.minY - 1 && y <= rect.maxY + 1 else { continue }
+            strokeLine(ctx, CGPoint(x: rect.minX, y: y), CGPoint(x: rect.maxX, y: y),
+                       color: RenderPalette.alpha(col, 0.9), width: w, dash: dash)
+        }
+        ctx.restoreGState()
+
+        // Right-gutter price tags (outside the clip so they sit in the ladder gutter), de-overlapped.
+        var placed: [CGFloat] = []
+        func nudge(_ y: CGFloat) -> CGFloat {
+            var yy = min(max(y, rect.minY + 8), rect.maxY - 8)
+            while placed.contains(where: { abs($0 - yy) < 14 }) { yy -= 14 }
+            placed.append(yy); return yy
+        }
+        for (price, _, col, _, _) in legs {
+            let y0 = yPrice(price); guard y0 >= rect.minY - 1 && y0 <= rect.maxY + 1 else { continue }
+            let y = nudge(y0)
+            let lbl = fmt(price, decimals)
+            let tagW = textWidth(lbl, size: 9.5, bold: true) + 10, tagH: CGFloat = 15
+            let tagRect = CGRect(x: rect.maxX + 3, y: y - tagH/2, width: tagW, height: tagH)
+            ctx.setFillColor(col)
+            ctx.addPath(CGPath(roundedRect: tagRect, cornerWidth: 3, cornerHeight: 3, transform: nil)); ctx.fillPath()
+            drawText(ctx, lbl, at: CGPoint(x: tagRect.minX + 5, y: tagRect.midY - 4), size: 9.5,
+                     color: CGColor(red: 0.05, green: 0.05, blue: 0.05, alpha: 1), bold: true)
+        }
+        // Entry leg's descriptive tag (direction · verb · engine) at the LEFT of the price pane.
+        let entryY = min(max(yPrice(f.entry), rect.minY + 8), rect.maxY - 8)
+        let etag = legs[0].1
+        let etw = textWidth(etag, size: 9, bold: true) + 12
+        let er = CGRect(x: rect.minX + 6, y: entryY - 8, width: etw, height: 16)
+        ctx.setFillColor(RenderPalette.alpha(RenderPalette.bg, 0.82))
+        ctx.addPath(CGPath(roundedRect: er, cornerWidth: 3, cornerHeight: 3, transform: nil)); ctx.fillPath()
+        ctx.addPath(CGPath(roundedRect: er, cornerWidth: 3, cornerHeight: 3, transform: nil))
+        ctx.setStrokeColor(RenderPalette.alpha(RenderPalette.gold, 0.5)); ctx.setLineWidth(0.75); ctx.strokePath()
+        drawText(ctx, etag, at: CGPoint(x: er.minX + 6, y: er.midY - 4), size: 9, color: RenderPalette.gold, bold: true)
     }
 
     private static func drawTimeAxis(_ ctx: CGContext, candles: [Candle], rect: CGRect, bottomY: CGFloat,

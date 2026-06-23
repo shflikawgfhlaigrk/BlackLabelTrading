@@ -20,6 +20,7 @@ SOURCES=(
   "$ROOT/Sources/Backtest.swift"
   "$ROOT/Sources/BacktestDepth.swift"
   "$ROOT/Sources/Charting.swift"
+  "$ROOT/Sources/ChartRender.swift"
   "$ROOT/Sources/FeedTypes.swift"
   "$ROOT/Sources/JournalImport.swift"
   "$ROOT/Sources/Screener.swift"
@@ -37,7 +38,7 @@ xcrun --sdk macosx swiftc \
   -O \
   -sdk "$SDK" \
   -target arm64-apple-macosx13.0 \
-  -framework Foundation \
+  -framework Foundation -framework CoreGraphics -framework ImageIO -framework CoreText -framework UniformTypeIdentifiers \
   -o "$OUT" \
   "${SOURCES[@]}"
 

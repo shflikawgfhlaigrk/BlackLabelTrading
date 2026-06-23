@@ -10,15 +10,16 @@ import UniformTypeIdentifiers
 
 // Which indicators are currently shown. Persists in UserDefaults so the layout sticks.
 struct ChartIndicatorSet: Codable, Equatable {
-    var sma = true
-    var ema = false
+    var sma = false
+    var ema = true
     var bollinger = false
     var vwap = false
     var rsi = false
     var macd = false
     var atr = false
     var smaPeriod = 20
-    var emaPeriod = 50
+    var emaPeriod = 9
+    var ema2Period = 21      // second EMA (demo shows EMA9 gold + EMA21 blue)
     var bbPeriod = 20
     var bbK = 2.0
     var vwapWindow = 20
@@ -90,6 +91,7 @@ struct ChartScreen: View {
 
     // Live feed state
     @State private var liveTick: LiveTick? = nil
+    @State private var activeFire: FireRow? = nil      // engine's entry/stop/target/exit, shown on chart
     @State private var feedNote = ""
     @State private var loadingFeed = false
     @State private var livePollTask: Task<Void, Never>? = nil
@@ -103,7 +105,7 @@ struct ChartScreen: View {
 
     // Zoom/pan: a visible window [winStart, winStart+winCount) over the candle index space.
     @State private var winStart = 0
-    @State private var winCount = 0     // 0 = show all
+    @State private var winCount = 80    // right-anchored default window — full, premium look (not stretched)
     @State private var crosshair: Int? = nil
 
     private static let indKey = "com.blacklabel.trading.chartIndicators"
@@ -357,7 +359,10 @@ struct ChartScreen: View {
         guard !s.isEmpty else { feedNote = "Enter or pick a symbol."; return }
         loadingFeed = true; defer { loadingFeed = false }
         let bars = await feed.recentBars(symbol: s, limit: 400)
-        baseBars = bars; winStart = 0; winCount = 0; crosshair = nil; liveTick = nil; lastLiveClose = nil
+        baseBars = bars; crosshair = nil; liveTick = nil; lastLiveClose = nil
+        // Right-anchor the last ~80 bars so a freshly-loaded live chart reads full & premium (like
+        // the website demo) instead of stretching sparse bars across the whole pane. "Fit" resets to all.
+        winCount = bars.count > 0 ? min(80, bars.count) : 0; winStart = max(0, bars.count - winCount)
         renkoBrick = CandleTransform.suggestedBrickSize(baseBars)
         if bars.isEmpty {
             feedNote = feed.state.hasData ? "No bars captured for \(s) yet." : "Feed offline — no bars to show."
@@ -374,6 +379,7 @@ struct ChartScreen: View {
         guard source == .live, livePollTask == nil else { return }
         livePollTask = Task {
             var sinceRepull = 0
+            var sinceFires = 0
             while !Task.isCancelled {
                 let s = symbol.trimmingCharacters(in: .whitespaces)
                 if !s.isEmpty {
@@ -383,9 +389,16 @@ struct ChartScreen: View {
                         baseBars = LiveFold.apply(t, to: baseBars)
                     }
                     sinceRepull += 1
+                    sinceFires += 1
+                    // Pull the engine's active trade ~every 2s so entry/stop/target + exit show live.
+                    if sinceFires >= 5 {
+                        sinceFires = 0
+                        let fires = await feed.recentFires(limit: 40)
+                        activeFire = fires.first { ($0.symbol == s || $0.symbol == nil) }
+                    }
                     // Every ~30s re-pull recent bars so newly-printed candles appear, and refresh
                     // the honest feed status banner.
-                    if sinceRepull >= 6 {
+                    if sinceRepull >= 75 {
                         sinceRepull = 0
                         await feed.refreshStatus()
                         let fresh = await feed.recentBars(symbol: s, limit: 400)
@@ -393,10 +406,11 @@ struct ChartScreen: View {
                             var merged = fresh
                             if let t = liveTick { merged = LiveFold.apply(t, to: merged) }
                             baseBars = merged
+                            if winCount > 0 { winStart = max(0, merged.count - winCount) }  // stay glued to the live edge
                         }
                     }
                 }
-                try? await Task.sleep(nanoseconds: 5_000_000_000)  // 5s tick poll
+                try? await Task.sleep(nanoseconds: 400_000_000)  // 0.4s tick poll — near-real-time movement
             }
         }
     }
@@ -500,6 +514,7 @@ struct ChartScreen: View {
         let closes = candles.map(\.close)
         let smaS = ind.sma ? Indicators.sma(closes, ind.smaPeriod) : []
         let emaS = ind.ema ? Indicators.ema(closes, ind.emaPeriod) : []
+        let ema2S = ind.ema ? Indicators.ema(closes, ind.ema2Period) : []
         let bb = ind.bollinger ? ChartIndicators.bollinger(closes, period: ind.bbPeriod, k: ind.bbK) : nil
         let vwapBars = candleBars()
         let vwapS = ind.vwap ? ChartIndicators.vwap(vwapBars, window: ind.vwapWindow) : []
@@ -514,14 +529,15 @@ struct ChartScreen: View {
                             .interpolationMethod(.monotone).foregroundStyle(BLTheme.gold).lineStyle(StrokeStyle(lineWidth: 2))
                     } else {
                         // Wick
+                        // Wick — bold and always visible (high↔low), even on small-range bars.
                         RuleMark(x: .value("i", c.index), yStart: .value("low", c.low), yEnd: .value("high", c.high))
-                            .foregroundStyle(c.up ? BLTheme.green.opacity(0.9) : BLTheme.red.opacity(0.9)).lineStyle(StrokeStyle(lineWidth: 1.2))
-                        // Body
+                            .foregroundStyle(c.up ? BLTheme.gold.opacity(0.95) : BLTheme.red.opacity(0.95)).lineStyle(StrokeStyle(lineWidth: 2.2, lineCap: .round))
+                        // Body — thick gold bull / red bear, matching the website demo.
                         RectangleMark(x: .value("i", c.index),
                                       yStart: .value("o", c.up ? c.open : c.close),
                                       yEnd: .value("c", c.up ? c.close : c.open),
-                                      width: .ratio(0.72))
-                            .foregroundStyle(c.up ? BLTheme.green : BLTheme.red).cornerRadius(1.5)
+                                      width: .ratio(0.88))
+                            .foregroundStyle(c.up ? BLTheme.gold : BLTheme.red).cornerRadius(1)
                     }
                 }
                 // Dotted gold session separators (overnight/weekend gaps) — explains the holes.
@@ -531,7 +547,8 @@ struct ChartScreen: View {
                         .lineStyle(StrokeStyle(lineWidth: 1, dash: [2,4]))
                 }
                 overlayMarks(smaS, color: BLTheme.gold, name: "SMA")
-                overlayMarks(emaS, color: BLTheme.goldHi, name: "EMA")
+                overlayMarks(emaS, color: BLTheme.goldHi, name: "EMA9")        // gold EMA9 (demo)
+                overlayMarks(ema2S, color: BLTheme.blue, name: "EMA21")        // blue EMA21 (demo)
                 if let bb = bb {
                     overlayMarks(bb.upper, color: BLTheme.blue.opacity(0.7), name: "BB↑", dashed: true)
                     overlayMarks(bb.mid, color: BLTheme.blue.opacity(0.4), name: "BB", dashed: true)
@@ -559,10 +576,34 @@ struct ChartScreen: View {
                                 .clipShape(RoundedRectangle(cornerRadius: 3))
                         }
                 }
+                // Engine trade overlay — entry / stop / target (and exit) for the active signal.
+                // Drawn ONLY from a real recorded fire; nil when flat -> nothing (never fabricated).
+                if let f = activeFire {
+                    RuleMark(y: .value("entry", f.entry))
+                        .foregroundStyle(BLTheme.gold).lineStyle(StrokeStyle(lineWidth: 1.4, dash: [6,3]))
+                        .annotation(position: .leading, alignment: .trailing, spacing: 2) {
+                            Text("\(f.direction.uppercased()) \(f.outcome == nil ? "ENTRY" : "EXIT " + (f.outcome ?? "").uppercased()) \(TradeMath.num(f.entry))")
+                                .font(.system(size: 8.5, weight: .heavy, design: .rounded)).foregroundColor(BLTheme.gold)
+                        }
+                    if let st = f.stop {
+                        RuleMark(y: .value("stop", st))
+                            .foregroundStyle(BLTheme.red).lineStyle(StrokeStyle(lineWidth: 1, dash: [4,3]))
+                            .annotation(position: .trailing, alignment: .leading) {
+                                Text("STOP \(TradeMath.num(st))").font(.system(size: 8, weight: .bold, design: .rounded)).foregroundColor(BLTheme.red)
+                            }
+                    }
+                    if let tg = f.target {
+                        RuleMark(y: .value("tgt", tg))
+                            .foregroundStyle(BLTheme.green).lineStyle(StrokeStyle(lineWidth: 1, dash: [4,3]))
+                            .annotation(position: .trailing, alignment: .leading) {
+                                Text("TGT \(TradeMath.num(tg))").font(.system(size: 8, weight: .bold, design: .rounded)).foregroundColor(BLTheme.green)
+                            }
+                    }
+                }
             }
             .chartXScale(domain: Double(xLo)...Double(xHi))
             .chartYScale(domain: yDomain, type: (ind.logScale && dom.lo > 0) ? .log : .linear)
-            .chartYAxis { AxisMarks(position: .trailing, values: yTicks) { v in AxisGridLine().foregroundStyle(BLTheme.stroke.opacity(0.4))
+            .chartYAxis { AxisMarks(position: .leading, values: yTicks) { v in AxisGridLine().foregroundStyle(BLTheme.stroke.opacity(0.4))
                 AxisValueLabel { if let d = v.as(Double.self) { Text(TradeMath.num(d)).font(.system(size: 9)).foregroundStyle(BLTheme.sub) } } } }
             .chartXAxis { AxisMarks(values: xTicks.map(\.idx)) { v in AxisGridLine().foregroundStyle(BLTheme.stroke.opacity(0.3))
                 AxisValueLabel { if let i = v.as(Int.self), let lbl = xTickLabels[i] {

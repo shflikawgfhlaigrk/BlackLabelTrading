@@ -1091,6 +1091,51 @@ func testFeedSymbolsPicker() {
     ok(Set(p).count == p.count, "picker has no dupes")
 }
 
+// ===== ChartRender — headless chart + engine-trade overlay (edge-gate transparency) =====
+// Locks that the renderer survives every honest input shape: a full fire (entry/stop/target), a
+// fire with nil legs (no stop/no target), a CLOSED fire (outcome set), and empty bars (no-data
+// frame). A returned PNG file proves the path didn't crash and produced output; honesty is that
+// nil legs simply aren't drawn (never fabricated) — exercised by the nil-leg render succeeding.
+func testChartRenderFireOverlay() {
+    func mkBars(_ n: Int) -> [Bar] {
+        (0..<n).map { i in
+            let base = 100.0 + Double(i) * 0.1
+            return Bar(date: Date(timeIntervalSince1970: 1_700_000_000 + Double(i) * 60),
+                       open: base, high: base + 0.5, low: base - 0.5, close: base + 0.2, volume: 1000)
+        }
+    }
+    let dir = tmpBase.appendingPathComponent("render-\(UUID().uuidString)")
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    let bars = mkBars(120)
+    func path(_ n: String) -> String { dir.appendingPathComponent(n).path }
+
+    // Full fire: entry + stop + target + engine, open.
+    let full = RenderFire(direction: "long", engine: "barber", entry: 110.0, stop: 108.0, target: 114.0, outcome: nil)
+    let p1 = path("full.png")
+    ok(ChartRender.renderPNG(bars: bars, symbol: "US.QQQ", title: "t", indicators: RenderIndicators(fire: full), to: p1),
+       "render w/ full fire returns true")
+    ok(FileManager.default.fileExists(atPath: p1), "full-fire PNG written")
+
+    // Nil-leg fire: entry only (no stop, no target) — honest, the missing legs just aren't drawn.
+    let bare = RenderFire(direction: "short", engine: "research", entry: 111.0, stop: nil, target: nil, outcome: nil)
+    let p2 = path("bare.png")
+    ok(ChartRender.renderPNG(bars: bars, symbol: "US.QQQ", title: "t", indicators: RenderIndicators(fire: bare), to: p2),
+       "render w/ nil-leg fire returns true (legs honestly skipped)")
+
+    // Closed fire: outcome set -> "EXIT" label path.
+    let closed = RenderFire(direction: "long", engine: "bible", entry: 110.0, stop: 108.0, target: 114.0, outcome: "win")
+    ok(ChartRender.renderPNG(bars: bars, symbol: "US.QQQ", title: "t", indicators: RenderIndicators(fire: closed), to: path("closed.png")),
+       "render w/ closed fire (EXIT label) returns true")
+
+    // Empty bars + a fire: honest no-data frame, must not crash and still writes a PNG.
+    ok(ChartRender.renderPNG(bars: [], symbol: "US.QQQ", title: "t", indicators: RenderIndicators(fire: full), to: path("empty.png")),
+       "render w/ empty bars returns true (honest no-data frame)")
+
+    // No fire at all: the overlay simply isn't there (flat = nothing, never a fabricated trade).
+    ok(ChartRender.renderPNG(bars: bars, symbol: "US.QQQ", title: "t", indicators: RenderIndicators(fire: nil), to: path("none.png")),
+       "render w/ no fire returns true (no overlay)")
+}
+
 // ===== ChartScale (axis intelligence shared by the SwiftUI chart + the headless render proof) =====
 func testChartScaleNiceNum() {
     eq(ChartScale.niceNum(0.8, ceil: true), 1, "niceNum ceil 0.8 -> 1")
@@ -1249,6 +1294,9 @@ func testLiveBackendIntegration() {
         ok(fires.allSatisfy { $0.entry > 0 && !$0.engine.isEmpty }, "[integration] /api/fires rows are real (positive entry, named engine) or empty")
     } else { ok(false, "[integration] /api/fires reachable") }
 }
+
+// ChartRender headless engine-trade overlay (edge-gate transparency)
+testChartRenderFireOverlay()
 
 // ChartScale axis intelligence
 testChartScaleNiceNum()
