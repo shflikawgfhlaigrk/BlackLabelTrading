@@ -947,10 +947,52 @@ func testRiskPanelEmptyAndSingle() {
     ok(one.sharpe.isFinite && one.sqn.isFinite, "single-trade risk metrics finite (no NaN/inf)")
 }
 
+func testRiskPanelDegenerateMultiTrade() {
+    // The empty (n=0) and single-trade (n=1) tests above stop at riskPanel's `count > 1`
+    // early-return, so they NEVER exercise the inner guards: stdDev==0 in sharpe/sqn, downside
+    // dd==0 in sortino, and an INFINITE payoffRatio feeding kelly. Those fire on a buyer's most
+    // realistic first-run journal — a few early WINNING trades with no losses yet (zero dispersion
+    // AND no downside AND payoff=inf). The math must stay 0/finite, never +inf or NaN (§5.1/§5.2).
+
+    // (1) n>=2, all-IDENTICAL R -> stdDev == 0 -> sharpe/sqn must be 0 (the `sd > 0` guard the n=1
+    //     case skips). Without the guard this is mean/0 = +inf reaching the buyer.
+    let flat = (0..<4).map { TradeStat(pnl: 100, r: 1.0, date: day($0)) }
+    let fp = Analytics.riskPanel(flat)
+    eqi(fp.sampleSize, 4, "flat-R riskPanel.sampleSize")
+    eq(fp.sharpe, 0, "flat-R sharpe 0 (stdDev==0, not +inf)")
+    eq(fp.sqn, 0, "flat-R sqn 0 (stdDev==0, not +inf)")
+    ok(fp.sharpe.isFinite && fp.sqn.isFinite && fp.sortino.isFinite,
+       "flat-R risk metrics finite (no NaN/inf)")
+    eq(Analytics.stdDev([1, 1, 1, 1]), 0, "stdDev of identical = 0")
+    eq(Analytics.sharpe([1, 1, 1, 1]), 0, "sharpe of identical R = 0 (guarded, not +inf)")
+    eq(Analytics.sqn([1, 1, 1, 1]), 0, "sqn of identical R = 0 (guarded, not +inf)")
+
+    // (2) n>=2, ALL WINS / no losses -> no downside (sortino dd==0) AND report.payoffRatio = .infinity.
+    //     report HONESTLY reports an infinite payoff, but the buyer-facing riskPanel must NOT mint a
+    //     max-Kelly bet off a no-loss sample: kelly is fed `payoffRatio.isFinite ? : 0` -> stays 0.
+    let wins = [1.0, 2.0, 3.0].enumerated().map { TradeStat(pnl: $0.element * 100, r: $0.element, date: day($0.offset)) }
+    let rep = Analytics.report(wins)
+    ok(rep.profitFactor.isInfinite, "all-wins report.profitFactor = .infinity (honest, no losses)")
+    ok(rep.payoffRatio.isInfinite, "all-wins report.payoffRatio = .infinity (honest, no losses)")
+    let wp = Analytics.riskPanel(wins)
+    eq(wp.sortino, 0, "all-wins sortino 0 (no downside, dd==0 guarded)")
+    eq(wp.kelly, 0, "all-wins kelly 0 — infinite payoff must NOT mint a bet from a no-loss sample")
+    ok(wp.kelly.isFinite && wp.halfKelly.isFinite && wp.sharpe.isFinite && wp.sqn.isFinite && wp.streakZ.isFinite,
+       "all-wins full risk panel finite (no NaN/inf reaches the buyer)")
+
+    // (3) n>=2, ALL LOSSES / no wins -> kelly 0 (no edge), everything finite.
+    let losses = [-1.0, -2.0, -3.0].enumerated().map { TradeStat(pnl: $0.element * 100, r: $0.element, date: day($0.offset)) }
+    let lp = Analytics.riskPanel(losses)
+    eq(lp.kelly, 0, "all-losses kelly 0 (no edge)")
+    ok(lp.sharpe.isFinite && lp.sortino.isFinite && lp.sqn.isFinite && lp.kelly.isFinite,
+       "all-losses risk panel finite (no NaN/inf)")
+}
+
 print("Running Black Label Trading engine tests...")
 testAnalyticsCore()
 testAnalyticsEmpty()
 testRiskPanelEmptyAndSingle()
+testRiskPanelDegenerateMultiTrade()
 testProfitFactorInfinite()
 testStreaksAndDrawdown()
 testRiskPanel()
