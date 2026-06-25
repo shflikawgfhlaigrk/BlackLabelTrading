@@ -6,6 +6,10 @@ synthetic OHLC series that SHOULD prove edge does; one that should NOT doesn't; 
 yield an honest empty result (no fabrication). Runnable via `python3 -m pytest test_engines.py`
 or plain `python3 test_engines.py`.
 """
+import os
+import tempfile
+import time
+
 import bltd_store as S
 
 
@@ -349,6 +353,80 @@ def test_config_sanitizes_to_known_engines_only():
     assert clean["engines"] == ["momentum", "regime"]   # unknown dropped, known kept in order
 
 
+def test_es_symbol_policy_accepts_only_es_contracts():
+    assert S.is_es_symbol("ES")
+    assert S.is_es_symbol("/ES")
+    assert S.is_es_symbol("CM.ESU6")
+    assert S.is_es_symbol("ESZ26")
+    assert not S.is_es_symbol("NQ")
+    assert not S.is_es_symbol("CM.NQU6")
+    assert not S.is_es_symbol("MESU6")
+    assert not S.is_es_symbol("US.SPY")
+
+
+def test_config_forces_es_symbol_scope():
+    clean = S._sanitize({"symbols": ["NQ", "CM.ESU6", "CL"]})
+    assert clean["symbols"] == ["ES"]
+
+
+def _temp_store():
+    fd, path = tempfile.mkstemp(prefix="bltd-es-only-", suffix=".sqlite3")
+    os.close(fd)
+    os.unlink(path)
+    cfg = path + ".json"
+    return S.Store(path, config_path=cfg), path, cfg
+
+
+def test_store_rejects_and_hides_non_es_symbols():
+    store, path, cfg = _temp_store()
+    try:
+        rows = [(1_700_000_000 + i, 100.0 + i, 101.0 + i, 99.0 + i, 100.5 + i) for i in range(45)]
+        assert store.record_bars("CM.ESU6", rows) == 45
+        assert store.record_bars("CM.NQU6", rows) == 0
+        store.record_tick("CM.ESU6", 5100.0, int(time.time()))
+        store.record_tick("CM.NQU6", 17000.0, int(time.time()))
+
+        # Simulate stale pre-policy rows already present in a buyer's local SQLite file.
+        stale = [("CM.NQU6", int(ts), o, h, l, c, int(time.time())) for (ts, o, h, l, c) in rows]
+        store._exec("INSERT INTO bars(symbol,ts,o,h,l,c,ts_recorded) VALUES(?,?,?,?,?,?,?)",
+                    stale, many=True)
+        store._exec("INSERT INTO wc_live(symbol,price,recorded) VALUES(?,?,?)",
+                    ("CM.NQU6", 17001.0, int(time.time())))
+        store.record_fire("momentum", "long", 5100.0, symbol="CM.ESU6", synthetic=False)
+        store._exec("INSERT INTO fires(engine,direction,entry,symbol,synthetic,ts,outcome,pnl) "
+                    "VALUES(?,?,?,?,?,?,?,?)",
+                    ("momentum", "long", 17000.0, "CM.NQU6", 0, int(time.time()) + 10, "Win", 100.0))
+
+        syms = store.symbols()
+        assert syms["backtestable"] == ["CM.ESU6"], syms
+        assert syms["liveTicks"] == ["CM.ESU6"], syms
+        assert syms["busiest"] == "CM.ESU6", syms
+        assert store.bars("CM.NQU6", 100, newest=False)["bars"] == []
+        assert store.live_price("CM.NQU6") == {"gated": True}
+        assert store.ohlc("CM.NQU6") == []
+        assert store.edge_ok("momentum", "CM.NQU6")["ok"] is False
+        assert store.latest_fire()["fire"]["symbol"] == "CM.ESU6"
+        assert [f["symbol"] for f in store.fires()["fires"]] == ["CM.ESU6"]
+        assert store.journal_stats("CM.NQU6")["graded"] == 0
+    finally:
+        for p in (path, cfg):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
+def test_screen_filters_to_es_symbols_only():
+    import bltd_analytics as A
+
+    class _Store:
+        def config(self): return S.CONFIG_DEFAULTS
+        def ohlc(self, symbol): return []
+
+    rows = A.screen(_Store(), ["CM.NQU6", "CM.ESU6", "MESU6", "ES"], ["momentum"], S.CONFIG_DEFAULTS)
+    assert [r["symbol"] for r in rows] == ["CM.ESU6", "ES"]
+
+
 # ---- WC candle frame parsing (BOTH live shapes WC actually sends) -----------
 # WC's realtime feed sends two candle frame variants on the same socket:
 #   1. the historical/realtime bar shape with a real Unix epoch in `cepoch`
@@ -412,6 +490,30 @@ def test_on_candle_uses_arrival_when_epoch_missing():
     price, ep = recorded["CM.ESU6"]
     assert price == 7546.5
     assert ep == int(arrival)                 # stamped at the real arrival wall-clock
+
+
+def test_capture_drops_non_es_candles():
+    import bltd_capture as C
+
+    recorded = []
+
+    class _StubStore:
+        def config(self):
+            return S.CONFIG_DEFAULTS
+
+        def record_tick(self, sym, price, ep):
+            recorded.append((sym, price, ep))
+
+        def record_bars(self, *a, **k):
+            return 0
+
+        def ohlc(self, *a, **k):
+            return []
+
+    cap = C.Capture(_StubStore(), bar_seconds=15, lookback=20, edge_gate=True)
+    cap.on_candle({"symbol": "CM.NQU6", "close": 17000.0, "epoch": None}, arrival=1781853600.0)
+    cap.on_candle({"symbol": "CM.ESU6", "close": 7546.5, "epoch": None}, arrival=1781853601.0)
+    assert [r[0] for r in recorded] == ["CM.ESU6"]
 
 
 if __name__ == "__main__":

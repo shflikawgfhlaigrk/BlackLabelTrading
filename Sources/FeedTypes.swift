@@ -9,6 +9,41 @@
 // here is verifiable headlessly so the decode contract is test-locked.
 import Foundation
 
+enum TradingSymbolScope {
+    private static let monthCodes = Set("FGHJKMNQUVXZ")
+
+    static func normalized(_ raw: String?) -> String {
+        var s = (raw ?? "").trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        if let dot = s.lastIndex(of: ".") {
+            s = String(s[s.index(after: dot)...])
+        }
+        while s.first == "/" || s.first == "@" {
+            s.removeFirst()
+        }
+        return String(s.filter { $0.isLetter || $0.isNumber })
+    }
+
+    static func isES(_ raw: String?) -> Bool {
+        let s = normalized(raw)
+        if s == "ES" { return true }
+        guard s.count >= 4, s.hasPrefix("ES") else { return false }
+        let rest = String(s.dropFirst(2))
+        guard let month = rest.first, monthCodes.contains(month) else { return false }
+        let year = rest.dropFirst()
+        return (1...2).contains(year.count) && year.allSatisfy(\.isNumber)
+    }
+
+    static func filterES(_ symbols: [String]) -> [String] {
+        var seen = Set<String>()
+        var out: [String] = []
+        for s in symbols where isES(s) && !seen.contains(s) {
+            seen.insert(s)
+            out.append(s)
+        }
+        return out
+    }
+}
+
 // MARK: - Feed connection state (drives the honest banner in the chart screen).
 // Every state maps to a real, observed condition of the buyer's own capture pipeline — there is
 // no "pretend live". `.live` requires the backend to report feedAvailable AND fresh ticks.
@@ -84,10 +119,11 @@ struct FeedSymbols: Equatable {
 
     static func decode(_ obj: [String: Any]) -> FeedSymbols {
         var s = FeedSymbols()
-        s.backtestable = (obj["backtestable"] as? [String]) ?? []
-        s.live = (obj["live"] as? [String]) ?? []
-        s.liveTicks = (obj["liveTicks"] as? [String]) ?? []
-        s.busiest = obj["busiest"] as? String
+        s.backtestable = TradingSymbolScope.filterES((obj["backtestable"] as? [String]) ?? [])
+        s.live = TradingSymbolScope.filterES((obj["live"] as? [String]) ?? [])
+        s.liveTicks = TradingSymbolScope.filterES((obj["liveTicks"] as? [String]) ?? [])
+        let busiest = obj["busiest"] as? String
+        s.busiest = TradingSymbolScope.isES(busiest) ? busiest : nil
         return s
     }
 }
@@ -131,6 +167,7 @@ struct LiveTick: Equatable {
     static func decode(_ obj: [String: Any]) -> LiveTick? {
         if (obj["gated"] as? Bool) == true { return nil }
         guard let sym = obj["symbol"] as? String,
+              TradingSymbolScope.isES(sym),
               let p = FeedBars.num(obj["price"] as Any),
               let t = FeedBars.num(obj["ts"] as Any) else { return nil }
         return LiveTick(symbol: sym, price: p, ts: Date(timeIntervalSince1970: t))
@@ -205,6 +242,7 @@ enum EngineRoster {
         guard let rows = obj["rows"] as? [[String: Any]] else { return [] }
         return rows.compactMap { r in
             guard let e = r["engine"] as? String, let s = r["symbol"] as? String else { return nil }
+            guard TradingSymbolScope.isES(s) else { return nil }
             return EngineRow(
                 engine: e, symbol: s,
                 edge: (r["edge"] as? Bool) ?? false,
@@ -242,11 +280,13 @@ enum FireFeed {
         guard let rows = obj["fires"] as? [[String: Any]] else { return [] }
         return rows.compactMap { r in
             guard let e = r["engine"] as? String, let d = r["direction"] as? String,
-                  let entry = FeedBars.num(r["entry"] as Any) else { return nil }
+                  let entry = FeedBars.num(r["entry"] as Any),
+                  let sym = r["symbol"] as? String,
+                  TradingSymbolScope.isES(sym) else { return nil }
             return FireRow(
                 id: Int(FeedBars.num(r["id"] as Any) ?? 0),
                 engine: e, direction: d, entry: entry,
-                symbol: r["symbol"] as? String,
+                symbol: sym,
                 stop: FeedBars.num(r["stop"] as Any),
                 target: FeedBars.num(r["target"] as Any),
                 rationale: r["rationale"] as? String,

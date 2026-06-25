@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -62,7 +63,7 @@ CONFIG_DEFAULTS = {
     "mrStopMult": 8.0,         # mean-reversion stop in sd multiples
     "mrWinFloor": 0.87,        # mean-reversion OOS win-rate floor to count as edge
     "bkTargetR": 2.0,          # breakout reward:risk target
-    "symbols": [],             # [] = capture every symbol the feed sends; else allow-list
+    "symbols": ["ES"],         # product scope: ES only; capture/screen ignore all non-ES symbols
     # risk / prop-firm rules (signals-only — informational, shapes alert sizing, never executes)
     "accountSize": 50000.0,
     "riskPerTradePct": 1.0,
@@ -83,6 +84,40 @@ _CONFIG_RANGES = {
 }
 _KNOWN_ENGINES = ("meanrev", "breakout", "research", "momentum", "structure", "regime",
                   "channel", "context_a", "context_b")
+ES_ROOT = "ES"
+_ES_MONTH_CODES = "FGHJKMNQUVXZ"
+_ES_CONTRACT_RE = re.compile(rf"^ES[{_ES_MONTH_CODES}]\d{{1,2}}$")
+
+
+def normalize_symbol(symbol) -> str:
+    """Normalize feed/platform symbols to the customer-facing futures token.
+
+    WealthCharts emits contract names like CM.ESU6. Users may also type ES or /ES. The engine
+    product is intentionally ES-only, so this helper exists to make that rule testable at every
+    boundary instead of scattering string checks through the capture/API code."""
+    s = str(symbol or "").strip().upper()
+    if not s:
+        return ""
+    if "." in s:
+        s = s.split(".")[-1]
+    s = s.lstrip("/@")
+    return "".join(ch for ch in s if ch.isalnum())
+
+
+def is_es_symbol(symbol) -> bool:
+    s = normalize_symbol(symbol)
+    return s == ES_ROOT or bool(_ES_CONTRACT_RE.match(s))
+
+
+def es_symbols(symbols) -> list[str]:
+    out = []
+    seen = set()
+    for sym in symbols or []:
+        raw = str(sym or "").strip()
+        if raw and is_es_symbol(raw) and raw not in seen:
+            seen.add(raw)
+            out.append(raw)
+    return out
 
 
 def _clamp(key, val):
@@ -119,7 +154,7 @@ def _sanitize(cfg: dict) -> dict:
     out["engines"] = eng or list(CONFIG_DEFAULTS["engines"])
     out["edgeGate"] = bool(out.get("edgeGate", True))
     out["alertSound"] = bool(out.get("alertSound", True))
-    out["symbols"] = [str(s).strip() for s in (out.get("symbols") or []) if str(s).strip()]
+    out["symbols"] = [ES_ROOT]
     out["propFirm"] = str(out.get("propFirm", ""))[:64]
     out["alertWebhook"] = str(out.get("alertWebhook", ""))[:512]
     return out
@@ -299,7 +334,7 @@ def _fib_pos(closes, lookback):
 
 # ===========================================================================
 # Engine math (pure) — ported from utah.product.backtest / research_signal / Engines.swift.
-# OOS-split, edge proven only on the held-out tail. Same numbers as the Swift engines.
+# OOS-split, OOS-candidate verdict only on the held-out tail. Same numbers as the Swift engines.
 # ===========================================================================
 LOOKBACK = 20
 OOS_FRAC = 0.4
@@ -400,7 +435,7 @@ def prove_meanrev(ohlc, cfg=None):
     oos = ohlc[split:]
     s = _summarize(_mr_trades(oos, lookback, cfg), min_trades)
     edge = s["trades"] >= min_trades and s["winRate"] >= win_floor and s["netPts"] > 0
-    reason = (f"edge proven: OOS win {s['winRate']*100:.1f}% / net {s['netPts']:+.2f} pts on {s['trades']} trades"
+    reason = (f"OOS candidate: win {s['winRate']*100:.1f}% / net {s['netPts']:+.2f} pts on {s['trades']} trades; live verification required"
               if edge else
               f"not proven: OOS win {s['winRate']*100:.1f}% / net {s['netPts']:+.2f} pts on {s['trades']} trades "
               f"(need win>={win_floor*100:.0f}%, net>0, >={min_trades} trades)")
@@ -470,7 +505,7 @@ def prove_breakout(ohlc, cfg=None):
     min_trades = cfg.get("minTrades", MIN_TRADES)
     split = int(len(ohlc) * (1.0 - oos_frac))
     s = _summarize(_bk_trades(ohlc[split:], lookback, cfg), min_trades)
-    reason = (f"edge proven: OOS expectancy {s['expectancyR']:+.3f}R on {s['trades']} trades"
+    reason = (f"OOS candidate: expectancy {s['expectancyR']:+.3f}R on {s['trades']} trades; live verification required"
               if s["edgeProven"] else
               f"not proven: OOS expectancy {s['expectancyR']:+.3f}R on {s['trades']} trades")
     return {"ok": s["edgeProven"], "reason": reason, **s}
@@ -560,7 +595,7 @@ def _consensus_prove(ohlc, cfg, dir_fn, label):
     min_trades = cfg.get("minTrades", MIN_TRADES)
     split = int(len(ohlc) * (1.0 - oos_frac))
     s = _summarize(_consensus_engine_trades(ohlc[split:], lookback, cfg, dir_fn), min_trades)
-    reason = (f"edge proven: OOS expectancy {s['expectancyR']:+.3f}R / net {s['netPts']:+.2f} pts on {s['trades']} trades"
+    reason = (f"OOS candidate: expectancy {s['expectancyR']:+.3f}R / net {s['netPts']:+.2f} pts on {s['trades']} trades; live verification required"
               if s["edgeProven"] else
               f"not proven: OOS expectancy {s['expectancyR']:+.3f}R on {s['trades']} trades")
     return {"ok": s["edgeProven"], "reason": f"{label}: {reason}" if label else reason, **s}
@@ -834,7 +869,7 @@ def _context_b_signal(closes, ohlc, lookback, cfg):
 
 
 # Registry of per-engine OOS trade generators. Keeps the gate, the screener and the full
-# backtest report in lockstep — every engine's edge is proven from THIS walk, nothing else.
+# backtest report in lockstep — every engine's OOS candidate verdict comes from THIS walk, nothing else.
 # research reuses the breakout walk as its tradable OOS proxy (same as prove_research).
 ENGINE_TRADES = {"meanrev": _mr_trades, "breakout": _bk_trades, "research": _bk_trades,
                  "momentum": _momentum_trades, "structure": _structure_trades,
@@ -957,28 +992,29 @@ class Store:
     def meta(self) -> dict:
         cutoff = int(time.time()) - LIVE_BAR_WINDOW
         today = int(time.time()) - (int(time.time()) % 86400)  # UTC midnight
-        cnt = self._q("SELECT count(*) FROM fires WHERE synthetic=0 AND ts>=?", (today,))
-        live = self._q("SELECT 1 FROM bars WHERE ts_recorded>? LIMIT 1", (cutoff,))
-        return {"online": self.online(), "feedLive": bool(live),
-                "signalsToday": (cnt[0][0] if cnt else 0)}
+        fires_today = self._q("SELECT symbol FROM fires WHERE synthetic=0 AND ts>=?", (today,))
+        live_syms = self._q("SELECT DISTINCT symbol FROM bars WHERE ts_recorded>?", (cutoff,))
+        return {"online": self.online(), "feedLive": any(is_es_symbol(s) for (s,) in live_syms),
+                "signalsToday": sum(1 for (s,) in fires_today if is_es_symbol(s))}
 
     # ---- symbols -------------------------------------------------------
     def symbols(self) -> dict:
-        bt = [r[0] for r in self._q(
-            "SELECT symbol FROM bars GROUP BY symbol HAVING count(*)>=40 ORDER BY symbol")]
-        live = [r[0] for r in self._q(
+        bt = es_symbols([r[0] for r in self._q(
+            "SELECT symbol FROM bars GROUP BY symbol HAVING count(*)>=40 ORDER BY symbol")])
+        live = es_symbols([r[0] for r in self._q(
             "SELECT DISTINCT symbol FROM bars WHERE ts_recorded>? ORDER BY symbol",
-            (int(time.time()) - LIVE_BAR_WINDOW,))]
-        ticks = [r[0] for r in self._q(
+            (int(time.time()) - LIVE_BAR_WINDOW,))])
+        ticks = es_symbols([r[0] for r in self._q(
             "SELECT symbol FROM wc_live WHERE recorded>? ORDER BY symbol",
-            (int(time.time()) - LIVE_TICK_WINDOW,))]
-        busiest = self._q("SELECT symbol FROM bars GROUP BY symbol ORDER BY count(*) DESC LIMIT 1")
+            (int(time.time()) - LIVE_TICK_WINDOW,))])
+        busiest_rows = self._q("SELECT symbol FROM bars GROUP BY symbol ORDER BY count(*) DESC")
+        busiest = next((r[0] for r in busiest_rows if is_es_symbol(r[0])), None)
         return {"backtestable": bt, "live": live, "liveTicks": ticks,
-                "busiest": busiest[0][0] if busiest else None}
+                "busiest": busiest}
 
     # ---- bars ----------------------------------------------------------
     def bars(self, symbol: str, limit: int, newest: bool) -> dict:
-        if not symbol:
+        if not symbol or not is_es_symbol(symbol):
             return {"symbol": symbol, "bars": []}
         if newest:
             rows = self._q(
@@ -993,6 +1029,8 @@ class Store:
     def record_bars(self, symbol: str, rows) -> int:
         """rows: [(ts_epoch, o, h, l, c), ...]. Upsert by (symbol, ts) so overlapping capture
         windows never double-count. Returns count attempted."""
+        if not is_es_symbol(symbol):
+            return 0
         now = int(time.time())
         seq = [(symbol, int(ts), o, h, l, c, now) for (ts, o, h, l, c) in rows]
         if not seq:
@@ -1005,7 +1043,7 @@ class Store:
 
     # ---- live tick -----------------------------------------------------
     def live_price(self, symbol: str) -> dict:
-        if not symbol:
+        if not symbol or not is_es_symbol(symbol):
             return {"gated": True}
         rows = self._q("SELECT price,recorded FROM wc_live WHERE symbol=?", (symbol,))
         if not rows:
@@ -1013,6 +1051,8 @@ class Store:
         return {"symbol": symbol, "price": rows[0][0], "ts": float(rows[0][1])}
 
     def record_tick(self, symbol: str, price: float, epoch: int) -> None:
+        if not is_es_symbol(symbol):
+            return
         self._exec("INSERT INTO wc_live(symbol,price,recorded) VALUES(?,?,?) "
                    "ON CONFLICT(symbol) DO UPDATE SET price=excluded.price,"
                    "recorded=excluded.recorded", (symbol, float(price), int(epoch)))
@@ -1020,6 +1060,8 @@ class Store:
     # ---- fires ---------------------------------------------------------
     def record_fire(self, engine, direction, entry, symbol=None, stop=None, target=None,
                     rationale=None, synthetic=False) -> int:
+        if symbol is not None and not is_es_symbol(symbol):
+            return 0
         return self._exec(
             "INSERT INTO fires(engine,direction,entry,symbol,stop,target,rationale,synthetic,ts) "
             "VALUES(?,?,?,?,?,?,?,?,?)",
@@ -1029,10 +1071,9 @@ class Store:
     def latest_fire(self) -> dict:
         rows = self._q(
             "SELECT id,engine,direction,entry,symbol,stop,target,rationale,outcome,pnl,ts "
-            "FROM fires WHERE synthetic=0 ORDER BY id DESC LIMIT 1")
-        if not rows:
-            return {"fire": None}
-        return {"fire": self._fire_dict(rows[0])}
+            "FROM fires WHERE synthetic=0 ORDER BY id DESC LIMIT 100")
+        row = next((r for r in rows if is_es_symbol(r[4])), None)
+        return {"fire": self._fire_dict(row) if row else None}
 
     @staticmethod
     def _fire_dict(r) -> dict:
@@ -1045,6 +1086,8 @@ class Store:
         """The signal journal: recorded real (non-synthetic) fires, newest first, optionally
         filtered. Each row carries its outcome/pnl if the daemon has graded it. Honest empty on
         a cold store."""
+        if symbol and not is_es_symbol(symbol):
+            return {"fires": []}
         where = ["synthetic=0"]
         params: list = []
         if symbol:
@@ -1057,12 +1100,15 @@ class Store:
         rows = self._q(
             "SELECT id,engine,direction,entry,symbol,stop,target,rationale,outcome,pnl,ts "
             f"FROM fires WHERE {' AND '.join(where)} ORDER BY id DESC LIMIT ?", tuple(params))
-        return {"fires": [self._fire_dict(r) for r in rows]}
+        return {"fires": [self._fire_dict(r) for r in rows if is_es_symbol(r[4])][:int(limit)]}
 
     def journal_stats(self, symbol: str | None = None, engine: str | None = None) -> dict:
         """Performance analytics over the journal of *graded* fires (hypothetical, signals-only).
         Counts only fires the daemon has marked target/stop with a pnl — never invents an outcome
         for an open signal."""
+        if symbol and not is_es_symbol(symbol):
+            return {"graded": 0, "wins": 0, "losses": 0, "winRate": 0.0, "netPnl": 0.0,
+                    "avgWin": 0.0, "avgLoss": 0.0, "byEngine": {}}
         where = ["synthetic=0", "outcome IS NOT NULL", "pnl IS NOT NULL"]
         params: list = []
         if symbol:
@@ -1072,7 +1118,8 @@ class Store:
             where.append("engine=?")
             params.append(engine)
         rows = self._q(
-            f"SELECT outcome,pnl,engine FROM fires WHERE {' AND '.join(where)}", tuple(params))
+            f"SELECT outcome,pnl,engine,symbol FROM fires WHERE {' AND '.join(where)}", tuple(params))
+        rows = [r for r in rows if is_es_symbol(r[3])]
         n = len(rows)
         if n == 0:
             return {"graded": 0, "wins": 0, "losses": 0, "winRate": 0.0, "netPnl": 0.0,
@@ -1080,7 +1127,7 @@ class Store:
         wins = [r[1] for r in rows if (r[1] or 0) > 0]
         losses = [r[1] for r in rows if (r[1] or 0) < 0]
         by_engine: dict = {}
-        for outcome, pnl, eng in rows:
+        for outcome, pnl, eng, _sym in rows:
             e = by_engine.setdefault(eng, {"n": 0, "wins": 0, "netPnl": 0.0})
             e["n"] += 1
             e["wins"] += 1 if (pnl or 0) > 0 else 0
@@ -1096,6 +1143,8 @@ class Store:
     def ohlc(self, symbol: str, limit: int = 5000):
         """A symbol's bars as [(o,h,l,c), ...] oldest->newest — the engine/gate input. Public so
         the capture daemon can evaluate the live signal off the same series the gate proves."""
+        if not is_es_symbol(symbol):
+            return []
         rows = self._q("SELECT o,h,l,c FROM bars WHERE symbol=? ORDER BY ts LIMIT ?",
                        (symbol, limit))
         # tolerate null o/h/l (close-only history) by falling back to close
@@ -1121,6 +1170,8 @@ class Store:
         verdict when there aren't enough bars. Uses the buyer's tuned config (lookback / OOS /
         win-floor / geometry) — nothing hardcoded."""
         cfg = cfg or self.config()
+        if not is_es_symbol(symbol):
+            return {"ok": False, "reason": f"unsupported symbol '{symbol}' — Black Label Trading engines are ES-only"}
         key = (engine, symbol)
         cached = self._edge_cache.get(key)
         now = time.time()

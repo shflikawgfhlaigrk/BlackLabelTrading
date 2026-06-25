@@ -99,9 +99,28 @@ print("symbol: \(symbol)")
 guard let recent = httpJSON("GET", base + "/api/recent?symbol=\(symbol.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? symbol)&limit=400", token: token) else {
     print("FATAL: /api/recent returned nothing."); exit(4)
 }
-let bars = FeedBars.decode(recent)
-print("decoded \(bars.count) real bars")
-guard !bars.isEmpty else { print("FATAL: zero bars for \(symbol) — honest empty, nothing to render."); exit(5) }
+let rawBars = FeedBars.decode(recent)
+print("decoded \(rawBars.count) real bars")
+guard !rawBars.isEmpty else { print("FATAL: zero bars for \(symbol) — honest empty, nothing to render."); exit(5) }
+// Match the LIVE APP's default view: aggregate 15s base bars -> 1-minute candles (factor 4), then
+// show the recent session (last ~60). This makes the proof reflect what the app actually renders.
+func resample1m(_ src: [Bar], factor: Int = 4) -> [Bar] {
+    guard src.count > factor else { return src }
+    var out: [Bar] = []; var i = 0
+    while i < src.count {
+        let chunk = Array(src[i..<min(i+factor, src.count)])
+        if let f = chunk.first, let l = chunk.last {
+            out.append(Bar(date: f.date, open: f.open, high: chunk.map(\.high).max() ?? f.high,
+                           low: chunk.map(\.low).min() ?? f.low, close: l.close,
+                           volume: chunk.reduce(0) { $0 + $1.volume }))
+        }
+        i += factor
+    }
+    return out
+}
+let oneMin = resample1m(rawBars)
+let bars = Array(oneMin.suffix(60))
+print("rendering recent \(bars.count) one-minute candles (app default view)")
 
 // 4) Real live last-price tick (if any) for the last-price line — never fabricated.
 var lastPrice: Double? = nil

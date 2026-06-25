@@ -236,17 +236,17 @@ struct SignalsScreen: View {
         let provenCount = engines.filter { (byEngine[$0] ?? []).contains { $0.edge } }.count
         return Panel(title: "Engine fleet", icon: "cpu.fill", accent: BLTheme.gold) {
             HStack(spacing: 8) {
-                Text("Each engine's edge is proven out-of-sample on YOUR captured bars. An engine fires only when it proves real held-out edge — nothing shows live without real math.")
+                Text("Each engine shows ES-only OOS candidate math on YOUR captured bars. Signals remain research-only until live verification exists — nothing shows live without real data.")
                     .font(.system(size: 11, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
                     .fixedSize(horizontal: false, vertical: true)
                 Spacer()
                 if !fleet.isEmpty {
-                    StatusPill(text: "\(provenCount)/\(engines.count) edge-proven", tint: provenCount > 0 ? BLTheme.green : BLTheme.gold)
+                    StatusPill(text: "\(provenCount)/\(engines.count) OOS candidates", tint: provenCount > 0 ? BLTheme.green : BLTheme.gold)
                 }
             }
             if fleet.isEmpty {
                 EmptyState(icon: "cpu", title: fleetLoading ? "Loading engine fleet…" : "Engine fleet idle",
-                           hint: "Connect your WealthCharts feed and let bars accumulate — each engine arms once your own data proves (or disproves) its edge out-of-sample. Nothing is shown until it's real.")
+                           hint: "Connect your WealthCharts feed and let ES bars accumulate — each engine arms only after your own ES data produces an OOS candidate. Nothing is shown until it's real.")
             } else {
                 VStack(spacing: 8) { ForEach(engines, id: \.self) { e in engineFleetRow(e, byEngine[e] ?? []) } }
             }
@@ -263,7 +263,7 @@ struct SignalsScreen: View {
         let allWarming = !rows.isEmpty && rows.allSatisfy { $0.warming }
         let best = proven.max(by: { $0.netPts < $1.netPts }) ?? rows.max(by: { $0.netPts < $1.netPts })
         let tint = !proven.isEmpty ? BLTheme.green : (allWarming ? BLTheme.gold : BLTheme.sub)
-        let status = !proven.isEmpty ? "EDGE" : (allWarming ? "WARMING" : "NO EDGE")
+        let status = !proven.isEmpty ? "OOS CAND" : (allWarming ? "WARMING" : "NO EDGE")
         return HStack(spacing: 12) {
             Image(systemName: "bolt.horizontal.circle.fill").font(.system(size: 14, weight: .bold)).foregroundColor(tint)
             VStack(alignment: .leading, spacing: 2) {
@@ -699,7 +699,7 @@ struct TradeEditor: View {
         VStack(alignment: .leading, spacing: 16) {
             Text(trade.symbol.isEmpty ? "Log trade" : "Edit trade").font(.system(size: 18, weight: .heavy, design: .rounded)).foregroundColor(BLTheme.text)
             HStack(spacing: 12) {
-                Field(title: "Symbol", text: $trade.symbol, prompt: "ES, NQ, CL…")
+                Field(title: "Symbol", text: $trade.symbol, prompt: "ES or CM.ESU6")
                 VStack(alignment: .leading, spacing: 4) {
                     Text("DIRECTION").font(.system(size: 10, weight: .bold, design: .rounded)).foregroundColor(BLTheme.sub).tracking(0.5)
                     Picker("", selection: $trade.direction) { ForEach(TradeDirection.allCases) { Text($0.label).tag($0) } }
@@ -752,7 +752,15 @@ struct TradeEditor: View {
             }
             HStack { Spacer()
                 GhostButton(label: "Cancel") { dismiss() }
-                GoldButton(label: "Save trade", icon: "checkmark") { var t = computed(); t.id = trade.id; model.upsert(t); dismiss() }
+                GoldButton(label: "Save trade", icon: "checkmark") {
+                    var t = computed()
+                    let s = t.symbol.trimmingCharacters(in: .whitespacesAndNewlines)
+                    t.symbol = s.isEmpty ? "ES" : s.uppercased()
+                    guard TradingSymbolScope.isES(t.symbol) else { return }
+                    t.id = trade.id
+                    model.upsert(t)
+                    dismiss()
+                }
             }
         }
         .padding(24).frame(width: 540)
@@ -939,7 +947,7 @@ struct SettingsScreen: View {
                     if feedSaved { Text("Saved.").font(.system(size: 11, weight: .semibold, design: .rounded)).foregroundColor(BLTheme.green) }
                 }
                 if !feed.symbols.pickerList.isEmpty {
-                    Text("Captured symbols: \(feed.symbols.pickerList.prefix(12).joined(separator: ", "))")
+                    Text("Captured ES contracts: \(feed.symbols.pickerList.prefix(12).joined(separator: ", "))")
                         .font(.system(size: 11, design: .rounded)).foregroundColor(BLTheme.sub).fixedSize(horizontal: false, vertical: true)
                 }
             }

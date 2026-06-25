@@ -1098,6 +1098,8 @@ func testFeedBarsGeometryDefensive() {
 func testLiveTickDecode() {
     ok(LiveTick.decode(["gated": true]) == nil, "gated tick -> nil")
     ok(LiveTick.decode(["symbol": "ES"]) == nil, "incomplete tick -> nil")
+    ok(LiveTick.decode(["symbol": "CM.NQU6", "price": 17000.0, "ts": 1_700_000_000.0]) == nil,
+       "non-ES tick is rejected")
     let t = LiveTick.decode(["symbol": "ES", "price": 4500.25, "ts": 1_700_000_000.0])
     ok(t != nil, "valid tick decodes")
     eq(t!.price, 4500.25, "tick price")
@@ -1124,13 +1126,42 @@ func testCaptureStatusState() {
 }
 func testFeedSymbolsPicker() {
     let s = FeedSymbols.decode([
-        "backtestable": ["AAA", "BBB"], "live": ["BBB", "CCC"],
-        "liveTicks": ["CCC", "DDD"], "busiest": "AAA",
+        "backtestable": ["AAA", "CM.ESU6", "ESZ26"], "live": ["ESZ26", "CM.NQU6"],
+        "liveTicks": ["CM.ESU6", "NQ"], "busiest": "AAA",
     ])
     let p = s.pickerList
-    eqi(p.count, 4, "picker de-duplicates union")
-    ok(p.first == "CCC", "picker leads with live tick")
+    eqi(p.count, 2, "picker de-duplicates ES-only union")
+    ok(p.first == "CM.ESU6", "picker leads with ES live tick")
     ok(Set(p).count == p.count, "picker has no dupes")
+    ok(s.busiest == nil, "non-ES busiest symbol is rejected")
+}
+
+func testTradingSymbolScope() {
+    ok(TradingSymbolScope.isES("ES"), "ES root accepted")
+    ok(TradingSymbolScope.isES("/ES"), "/ES accepted")
+    ok(TradingSymbolScope.isES("CM.ESU6"), "WealthCharts ES contract accepted")
+    ok(TradingSymbolScope.isES("ESZ26"), "two-digit ES contract accepted")
+    ok(!TradingSymbolScope.isES("NQ"), "NQ rejected")
+    ok(!TradingSymbolScope.isES("CM.NQU6"), "NQ contract rejected")
+    ok(!TradingSymbolScope.isES("MESU6"), "MES rejected")
+    ok(!TradingSymbolScope.isES("US.SPY"), "equity symbol rejected")
+}
+
+func source(_ rel: String) -> String {
+    let url = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(rel)
+    return (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+}
+
+func testProductSurfaceESOnlyContract() {
+    let files = ["Sources/Model.swift", "Sources/Screens.swift", "Sources/Screens2.swift", "Sources/Screens3.swift"]
+    let text = files.map { source($0) }.joined(separator: "\n")
+    ok(!text.isEmpty, "product-surface source loaded")
+    for phrase in ["ES, NQ", "ES, AAPL", "NQ=15500", "placeholder: \"AAPL\"", "i.symbol = \"NQ\"", "i.symbol = \"CL\""] {
+        ok(!text.contains(phrase), "product surface excludes non-ES phrase: \(phrase)")
+    }
+    ok(text.contains("TradingSymbolScope.isES(t.symbol)"), "trade save is ES-guarded")
+    ok(text.contains("TradingSymbolScope.isES(s), !conditions.isEmpty"), "alert creation is ES-guarded")
+    ok(text.contains("Alerts are ES-only"), "visual strategy alert explains ES-only guard")
 }
 
 // ===== ChartRender — headless chart + engine-trade overlay (edge-gate transparency) =====
@@ -1224,17 +1255,16 @@ func testChartScaleDecimals() {
 // ===== Engine roster + fire feed decode (GET /api/screen, /api/fires) =====
 func testEngineRosterDecode() {
     let obj: [String: Any] = ["rows": [
-        ["engine": "momentum", "symbol": "CM.MNQM6", "edge": true, "warming": false,
-         "winRate": 0.9, "netPts": 12.5, "expectancyR": 0.6, "trades": 30, "bars": 120, "reason": "edge proven"],
+        ["engine": "momentum", "symbol": "CM.ESU6", "edge": true, "warming": false,
+         "winRate": 0.9, "netPts": 12.5, "expectancyR": 0.6, "trades": 30, "bars": 120, "reason": "OOS candidate"],
         ["engine": "regime", "symbol": "US.SPY", "edge": false, "warming": true,
          "winRate": 0.0, "netPts": 0.0, "expectancyR": 0.0, "trades": 0, "bars": 12, "reason": "warming"],
     ]]
     let rows = EngineRoster.decode(obj)
-    eqi(rows.count, 2, "roster row count")
+    eqi(rows.count, 1, "roster keeps only ES rows")
     ok(rows[0].engine == "momentum" && rows[0].edge && !rows[0].warming, "roster row 0 fields")
     eq(rows[0].netPts, 12.5, "roster row 0 netPts")
     eqi(rows[0].trades, 30, "roster row 0 trades")
-    ok(rows[1].warming && !rows[1].edge, "roster row 1 warming")
     eqi(EngineRoster.decode(["rows": []]).count, 0, "empty roster honest")
     eqi(EngineRoster.decode([:]).count, 0, "missing rows key honest")
 }
@@ -1258,13 +1288,15 @@ func testEngineLabels() {
 
 func testFireFeedDecode() {
     let obj: [String: Any] = ["fires": [
-        ["id": 5, "engine": "structure", "direction": "short", "entry": 100.0, "symbol": "US.QQQ",
+        ["id": 5, "engine": "structure", "direction": "short", "entry": 5100.0, "symbol": "CM.ESU6",
          "stop": 102.0, "target": 96.0, "rationale": "r", "outcome": NSNull(), "pnl": NSNull(), "ts": "2026-06-18 12:00:00"],
+        ["id": 6, "engine": "momentum", "direction": "long", "entry": 17000.0, "symbol": "CM.NQU6",
+         "stop": 16900.0, "target": 17200.0, "rationale": "r", "ts": "2026-06-18 12:01:00"],
     ]]
     let fires = FireFeed.decode(obj)
-    eqi(fires.count, 1, "fire count")
+    eqi(fires.count, 1, "fire decode keeps only ES rows")
     ok(fires[0].engine == "structure" && fires[0].direction == "short", "fire fields")
-    eq(fires[0].entry, 100.0, "fire entry")
+    eq(fires[0].entry, 5100.0, "fire entry")
     ok(fires[0].outcome == nil && fires[0].pnl == nil, "ungraded fire -> nil outcome/pnl (honest)")
     eqi(FireFeed.decode(["fires": []]).count, 0, "empty fires honest")
 }
@@ -1355,6 +1387,8 @@ testLiveTickDecode()
 testLiveFold()
 testCaptureStatusState()
 testFeedSymbolsPicker()
+testTradingSymbolScope()
+testProductSurfaceESOnlyContract()
 
 // Engine roster + fire feed decode (the /api/screen + /api/fires wire contract)
 testEngineRosterDecode()

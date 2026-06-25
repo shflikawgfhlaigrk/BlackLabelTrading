@@ -215,14 +215,14 @@ enum SignalEngine {
                          "Volume": 0.6, "Trend": 0.9, "Momentum": 0.7, "HMM Regime": 0.7, "Alpha Monitor": 0.5,
                          "Session": 0.5, "SMT": 0.3]; return i
         }()),
-        ("Bearish CVD divergence", {
-            var i = SignalInputs(); i.symbol = "NQ"; i.price = 17850; i.atr = 45; i.pointValue = 20
+        ("Bearish ES CVD divergence", {
+            var i = SignalInputs(); i.symbol = "ES"; i.price = 4988; i.atr = 12.5; i.pointValue = 50
             i.factors = ["CVD Divergence": -0.9, "CVD Flow": -0.6, "VWAP": -0.5, "VPIN": -0.7, "StepGMA": -0.6,
                          "Volume": 0.5, "Trend": -0.7, "Momentum": -0.5, "HMM Regime": -0.6, "Alpha Monitor": -0.4,
                          "Session": 0.2, "SMT": -0.6]; return i
         }()),
-        ("Chop / no edge", {
-            var i = SignalInputs(); i.symbol = "CL"; i.price = 78.4; i.atr = 0.9; i.pointValue = 1000
+        ("ES chop / no edge", {
+            var i = SignalInputs(); i.symbol = "ES"; i.price = 5002; i.atr = 8.0; i.pointValue = 50
             i.factors = ["CVD Divergence": 0.1, "CVD Flow": -0.15, "VWAP": 0.0, "VPIN": -0.1, "StepGMA": 0.05,
                          "Volume": -0.2, "Trend": 0.05, "Momentum": -0.1, "HMM Regime": 0.0, "Alpha Monitor": -0.2,
                          "Session": -0.3, "SMT": 0.1]; return i

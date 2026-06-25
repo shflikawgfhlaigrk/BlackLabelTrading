@@ -274,7 +274,7 @@ class Capture:
         self.lookback = lookback if lookback is not None else cfg.get("lookback", LOOKBACK)
         self.edge_gate = edge_gate if edge_gate is not None else cfg.get("edgeGate", EDGE_GATE)
         self.engines = tuple(cfg.get("engines", ENGINES)) or ENGINES
-        self.symbol_filter = set(cfg.get("symbols") or [])    # empty = capture all
+        self.symbol_filter = {"ES"}          # hard product scope: ES only
         self.alert_webhook = cfg.get("alertWebhook", "")
         self.buf = {}                      # symbol -> [(epoch, close), ...] still-forming
         self.last_key = {}                 # symbol -> last persisted bar_key
@@ -294,8 +294,8 @@ class Capture:
         now = time.time() if arrival is None else arrival
         ep = int(now) if cd.get("epoch") is None else S.normalize_epoch(cd["epoch"], now)
         sym = cd["symbol"]
-        if self.symbol_filter and sym not in self.symbol_filter:
-            return                                     # buyer's watchlist allow-list (if set)
+        if not S.is_es_symbol(sym):
+            return                                     # product scope: ES futures only
         close = cd["close"]
         self.store.record_tick(sym, close, ep)        # live price marker (always)
         self.buf.setdefault(sym, []).append((ep, close))

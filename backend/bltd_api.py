@@ -26,6 +26,9 @@ Endpoints (Bearer token from /auth/signin required on /api/*):
   GET  /api/fires?limit=&symbol=&engine=  -> {fires:[{...}]}   (the signal journal)
   GET  /api/journal?symbol=&engine=       -> {graded, winRate, netPnl, byEngine}
 
+Trading engine scope is intentionally ES-only. Endpoints that drive live bars, ticks, screen rows,
+fires, and engine backtests reject/filter non-ES symbols even if an old local store contains them.
+
 Run:  python3 bltd_api.py 8787
 """
 from __future__ import annotations
@@ -178,15 +181,22 @@ class H(BaseHTTPRequestHandler):
             if u.path == "/api/capture":
                 return self._send(200, _capture_status())
             if u.path == "/api/studies":
-                ohlc = STORE.ohlc(g("symbol"), int(g("limit", "300")))
-                return self._send(200, {"symbol": g("symbol"), "studies": bltd_analytics.studies(ohlc, STORE.config())})
+                sym = g("symbol")
+                ohlc = STORE.ohlc(sym, int(g("limit", "300")))
+                return self._send(200, {"symbol": sym, "studies": bltd_analytics.studies(ohlc, STORE.config())})
             if u.path == "/api/backtest":
                 engine = g("engine", "meanrev")
-                ohlc = STORE.ohlc(g("symbol"))
+                sym = g("symbol")
+                if not bltd_store.is_es_symbol(sym):
+                    return self._send(200, {"ok": False, "engine": engine,
+                                            "reason": f"unsupported symbol '{sym}' — engines are ES-only",
+                                            "stats": bltd_analytics._stats([]), "curve": [], "enoughBars": False})
+                ohlc = STORE.ohlc(sym)
                 return self._send(200, bltd_analytics.full_backtest(engine, ohlc, STORE.config()))
             if u.path == "/api/screen":
                 cfg = STORE.config()
-                syms = [s for s in g("symbols").split(",") if s] or STORE.symbols().get("backtestable", [])
+                requested_syms = [s for s in g("symbols").split(",") if s]
+                syms = bltd_store.es_symbols(requested_syms) if requested_syms else STORE.symbols().get("backtestable", [])
                 engs = [e for e in g("engines").split(",") if e] or cfg.get("engines", [])
                 return self._send(200, {"rows": bltd_analytics.screen(STORE, syms, engs, cfg)})
             if u.path == "/api/fires":

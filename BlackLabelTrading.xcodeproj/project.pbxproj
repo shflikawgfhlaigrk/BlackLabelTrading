@@ -22,6 +22,7 @@
 		90707A44A07E7B9AFDB19C9A /* WatchlistModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7CF7A460CCFFAE3CB33459EB /* WatchlistModel.swift */; };
 		990B5D35F132390ABD3D239E /* ChartRender.swift in Sources */ = {isa = PBXBuildFile; fileRef = 827AF4899FFC1715688443FC /* ChartRender.swift */; };
 		994EAB02CA9EBD40DCB91BCB /* Charting.swift in Sources */ = {isa = PBXBuildFile; fileRef = 46AAF0E56B1CCCACF1020C9D /* Charting.swift */; };
+		C0D3A11E0000000000000002 /* LiveChart.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D3A11E0000000000000001 /* LiveChart.swift */; };
 		99C1D0E083569E20A2795B08 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 5FBF9178ADF66A2A2A0BCCD6 /* Assets.xcassets */; };
 		A8CB129546FCF3F06250A9E2 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = E11C506535021004EA73DFCF /* PrivacyInfo.xcprivacy */; };
 		ADDA9FA65998E23C0E6C9679 /* FeedTypes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2331344C8E29E9A66C4E38BE /* FeedTypes.swift */; };
@@ -71,6 +72,7 @@
 		E15B1B8D78A6C53363EB2F28 /* Auth.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Auth.swift; sourceTree = "<group>"; };
 		F02460415B3ABA838EAC8E45 /* Model.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Model.swift; sourceTree = "<group>"; };
 		FCAB20BE28B9A7AD4C47ED8C /* StrategyBuilder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StrategyBuilder.swift; sourceTree = "<group>"; };
+		C0D3A11E0000000000000001 /* LiveChart.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveChart.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXGroup section */
@@ -111,6 +113,7 @@
 				B72865605B27F1EFFCCC954F /* HoloTheme.swift */,
 				B385E78DF0DFBBE2B4088F2C /* Info.plist */,
 				7D2D31F2F75B736703304B55 /* JournalImport.swift */,
+				C0D3A11E0000000000000001 /* LiveChart.swift */,
 				96F6578A4722D5D85DD68C4F /* main.swift */,
 				F02460415B3ABA838EAC8E45 /* Model.swift */,
 				1C4F8D00BD91FC0CBA27FE00 /* PaperTrade.swift */,
@@ -214,6 +217,7 @@
 				EBF30CE6E21CC174E5A2AD07 /* HoloTheme.swift in Sources */,
 				E8D23A7EB063EA80C28BD83B /* Holographic.swift in Sources */,
 				D6CBC04439A2E01ECF5AE0C5 /* JournalImport.swift in Sources */,
+				C0D3A11E0000000000000002 /* LiveChart.swift in Sources */,
 				18FD43254FF7C98367BD4297 /* Model.swift in Sources */,
 				033F9B5D335A39C5261BAECB /* PaperTrade.swift in Sources */,
 				D07AC20EEDF81A57B6FBF4B7 /* Patterns.swift in Sources */,

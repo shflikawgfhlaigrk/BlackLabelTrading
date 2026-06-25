@@ -3,7 +3,8 @@
 // HONEST FRAMING: this talks ONLY to the product's OWN self-contained backend (bltd_api.py,
 // default http://127.0.0.1:8787). That backend serves ONLY what the buyer's own WealthCharts
 // session captured into the buyer's own local store. NOTHING is fetched from Black Label / Utah /
-// any third party here. When the backend is down, or the buyer's WC session is logged out, the
+// any third party here. The engine/feed surface is ES-only; non-ES symbols are ignored even if
+// stale rows exist in the local store. When the backend is down, or the buyer's WC session is logged out, the
 // client reports an honest FeedState (.offline / .loggedOut / .idle) and shows NO bars — it never
 // fabricates prices. Signals-only: this client reads bars/ticks/fires; it can NEVER place a
 // trade or move money.

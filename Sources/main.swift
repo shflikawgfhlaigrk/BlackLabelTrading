@@ -227,7 +227,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.titlebarAppearsTransparent = true
         window.backgroundColor = NSColor(BLTheme.bg)
         window.contentView = NSHostingView(rootView: RootView())
-        window.center(); window.makeKeyAndOrderFront(nil)
+        // Open LARGE and reliably ON-SCREEN: set the frame to the screen's visibleFrame (fills the
+        // usable screen like a real trading terminal). Using visibleFrame directly avoids the
+        // off-bottom positioning the centered-92% math produced on the built-in display.
+        if let vis = NSScreen.main?.visibleFrame {
+            window.setFrame(vis, display: true)
+        }
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
         NSApp.setActivationPolicy(.regular); NSApp.activate(ignoringOtherApps: true)
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ s: NSApplication) -> Bool { true }

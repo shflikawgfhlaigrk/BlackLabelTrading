@@ -64,16 +64,21 @@ struct RenderIndicators {
     var sma: Int? = nil
     var vwapWindow: Int? = nil    // session/rolling VWAP
     var rsiPeriod: Int? = nil     // draws an RSI sub-pane when set
+    var macd = false              // draws a MACD(12,26,9) sub-pane when true
+    var atrPeriod: Int? = nil     // draws an ATR sub-pane when set
     var bollinger: (period: Int, k: Double)? = nil
     var crosshairIndex: Int? = nil  // candle index to draw the crosshair + OHLC readout at
     var lastPriceLine: Double? = nil
     var fire: RenderFire? = nil   // active engine signal: entry/stop/target overlay (edge-gate transparency)
+    var fires: [RenderFire] = []  // one entry line per engine (live multi-engine overlay)
     var logScale = false
 }
 
 enum ChartRender {
 
-    // MARK: Public entry — render `bars` to a PNG at `path`. Returns true on success.
+    // MARK: Public entry — render `bars` to a PNG at `path`. Returns true on success. The PNG path
+    // is the full-window default; the SAME drawChart core drives the live interactive NSView with a
+    // visible sub-window, so what Michael inspects in the proof is exactly what the app draws.
     static func renderPNG(
         bars: [Bar],
         symbol: String,
@@ -86,60 +91,96 @@ enum ChartRender {
     ) -> Bool {
         guard let ctx = makeContext(size: size, scale: scale) else { return false }
         ctx.scaleBy(x: scale, y: scale)
-        draw(ctx: ctx, size: size, bars: bars, symbol: symbol, title: title,
-             indicators: indicators, showVolume: showVolume)
+        drawChart(ctx: ctx, size: size, candles: CandleTransform.candles(bars), symbol: symbol, title: title,
+                  indicators: indicators, showVolume: showVolume, header: true)
         guard let img = ctx.makeImage() else { return false }
         return writePNG(img, to: path)
     }
 
-    // MARK: - Layout + draw
-    private static func draw(ctx: CGContext, size: CGSize, bars: [Bar], symbol: String, title: String,
-                             indicators ind: RenderIndicators, showVolume: Bool) {
+    // MARK: - Pane layout (shared by the renderer AND the live NSView's interaction math, so the
+    // hit-testing in the view agrees pixel-for-pixel with what's drawn).
+    struct ChartLayout {
+        var price: CGRect = .zero
+        var rsi: CGRect = .zero
+        var macd: CGRect = .zero
+        var atr: CGRect = .zero
+        var vol: CGRect = .zero
+        var bottomAxis: CGFloat = 26
+        var marginR: CGFloat = 78
+    }
+    static func layout(size: CGSize, indicators ind: RenderIndicators, showVolume: Bool,
+                       hasVolume: Bool, header: Bool) -> ChartLayout {
+        let W = size.width, H = size.height
+        let headerH: CGFloat = header ? 64 : 6
+        let marginL: CGFloat = 22, marginR: CGFloat = 78, gap: CGFloat = 8
+        let bottomAxis: CGFloat = 26
+        let contentTop = H - headerH - 10
+        let contentBottom = bottomAxis + 10
+        let contentH = max(60, contentTop - contentBottom)
+        // Lower panes stack under the price pane, top→bottom: RSI, MACD, ATR, Volume.
+        var lower: [(String, CGFloat)] = []
+        if ind.rsiPeriod != nil  { lower.append(("rsi",  contentH * 0.16)) }
+        if ind.macd              { lower.append(("macd", contentH * 0.16)) }
+        if ind.atrPeriod != nil  { lower.append(("atr",  contentH * 0.13)) }
+        if showVolume && hasVolume { lower.append(("vol", contentH * 0.12)) }
+        let lowerTotal = lower.reduce(CGFloat(0)) { $0 + $1.1 } + CGFloat(lower.count) * gap
+        let priceH = max(contentH * 0.42, contentH - lowerTotal)
+        let plotL = marginL, plotW = W - marginL - marginR
+        var L = ChartLayout(bottomAxis: bottomAxis, marginR: marginR)
+        L.price = CGRect(x: plotL, y: contentTop - priceH, width: plotW, height: priceH)
+        var y = L.price.minY - gap
+        for (key, h) in lower {
+            let r = CGRect(x: plotL, y: y - h, width: plotW, height: h)
+            switch key { case "rsi": L.rsi = r; case "macd": L.macd = r; case "atr": L.atr = r; default: L.vol = r }
+            y = r.minY - gap
+        }
+        return L
+    }
+
+    // MARK: - Windowed multi-pane draw. Draws candles[winStart ..< winStart+winCount] (fractional
+    // offsets allowed for buttery zoom/pan) into `ctx`. winCount <= 0 means "show everything"
+    // (the PNG default). Y auto-fits the VISIBLE window (TradingView behavior). HONEST: only the
+    // candles handed in are drawn — nothing sampled or invented; empty -> an honest "no data" frame.
+    static func drawChart(ctx: CGContext, size: CGSize, candles: [Candle], symbol: String, title: String,
+                          indicators ind: RenderIndicators, showVolume: Bool, lineMode: Bool = false,
+                          winStart: Double = 0, winCount: Double = -1, drawings: [Drawing] = [],
+                          header: Bool = true) {
         let W = size.width, H = size.height
         // Background — vertical premium wash (lighter top → near-black bottom) for depth.
         ctx.setFillColor(RenderPalette.bg); ctx.fill(CGRect(x: 0, y: 0, width: W, height: H))
         fillVGradient(ctx, CGRect(x: 0, y: 0, width: W, height: H),
                       top: RenderPalette.bgTop, bottom: RenderPalette.bgBot)
 
-        // Header band.
-        let headerH: CGFloat = 64
-        drawHeader(ctx: ctx, rect: CGRect(x: 0, y: H - headerH, width: W, height: headerH),
-                   symbol: symbol, title: title, bars: bars)
-
-        guard !bars.isEmpty else {
+        if header {
+            let headerH: CGFloat = 64
+            drawHeader(ctx: ctx, rect: CGRect(x: 0, y: H - headerH, width: W, height: headerH),
+                       symbol: symbol, title: title, candles: candles)
+        }
+        guard !candles.isEmpty else {
             drawCentered(ctx, "No bars — load your own captured / imported OHLC to chart.",
                          at: CGPoint(x: W/2, y: H/2), size: 15, color: RenderPalette.sub, align: .center)
             return
         }
 
-        // Panes: price (top), optional RSI, optional volume (bottom).
-        let marginL: CGFloat = 22, marginR: CGFloat = 78, gap: CGFloat = 10
-        let bottomAxis: CGFloat = 26
-        let contentTop = H - headerH - 12
-        let contentBottom = bottomAxis + 12
-        let contentH = contentTop - contentBottom
+        let total = candles.count
+        let wCount = winCount <= 0 ? Double(total) : min(Double(total), max(4, winCount))
+        let wStart = min(max(0, winStart), Double(total) - wCount)
+        let hasVolume = candles.contains { $0.volume > 0 }
+        let L = layout(size: size, indicators: ind, showVolume: showVolume, hasVolume: hasVolume, header: header)
+        let priceRect = L.price, marginR = L.marginR, bottomAxis = L.bottomAxis
+        let plotW = priceRect.width
 
-        var rsiH: CGFloat = 0, volH: CGFloat = 0
-        if ind.rsiPeriod != nil { rsiH = contentH * 0.20 }
-        if showVolume && bars.contains(where: { $0.volume > 0 }) { volH = contentH * 0.16 }
-        let priceH = contentH - rsiH - volH - (rsiH > 0 ? gap : 0) - (volH > 0 ? gap : 0)
+        // x mapping: candle index -> pixel center over the visible window (fractional).
+        let slot = plotW / CGFloat(wCount)
+        func xCenter(_ i: Int) -> CGFloat { priceRect.minX + (CGFloat(Double(i) - wStart) + 0.5) * slot }
+        func xAtIndex(_ x: Double) -> CGFloat { priceRect.minX + (CGFloat(x - wStart) + 0.5) * slot }
 
-        let plotL = marginL, plotW = W - marginL - marginR
-        let priceRect = CGRect(x: plotL, y: contentBottom + volH + (volH>0 ? gap:0) + rsiH + (rsiH>0 ? gap:0),
-                               width: plotW, height: priceH)
-        let rsiRect = rsiH > 0 ? CGRect(x: plotL, y: contentBottom + volH + (volH>0 ? gap:0),
-                                        width: plotW, height: rsiH) : .zero
-        let volRect = volH > 0 ? CGRect(x: plotL, y: contentBottom, width: plotW, height: volH) : .zero
-
-        let candles = CandleTransform.candles(bars)
-        let n = candles.count
-        // Robust domain so one session-gap candle can't squash the rest of the chart.
-        let dom = ChartScale.robustDomain(candles)
+        // Visible slice (+1 each edge so partial candles draw); Y auto-fits the visible window.
+        let loI = max(0, Int(floor(wStart)) - 1)
+        let hiI = min(total - 1, Int(ceil(wStart + wCount)) + 1)
+        let visible = (loI <= hiI) ? Array(candles[loI...hiI]) : candles
+        let dom = ChartScale.robustDomain(visible)
         let useLog = ind.logScale && dom.lo > 0
-
-        // x mapping: candle index -> pixel center.
-        let slot = plotW / CGFloat(max(1, n))
-        func xCenter(_ i: Int) -> CGFloat { priceRect.minX + (CGFloat(i) + 0.5) * slot }
         func yPrice(_ p: Double, _ r: CGRect) -> CGFloat {
             CGFloat(ChartScale.yPixel(p, lo: dom.lo, hi: dom.hi,
                                       topY: Double(r.maxY), bottomY: Double(r.minY), log: useLog))
@@ -147,7 +188,6 @@ enum ChartRender {
 
         // ---- Price pane: panel, gridlines, right-aligned price ladder ----
         drawPanel(ctx, priceRect)
-        // Dedicated ladder gutter plate so prices sit on a subtle column, not on candles.
         ctx.setFillColor(RenderPalette.panel)
         ctx.fill(CGRect(x: priceRect.maxX, y: priceRect.minY, width: marginR, height: priceRect.height))
         strokeLine(ctx, CGPoint(x: priceRect.maxX, y: priceRect.minY),
@@ -155,23 +195,26 @@ enum ChartRender {
         let ticks = ChartScale.ticks(lo: dom.lo, hi: dom.hi, target: 6)
         let step = ticks.count > 1 ? (ticks[1] - ticks[0]) : (dom.hi - dom.lo)
         let decimals = ChartScale.priceDecimals(step: step)
-        let lastClose = candles.last?.close
+        let lastClose = visible.last?.close
         for t in ticks {
             let y = yPrice(t, priceRect)
             guard y >= priceRect.minY - 0.5 && y <= priceRect.maxY + 0.5 else { continue }
             strokeLine(ctx, CGPoint(x: priceRect.minX, y: y), CGPoint(x: priceRect.maxX, y: y),
                        color: RenderPalette.gridMinor, width: 0.5)
-            // Suppress the tick nearest the last price — the last-price tag replaces it.
             if let lc = lastClose, abs(yPrice(lc, priceRect) - y) < 9 { continue }
             let s = fmt(t, decimals)
             let tw = textWidth(s, size: 10, bold: false)
             drawText(ctx, s, at: CGPoint(x: W - 10 - tw, y: y - 4), size: 10, color: RenderPalette.sub)
         }
-        // Time-aware x-axis: round-clock labels + dotted session separators (not index stride).
-        drawTimeAxis(ctx, candles: candles, rect: priceRect, bottomY: bottomAxis, slot: slot, xCenter: xCenter)
+        // Time-aware x-axis over the VISIBLE candles (round-clock labels + session separators).
+        let lowerRects = [L.rsi, L.macd, L.atr, L.vol].filter { $0 != .zero }
+        drawWindowedTimeAxis(ctx, visible: visible, priceRect: priceRect, panes: lowerRects,
+                             bottomY: bottomAxis, slot: slot, xCenter: xCenter)
 
-        // ---- Indicator overlays (under candles for VWAP/BB band, over for MAs reads fine) ----
+        // ---- Indicator overlays computed on the FULL series, drawn through the windowed xCenter
+        // (drawSeries clips to the pane, so off-window points fall away cleanly). ----
         let closes = candles.map(\.close)
+        let vbars = candles.map { Bar(date: $0.date, open: $0.open, high: $0.high, low: $0.low, close: $0.close, volume: $0.volume) }
         if let bb = ind.bollinger {
             let b = ChartIndicators.bollinger(closes, period: bb.period, k: bb.k)
             drawSeries(ctx, b.upper, rect: priceRect, xCenter: xCenter, y: { yPrice($0, priceRect) }, color: RenderPalette.alpha(RenderPalette.blue, 0.55), width: 1.1, dash: [4,3])
@@ -179,46 +222,58 @@ enum ChartRender {
             drawSeries(ctx, b.mid,   rect: priceRect, xCenter: xCenter, y: { yPrice($0, priceRect) }, color: RenderPalette.alpha(RenderPalette.blue, 0.30), width: 0.9, dash: [2,3])
         }
 
-        // ---- Candles ----
-        let bodyW = max(2, min(slot * 0.72, slot - 2.0, 26))   // clamp gap + cap fat blocks
-        let wickW = max(1.0, (slot * 0.14).rounded())
+        // ---- Candles (or line) — clipped to the price pane so partial edge candles don't bleed. ----
+        let bodyW = max(1.5, min(slot * 0.72, slot - 1.4, 26))
+        let wickW = max(1.0, min(slot * 0.16, 3))
         let radius = min(1.5, bodyW * 0.18)
-        let lastIdx = n - 1
-        for c in candles {
-            let x = xCenter(c.index).rounded() + 0.5             // pixel-snap for crisp wicks
-            let col = c.up ? RenderPalette.green : RenderPalette.red
-            let isCurrent = c.index == lastIdx
-            // Wick — slightly darker than the body so the body reads as the focal mass.
-            strokeLine(ctx, CGPoint(x: x, y: yPrice(c.high, priceRect)), CGPoint(x: x, y: yPrice(c.low, priceRect)),
-                       color: RenderPalette.shade(col, 0.8), width: wickW)
-            // Body — rounded, with a crisp brighter border; doji forced to a visible 1.5px bar.
-            let yo = yPrice(c.open, priceRect), yc = yPrice(c.close, priceRect)
-            let top = min(yo, yc), bot = max(yo, yc)
-            let bodyH = max(1.5, bot - top)
-            let bodyRect = CGRect(x: (x - bodyW/2).rounded(), y: top, width: bodyW, height: bodyH)
-            let path = CGPath(roundedRect: bodyRect, cornerWidth: radius, cornerHeight: radius, transform: nil)
-            ctx.setFillColor(RenderPalette.alpha(col, isCurrent ? 1.0 : 0.92))
-            ctx.addPath(path); ctx.fillPath()
-            ctx.addPath(path)
-            ctx.setStrokeColor(RenderPalette.alpha(RenderPalette.shade(col, 1.15), 0.9)); ctx.setLineWidth(0.75); ctx.strokePath()
-            if isCurrent {
-                // live-bar emphasis: gold halo border + close anchor dot.
-                ctx.addPath(CGPath(roundedRect: bodyRect.insetBy(dx: -1.5, dy: -1.5), cornerWidth: radius, cornerHeight: radius, transform: nil))
-                ctx.setStrokeColor(RenderPalette.alpha(RenderPalette.goldHi, 0.6)); ctx.setLineWidth(1); ctx.strokePath()
-                ctx.setFillColor(col); ctx.fillEllipse(in: CGRect(x: x - 2.5, y: yc - 2.5, width: 5, height: 5))
+        let lastIdx = total - 1
+        ctx.saveGState(); ctx.clip(to: priceRect)
+        if lineMode {
+            ctx.setStrokeColor(RenderPalette.gold); ctx.setLineWidth(1.8); ctx.setLineJoin(.round); ctx.setLineCap(.round)
+            var started = false
+            for c in visible { let p = CGPoint(x: xCenter(c.index), y: yPrice(c.close, priceRect))
+                if started { ctx.addLine(to: p) } else { ctx.move(to: p); started = true } }
+            ctx.strokePath()
+        } else {
+            for c in visible {
+                let x = xCenter(c.index).rounded() + 0.5
+                let col = c.up ? RenderPalette.green : RenderPalette.red
+                let isCurrent = c.index == lastIdx
+                strokeLine(ctx, CGPoint(x: x, y: yPrice(c.high, priceRect)), CGPoint(x: x, y: yPrice(c.low, priceRect)),
+                           color: RenderPalette.shade(col, 0.8), width: wickW)
+                let yo = yPrice(c.open, priceRect), yc = yPrice(c.close, priceRect)
+                let top = min(yo, yc), bot = max(yo, yc)
+                let bodyH = max(1.5, bot - top)
+                let bodyRect = CGRect(x: (x - bodyW/2).rounded(), y: top, width: bodyW, height: bodyH)
+                let path = CGPath(roundedRect: bodyRect, cornerWidth: radius, cornerHeight: radius, transform: nil)
+                ctx.setFillColor(RenderPalette.alpha(col, isCurrent ? 1.0 : 0.92))
+                ctx.addPath(path); ctx.fillPath()
+                ctx.addPath(path)
+                ctx.setStrokeColor(RenderPalette.alpha(RenderPalette.shade(col, 1.15), 0.9)); ctx.setLineWidth(0.75); ctx.strokePath()
+                if isCurrent {
+                    ctx.addPath(CGPath(roundedRect: bodyRect.insetBy(dx: -1.5, dy: -1.5), cornerWidth: radius, cornerHeight: radius, transform: nil))
+                    ctx.setStrokeColor(RenderPalette.alpha(RenderPalette.goldHi, 0.6)); ctx.setLineWidth(1); ctx.strokePath()
+                    ctx.setFillColor(col); ctx.fillEllipse(in: CGRect(x: x - 2.5, y: yc - 2.5, width: 5, height: 5))
+                }
             }
         }
+        ctx.restoreGState()
 
         // Moving averages / VWAP (drawn over candles).
         if let p = ind.sma { drawSeries(ctx, Indicators.sma(closes, p), rect: priceRect, xCenter: xCenter, y: { yPrice($0, priceRect) }, color: RenderPalette.gold, width: 1.8) }
         if let p = ind.ema1 { drawSeries(ctx, Indicators.ema(closes, p), rect: priceRect, xCenter: xCenter, y: { yPrice($0, priceRect) }, color: RenderPalette.goldHi, width: 1.8) }
         if let p = ind.ema2 { drawSeries(ctx, Indicators.ema(closes, p), rect: priceRect, xCenter: xCenter, y: { yPrice($0, priceRect) }, color: RenderPalette.blue, width: 1.8) }
-        if let w = ind.vwapWindow { drawSeries(ctx, ChartIndicators.vwap(bars, window: w), rect: priceRect, xCenter: xCenter, y: { yPrice($0, priceRect) }, color: RenderPalette.green, width: 1.8, dash: [6,3]) }
+        if let w = ind.vwapWindow { drawSeries(ctx, ChartIndicators.vwap(vbars, window: w), rect: priceRect, xCenter: xCenter, y: { yPrice($0, priceRect) }, color: RenderPalette.green, width: 1.8, dash: [6,3]) }
 
-        // Last-price line + flag (real value only — never fabricated). Colored by last tick dir.
+        // ---- User drawings (trendline / level / zone / fib) mapped through the window. ----
+        if !drawings.isEmpty {
+            drawDrawings(ctx, drawings, rect: priceRect, xAtIndex: xAtIndex, yPrice: { yPrice($0, priceRect) })
+        }
+
+        // Last-price line + flag (real value only — never fabricated).
         if let lp = ind.lastPriceLine {
             let y = yPrice(lp, priceRect)
-            let prevClose = candles.count >= 2 ? candles[candles.count - 2].close : lp
+            let prevClose = visible.count >= 2 ? visible[visible.count - 2].close : lp
             let tagCol = lp >= prevClose ? RenderPalette.green : RenderPalette.red
             strokeLine(ctx, CGPoint(x: priceRect.minX, y: y), CGPoint(x: priceRect.maxX, y: y),
                        color: RenderPalette.alpha(tagCol, 0.85), width: 1, dash: [3,3])
@@ -230,77 +285,147 @@ enum ChartRender {
             ctx.addPath(CGPath(roundedRect: tagRect, cornerWidth: 3, cornerHeight: 3, transform: nil)); ctx.fillPath()
             drawText(ctx, lbl, at: CGPoint(x: tagRect.minX + 6, y: tagRect.midY - 4), size: 10.5,
                      color: CGColor(red: 0.05, green: 0.05, blue: 0.05, alpha: 1), bold: true)
-            // static "pulse" glow at the line's right end.
             for (r, a) in [(CGFloat(4), CGFloat(0.5)), (CGFloat(7), CGFloat(0.18))] {
                 ctx.setStrokeColor(RenderPalette.alpha(tagCol, a)); ctx.setLineWidth(1)
                 ctx.strokeEllipse(in: CGRect(x: priceRect.maxX - r, y: y - r, width: r*2, height: r*2))
             }
         }
 
-        // ---- Engine trade overlay: entry / stop / target (edge-gate transparency) ----
-        // Drawn ONLY from a real recorded fire; nil legs are skipped, never fabricated. This is the
-        // headless twin of the live SwiftUI ChartScreen.activeFire overlay so the proof matches the app.
-        if let f = ind.fire {
-            drawFire(ctx, f, rect: priceRect, decimals: decimals, yPrice: { yPrice($0, priceRect) })
-        }
+        // ---- Engine trade overlay(s): entry / stop / target (edge-gate transparency). Real fires only. ----
+        for f in ind.fires { drawFire(ctx, f, rect: priceRect, decimals: decimals, yPrice: { yPrice($0, priceRect) }) }
+        if let f = ind.fire { drawFire(ctx, f, rect: priceRect, decimals: decimals, yPrice: { yPrice($0, priceRect) }) }
 
         // ---- Crosshair + OHLC readout ----
-        if let ci = ind.crosshairIndex, ci >= 0, ci < n {
+        if let ci = ind.crosshairIndex, ci >= 0, ci < total {
             let c = candles[ci]
             let x = xCenter(ci)
-            strokeLine(ctx, CGPoint(x: x, y: priceRect.minY), CGPoint(x: x, y: priceRect.maxY),
-                       color: RenderPalette.alpha(RenderPalette.gold, 0.45), width: 1, dash: [2,2])
-            let cy = yPrice(c.close, priceRect)
-            strokeLine(ctx, CGPoint(x: priceRect.minX, y: cy), CGPoint(x: priceRect.maxX, y: cy),
-                       color: RenderPalette.alpha(RenderPalette.gold, 0.30), width: 1, dash: [2,2])
-            // OHLC readout chip top-left of price pane.
-            drawOHLCReadout(ctx, c: c, decimals: decimals, at: CGPoint(x: priceRect.minX + 8, y: priceRect.maxY - 22))
+            if x >= priceRect.minX && x <= priceRect.maxX {
+                strokeLine(ctx, CGPoint(x: x, y: priceRect.minY), CGPoint(x: x, y: priceRect.maxY),
+                           color: RenderPalette.alpha(RenderPalette.gold, 0.45), width: 1, dash: [2,2])
+                let cy = yPrice(c.close, priceRect)
+                strokeLine(ctx, CGPoint(x: priceRect.minX, y: cy), CGPoint(x: priceRect.maxX, y: cy),
+                           color: RenderPalette.alpha(RenderPalette.gold, 0.30), width: 1, dash: [2,2])
+                // crosshair price tag in the gutter
+                let lbl = fmt(c.close, decimals)
+                let tagW = textWidth(lbl, size: 9.5, bold: true) + 10, tagH: CGFloat = 15
+                let tagRect = CGRect(x: priceRect.maxX + 3, y: cy - tagH/2, width: tagW, height: tagH)
+                ctx.setFillColor(RenderPalette.gold)
+                ctx.addPath(CGPath(roundedRect: tagRect, cornerWidth: 3, cornerHeight: 3, transform: nil)); ctx.fillPath()
+                drawText(ctx, lbl, at: CGPoint(x: tagRect.minX + 5, y: tagRect.midY - 4), size: 9.5,
+                         color: CGColor(red: 0.05, green: 0.05, blue: 0.05, alpha: 1), bold: true)
+                drawOHLCReadout(ctx, c: c, decimals: decimals, at: CGPoint(x: priceRect.minX + 8, y: priceRect.maxY - 22))
+            }
         }
 
         // ---- RSI sub-pane ----
-        if let rp = ind.rsiPeriod, rsiH > 0 {
-            drawPanel(ctx, rsiRect)
+        if let rp = ind.rsiPeriod, L.rsi != .zero {
+            drawPanel(ctx, L.rsi)
             let rsi = Indicators.rsi(closes, rp)
-            func yR(_ v: Double) -> CGFloat { rsiRect.minY + CGFloat(v/100) * rsiRect.height }
+            func yR(_ v: Double) -> CGFloat { L.rsi.minY + CGFloat(v/100) * L.rsi.height }
             for lvl in [30.0, 50, 70] {
                 let y = yR(lvl)
-                strokeLine(ctx, CGPoint(x: rsiRect.minX, y: y), CGPoint(x: rsiRect.maxX, y: y),
+                strokeLine(ctx, CGPoint(x: L.rsi.minX, y: y), CGPoint(x: L.rsi.maxX, y: y),
                            color: RenderPalette.alpha(lvl==50 ? RenderPalette.sub : (lvl<50 ? RenderPalette.green : RenderPalette.red), 0.30), width: 0.8, dash: [3,3])
-                drawText(ctx, String(Int(lvl)), at: CGPoint(x: rsiRect.maxX + 6, y: y - 5), size: 9, color: RenderPalette.sub)
+                drawText(ctx, String(Int(lvl)), at: CGPoint(x: L.rsi.maxX + 6, y: y - 5), size: 9, color: RenderPalette.sub)
             }
-            drawSeries(ctx, rsi, rect: rsiRect, xCenter: xCenter, y: yR, color: RenderPalette.blue, width: 1.6)
-            drawText(ctx, "RSI \(rp)", at: CGPoint(x: rsiRect.minX + 8, y: rsiRect.maxY - 16), size: 10, color: RenderPalette.sub, bold: true)
+            drawSeries(ctx, rsi, rect: L.rsi, xCenter: xCenter, y: yR, color: RenderPalette.blue, width: 1.6)
+            drawText(ctx, "RSI \(rp)", at: CGPoint(x: L.rsi.minX + 8, y: L.rsi.maxY - 16), size: 10, color: RenderPalette.sub, bold: true)
+        }
+
+        // ---- MACD sub-pane (12,26,9): histogram + macd/signal lines. ----
+        if ind.macd, L.macd != .zero {
+            drawPanel(ctx, L.macd)
+            let m = ChartIndicators.macd(closes)
+            let vals = (m.macd + m.signal + m.histogram).compactMap { $0 }
+            let lim = max(vals.map { abs($0) }.max() ?? 1, 1e-9)
+            func yM(_ v: Double) -> CGFloat { L.macd.midY + CGFloat(v/lim) * (L.macd.height/2 - 3) }
+            strokeLine(ctx, CGPoint(x: L.macd.minX, y: L.macd.midY), CGPoint(x: L.macd.maxX, y: L.macd.midY),
+                       color: RenderPalette.alpha(RenderPalette.sub, 0.3), width: 0.6)
+            ctx.saveGState(); ctx.clip(to: L.macd)
+            for (i, v) in m.histogram.enumerated() {
+                guard let v = v else { continue }
+                let x = xCenter(i); guard x >= L.macd.minX - slot && x <= L.macd.maxX + slot else { continue }
+                let y0 = L.macd.midY, y1 = yM(v)
+                ctx.setFillColor(RenderPalette.alpha(v >= 0 ? RenderPalette.green : RenderPalette.red, 0.55))
+                ctx.fill(CGRect(x: x - bodyW/2, y: min(y0,y1), width: max(1, bodyW), height: abs(y1-y0)))
+            }
+            ctx.restoreGState()
+            drawSeries(ctx, m.macd, rect: L.macd, xCenter: xCenter, y: yM, color: RenderPalette.gold, width: 1.4)
+            drawSeries(ctx, m.signal, rect: L.macd, xCenter: xCenter, y: yM, color: RenderPalette.blue, width: 1.4)
+            drawText(ctx, "MACD 12,26,9", at: CGPoint(x: L.macd.minX + 8, y: L.macd.maxY - 16), size: 10, color: RenderPalette.sub, bold: true)
+        }
+
+        // ---- ATR sub-pane ----
+        if let ap = ind.atrPeriod, L.atr != .zero {
+            drawPanel(ctx, L.atr)
+            let atr = Indicators.atr(vbars, ap)
+            let lim = max(atr.compactMap { $0 }.max() ?? 1, 1e-9)
+            func yA(_ v: Double) -> CGFloat { L.atr.minY + CGFloat(v/lim) * (L.atr.height - 4) }
+            drawSeries(ctx, atr, rect: L.atr, xCenter: xCenter, y: yA, color: RenderPalette.red, width: 1.5)
+            drawText(ctx, "ATR \(ap)", at: CGPoint(x: L.atr.minX + 8, y: L.atr.maxY - 16), size: 10, color: RenderPalette.sub, bold: true)
         }
 
         // ---- Volume sub-pane (real volume only) ----
-        if volH > 0 {
-            drawPanel(ctx, volRect)
-            let maxV = candles.map(\.volume).max() ?? 1
-            for c in candles where c.volume > 0 {
+        if L.vol != .zero {
+            drawPanel(ctx, L.vol)
+            let maxV = visible.map(\.volume).max() ?? 1
+            ctx.saveGState(); ctx.clip(to: L.vol)
+            for c in visible where c.volume > 0 {
                 let x = xCenter(c.index).rounded()
-                let h = CGFloat(c.volume / max(maxV, 1)) * (volRect.height - 4)
+                let h = CGFloat(c.volume / max(maxV, 1)) * (L.vol.height - 4)
                 let isCur = c.index == lastIdx
                 ctx.setFillColor(RenderPalette.alpha(c.up ? RenderPalette.green : RenderPalette.red, isCur ? 0.55 : 0.30))
-                ctx.fill(CGRect(x: (x - bodyW/2).rounded(), y: volRect.minY, width: bodyW, height: max(1, h)))
+                ctx.fill(CGRect(x: (x - bodyW/2).rounded(), y: L.vol.minY, width: bodyW, height: max(1, h)))
             }
-            drawText(ctx, "VOL", at: CGPoint(x: volRect.minX + 8, y: volRect.maxY - 16), size: 10, color: RenderPalette.sub, bold: true)
+            ctx.restoreGState()
+            drawText(ctx, "VOL", at: CGPoint(x: L.vol.minX + 8, y: L.vol.maxY - 16), size: 10, color: RenderPalette.sub, bold: true)
         }
 
         // Legend chips (which overlays are on).
         drawLegend(ctx, ind: ind, at: CGPoint(x: priceRect.minX + 8, y: priceRect.minY + 8))
     }
 
+    // User annotations mapped through the window: x stored as (fractional) bar index, y as price.
+    private static func drawDrawings(_ ctx: CGContext, _ drawings: [Drawing], rect: CGRect,
+                                     xAtIndex: (Double) -> CGFloat, yPrice: (Double) -> CGFloat) {
+        ctx.saveGState(); ctx.clip(to: rect)
+        let gold = RenderPalette.gold
+        for d in drawings {
+            switch d.kind {
+            case .trendline:
+                strokeLine(ctx, CGPoint(x: xAtIndex(d.x1), y: yPrice(d.y1)), CGPoint(x: xAtIndex(d.x2), y: yPrice(d.y2)),
+                           color: RenderPalette.alpha(gold, 0.85), width: 1.8)
+            case .horizontal:
+                let y = yPrice(d.y1)
+                strokeLine(ctx, CGPoint(x: rect.minX, y: y), CGPoint(x: rect.maxX, y: y),
+                           color: RenderPalette.alpha(gold, 0.85), width: 1.4, dash: [6,3])
+            case .rect:
+                let a = CGPoint(x: xAtIndex(d.x1), y: yPrice(d.y1)), b = CGPoint(x: xAtIndex(d.x2), y: yPrice(d.y2))
+                let r = CGRect(x: min(a.x,b.x), y: min(a.y,b.y), width: abs(b.x-a.x), height: abs(b.y-a.y))
+                ctx.setFillColor(RenderPalette.alpha(gold, 0.10)); ctx.fill(r)
+                ctx.setStrokeColor(RenderPalette.alpha(gold, 0.85)); ctx.setLineWidth(1.2); ctx.stroke(r)
+            case .fib:
+                for f in Fibonacci.levels(from: d.y1, to: d.y2) {
+                    let y = yPrice(f.price)
+                    strokeLine(ctx, CGPoint(x: rect.minX, y: y), CGPoint(x: rect.maxX, y: y),
+                               color: RenderPalette.alpha(gold, 0.5), width: 0.9, dash: [3,3])
+                }
+            }
+        }
+        ctx.restoreGState()
+    }
+
     // MARK: header
-    private static func drawHeader(ctx: CGContext, rect: CGRect, symbol: String, title: String, bars: [Bar]) {
+    private static func drawHeader(ctx: CGContext, rect: CGRect, symbol: String, title: String, candles: [Candle]) {
         // gold underline
         strokeLine(ctx, CGPoint(x: 0, y: rect.minY), CGPoint(x: rect.maxX, y: rect.minY),
                    color: RenderPalette.alpha(RenderPalette.gold, 0.25), width: 1)
         drawText(ctx, "BLACK LABEL TRADING", at: CGPoint(x: 22, y: rect.maxY - 22), size: 11, color: RenderPalette.gold, bold: true, tracking: 1.5)
         drawText(ctx, title, at: CGPoint(x: 22, y: rect.minY + 10), size: 16, color: RenderPalette.text, bold: true)
         // Right-aligned last close + change pill (measured widths, real values).
-        if let last = bars.last {
+        if let last = candles.last {
             let up = last.close >= last.open
-            let prev = bars.count >= 2 ? bars[bars.count - 2].close : last.open
+            let prev = candles.count >= 2 ? candles[candles.count - 2].close : last.open
             let chg = last.close - prev
             let pct = prev != 0 ? chg / prev * 100 : 0
             let col = up ? RenderPalette.green : RenderPalette.red
@@ -310,6 +435,32 @@ enum ChartRender {
                      size: 17, color: col, bold: true)
             drawText(ctx, chgS, at: CGPoint(x: rect.maxX - 18 - textWidth(chgS, size: 11, bold: false), y: rect.minY + 1),
                      size: 11, color: RenderPalette.alpha(col, 0.85))
+        }
+    }
+
+    // Windowed time axis: round-clock labels on the visible candles + dotted gold session breaks
+    // spanning every pane. Replaces the old full-range axis so labels stay correct under zoom/pan.
+    private static func drawWindowedTimeAxis(_ ctx: CGContext, visible: [Candle], priceRect: CGRect,
+                                             panes: [CGRect], bottomY: CGFloat, slot: CGFloat,
+                                             xCenter: (Int) -> CGFloat) {
+        guard visible.count > 1 else { return }
+        let lowest = panes.map(\.minY).min() ?? priceRect.minY
+        for t in ChartScale.timeTicks(visible.map(\.date), maxLabels: 8) {
+            guard t.index >= 0 && t.index < visible.count else { continue }
+            let gi = visible[t.index].index
+            let x = xCenter(gi)
+            guard x >= priceRect.minX - 1 && x <= priceRect.maxX + 1 else { continue }
+            if t.isSessionBreak {
+                let sx = x - slot * 0.5
+                strokeLine(ctx, CGPoint(x: sx, y: lowest), CGPoint(x: sx, y: priceRect.maxY),
+                           color: RenderPalette.alpha(RenderPalette.gold, 0.18), width: 1, dash: [2, 4])
+            } else {
+                strokeLine(ctx, CGPoint(x: x, y: lowest), CGPoint(x: x, y: priceRect.maxY),
+                           color: RenderPalette.gridMinor, width: 0.5)
+            }
+            let tw = textWidth(t.label, size: 9, bold: t.isSessionBreak)
+            drawText(ctx, t.label, at: CGPoint(x: x - tw/2, y: bottomY - 6), size: 9,
+                     color: t.isSessionBreak ? RenderPalette.gold : RenderPalette.sub, bold: t.isSessionBreak)
         }
     }
 
@@ -400,27 +551,6 @@ enum ChartRender {
         ctx.addPath(CGPath(roundedRect: er, cornerWidth: 3, cornerHeight: 3, transform: nil))
         ctx.setStrokeColor(RenderPalette.alpha(RenderPalette.gold, 0.5)); ctx.setLineWidth(0.75); ctx.strokePath()
         drawText(ctx, etag, at: CGPoint(x: er.minX + 6, y: er.midY - 4), size: 9, color: RenderPalette.gold, bold: true)
-    }
-
-    private static func drawTimeAxis(_ ctx: CGContext, candles: [Candle], rect: CGRect, bottomY: CGFloat,
-                                     slot: CGFloat, xCenter: (Int) -> CGFloat) {
-        guard candles.count > 1 else { return }
-        // Value-based ticks: labels land on round clock times; gaps become session breaks.
-        for t in ChartScale.timeTicks(candles.map(\.date), maxLabels: 7) {
-            let x = xCenter(t.index)
-            if t.isSessionBreak {
-                // dotted gold separator between candle i-1 and i — explains the overnight hole.
-                let sx = x - slot * 0.5
-                strokeLine(ctx, CGPoint(x: sx, y: rect.minY), CGPoint(x: sx, y: rect.maxY),
-                           color: RenderPalette.alpha(RenderPalette.gold, 0.18), width: 1, dash: [2, 4])
-            } else {
-                strokeLine(ctx, CGPoint(x: x, y: rect.minY), CGPoint(x: x, y: rect.maxY),
-                           color: RenderPalette.gridMinor, width: 0.5)
-            }
-            let tw = textWidth(t.label, size: 9, bold: t.isSessionBreak)
-            drawText(ctx, t.label, at: CGPoint(x: x - tw/2, y: bottomY - 6), size: 9,
-                     color: t.isSessionBreak ? RenderPalette.gold : RenderPalette.sub, bold: t.isSessionBreak)
-        }
     }
 
     // Draw an indicator series ([Double?]) as a connected polyline, skipping nil leading values.

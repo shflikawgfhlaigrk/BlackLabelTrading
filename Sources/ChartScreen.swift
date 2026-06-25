@@ -4,7 +4,6 @@
 // and persisted drawing tools (trendline / level / zone / fib). Honest framing: the chart is
 // empty until the user loads their own bars — nothing is downloaded, sampled, or invented.
 import SwiftUI
-import Charts
 import AppKit
 import UniformTypeIdentifiers
 
@@ -12,6 +11,7 @@ import UniformTypeIdentifiers
 struct ChartIndicatorSet: Codable, Equatable {
     var sma = false
     var ema = true
+    var engines = true       // overlay each engine's entry/stop/target on the chart (toggle)
     var bollinger = false
     var vwap = false
     var rsi = false
@@ -30,10 +30,12 @@ struct ChartIndicatorSet: Codable, Equatable {
 
 // Timeframe resampling: aggregate the user's base bars up to a coarser interval. This is an
 // honest down-sampling of the user's OWN data — no new bars are invented.
+// Real minute timeframes (base capture bars are 15s, so 1m = 4 base bars) — matches the
+// WealthCharts default (1-minute candles) instead of choppy 15-second micro-bars.
 enum ChartTimeframe: String, CaseIterable, Identifiable, Codable {
-    case base = "Base", x5 = "×5", x15 = "×15", x60 = "×60", daily = "Daily"
+    case m1 = "1m", m5 = "5m", m15 = "15m", m30 = "30m", h1 = "1h"
     var id: String { rawValue }
-    var factor: Int { switch self { case .base: return 1; case .x5: return 5; case .x15: return 15; case .x60: return 60; case .daily: return 0 } }
+    var factor: Int { switch self { case .m1: return 4; case .m5: return 20; case .m15: return 60; case .m30: return 120; case .h1: return 240 } }
 }
 
 enum Resampler {
@@ -84,29 +86,26 @@ struct ChartScreen: View {
     @State private var csvText = ""
     @State private var importNote = ""
     @State private var style: CandleStyle = .candles
-    @State private var timeframe: ChartTimeframe = .base
+    @State private var timeframe: ChartTimeframe = .m1   // default 1-minute candles (WealthCharts-style)
     @State private var ind = ChartScreen.loadIndicators()
     @State private var renkoBrick: Double = 0
     @State private var showImporter = false
 
     // Live feed state
     @State private var liveTick: LiveTick? = nil
-    @State private var activeFire: FireRow? = nil      // engine's entry/stop/target/exit, shown on chart
+    @State private var activeFire: FireRow? = nil      // latest fire (any engine)
+    @State private var engineFires: [FireRow] = []     // latest fire per engine — color-coded on chart
     @State private var feedNote = ""
     @State private var loadingFeed = false
     @State private var livePollTask: Task<Void, Never>? = nil
     @State private var lastLiveClose: Double? = nil
 
-    // Drawing state
+    // Drawing state — the active tool; placement happens inside the native chart canvas.
     @State private var activeTool: DrawingKind? = nil
-    @State private var dragStart: CGPoint? = nil
-    @State private var dragCurrent: CGPoint? = nil
-    @State private var showFib = false
 
-    // Zoom/pan: a visible window [winStart, winStart+winCount) over the candle index space.
-    @State private var winStart = 0
-    @State private var winCount = 80    // right-anchored default window — full, premium look (not stretched)
-    @State private var crosshair: Int? = nil
+    // Native chart controller (toolbar zoom/pan/fit/live → the live NSView). The visible window,
+    // crosshair, drag-pan and pinch all live inside BLChartNSView now.
+    @StateObject private var chartCtl = BLChartController()
 
     private static let indKey = "com.blacklabel.trading.chartIndicators"
     static func loadIndicators() -> ChartIndicatorSet {
@@ -118,13 +117,9 @@ struct ChartScreen: View {
         if let d = try? JSONEncoder().encode(ind) { UserDefaults.standard.set(d, forKey: Self.indKey) }
     }
 
-    // Bars after timeframe resampling.
+    // Bars after timeframe resampling (every timeframe aggregates the 15s base bars to minutes).
     private var bars: [Bar] {
-        switch timeframe {
-        case .base: return baseBars
-        case .daily: return Resampler.daily(baseBars)
-        default: return Resampler.resample(baseBars, factor: timeframe.factor)
-        }
+        Resampler.resample(baseBars, factor: timeframe.factor)
     }
     // Candles for the current style.
     private var candles: [Candle] {
@@ -134,13 +129,7 @@ struct ChartScreen: View {
         case .renko:          return CandleTransform.renko(bars, brickSize: renkoBrick > 0 ? renkoBrick : CandleTransform.suggestedBrickSize(bars))
         }
     }
-    // Visible window of candles.
-    private var visible: [Candle] {
-        let all = candles
-        guard winCount > 0, winCount < all.count else { return all }
-        let start = max(0, min(winStart, all.count - winCount))
-        return Array(all[start..<min(start + winCount, all.count)])
-    }
+    private var lineMode: Bool { style == .line }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -150,17 +139,11 @@ struct ChartScreen: View {
             if baseBars.isEmpty {
                 emptyState
             } else {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 14) {
-                        toolbar
-                        priceChartCard
-                        volumePane
-                        if ind.rsi { rsiPane }
-                        if ind.macd { macdPane }
-                        if ind.atr { atrPane }
-                        drawingsList
-                    }.padding(20)
-                }
+                VStack(alignment: .leading, spacing: 12) {
+                    toolbar
+                    chartCard
+                    drawingsList
+                }.padding(20)
             }
         }
         .onAppear {
@@ -171,8 +154,16 @@ struct ChartScreen: View {
             if newSource == .live { Task { await refreshFeed() } }
         }
         .onChange(of: feed.state) { _ in
-            // When the feed transitions to flowing while we're live, (re)start tick polling.
-            if source == .live && feed.state.isFlowing { startLivePoll() } else { stopLivePoll() }
+            // Keep polling as long as we're on the LIVE chart — DON'T stop just because the feed
+            // state momentarily flips (the API degrades/recovers every so often; the store keeps
+            // ticking). Stopping on every flip is what froze the live chart. The poll itself gets
+            // nil ticks when genuinely quiet, so leaving it running is safe and keeps updates live.
+            if source == .live { startLivePoll() }
+        }
+        .onChange(of: timeframe) { _ in
+            // The native chart re-anchors its own window to the new candle count and snaps to the
+            // live edge on the next data push.
+            chartCtl.jumpToLive()
         }
         .onDisappear { stopLivePoll() }
     }
@@ -252,7 +243,7 @@ struct ChartScreen: View {
                             .frame(width: 90).padding(.vertical, 8).padding(.horizontal, 11)
                             .background(BLTheme.bg2).clipShape(RoundedRectangle(cornerRadius: 9))
                             .overlay(RoundedRectangle(cornerRadius: 9).stroke(BLTheme.stroke, lineWidth: 1))
-                            .onChange(of: symbol) { _ in winStart = 0 }
+                            .onChange(of: symbol) { _ in chartCtl.jumpToLive() }
                         GoldButton(label: "Load bars", icon: "square.and.arrow.down") { showImporter = true }
                     }
                 }
@@ -266,16 +257,16 @@ struct ChartScreen: View {
         .sheet(isPresented: $showImporter) { importSheet.sheetCloseBar() }
     }
 
-    // Live symbol picker: a menu of the buyer's own captured symbols + free-text entry.
+    // Live symbol picker: a menu of the buyer's own captured ES contracts + free-text entry.
     private var liveSymbolField: some View {
         HStack(spacing: 6) {
-            TextField("Symbol", text: $symbol)
+            TextField("ES", text: $symbol)
                 .textFieldStyle(.plain).font(.system(size: 13, weight: .bold, design: .rounded)).foregroundColor(BLTheme.text)
                 .frame(width: 110).padding(.vertical, 8).padding(.horizontal, 11)
                 .background(BLTheme.bg2).clipShape(RoundedRectangle(cornerRadius: 9))
                 .overlay(RoundedRectangle(cornerRadius: 9).stroke(BLTheme.stroke, lineWidth: 1))
                 .onSubmit { Task { await loadLiveBars() } }
-                .onChange(of: symbol) { _ in winStart = 0 }
+                .onChange(of: symbol) { _ in chartCtl.jumpToLive() }
             if !feed.symbols.pickerList.isEmpty {
                 Menu {
                     ForEach(feed.symbols.pickerList, id: \.self) { s in
@@ -328,8 +319,8 @@ struct ChartScreen: View {
                     EmptyState(icon: "hourglass", title: "Feed connected — store is still filling",
                                hint: "Your WealthCharts session is reachable but your local store has no bars yet. Leave a chart open in WealthCharts; bars accumulate here. Honest empty until real bars arrive.")
                 } else {
-                    EmptyState(icon: "chart.xyaxis.line", title: "Pick a symbol to chart",
-                               hint: "Your captured symbols are in the dropdown next to the symbol field. Choose one to load its real bars.")
+                    EmptyState(icon: "chart.xyaxis.line", title: "Pick an ES contract to chart",
+                               hint: "Your captured ES contracts are in the dropdown next to the symbol field. Choose one to load its real bars.")
                     if let busiest = feed.symbols.busiest {
                         GoldButton(label: "Chart \(busiest)", icon: "chart.bar") { symbol = busiest; Task { await loadLiveBars() } }
                     }
@@ -347,7 +338,7 @@ struct ChartScreen: View {
             symbol = b
         }
         if !symbol.trimmingCharacters(in: .whitespaces).isEmpty { await loadLiveBars() }
-        if feed.state.isFlowing { startLivePoll() }
+        if source == .live { startLivePoll() }   // poll whenever on the live chart (resilient to API blips)
     }
     private func reconnectFeed() async {
         loadingFeed = true; defer { loadingFeed = false }
@@ -358,18 +349,25 @@ struct ChartScreen: View {
         let s = symbol.trimmingCharacters(in: .whitespaces)
         guard !s.isEmpty else { feedNote = "Enter or pick a symbol."; return }
         loadingFeed = true; defer { loadingFeed = false }
-        let bars = await feed.recentBars(symbol: s, limit: 400)
-        baseBars = bars; crosshair = nil; liveTick = nil; lastLiveClose = nil
-        // Right-anchor the last ~80 bars so a freshly-loaded live chart reads full & premium (like
-        // the website demo) instead of stretching sparse bars across the whole pane. "Fit" resets to all.
-        winCount = bars.count > 0 ? min(80, bars.count) : 0; winStart = max(0, bars.count - winCount)
+        let raw = await feed.recentBars(symbol: s, limit: 400)
+        // Show only the recent contiguous session — drop stale cross-day bars (left from when
+        // capture was intermittent) so the chart isn't squished by an old price level + a giant
+        // overnight-gap candle. Keep everything within ~4h of the newest bar.
+        let cutoff = (raw.last?.date ?? Date()).addingTimeInterval(-4 * 3600)
+        let bars = raw.filter { $0.date >= cutoff }
+        baseBars = bars; liveTick = nil; lastLiveClose = nil
         renkoBrick = CandleTransform.suggestedBrickSize(baseBars)
         if bars.isEmpty {
             feedNote = feed.state.hasData ? "No bars captured for \(s) yet." : "Feed offline — no bars to show."
         } else {
             feedNote = "Loaded \(bars.count) live bars for \(s)."
         }
-        if feed.state.isFlowing { startLivePoll() }
+        // Pull the engine signals on load so entry/stop/target show on the chart even in a quiet
+        // market (not only while the live poll is running). One latest fire per engine.
+        let fires = await feed.recentFires(limit: 60).filter { $0.symbol == s || $0.symbol == nil }
+        engineFires = fires
+        activeFire = fires.first
+        if source == .live { startLivePoll() }   // poll whenever on the live chart (resilient to API blips)
     }
 
     // Poll the live last-price tick and fold it into the most-recent bar (moves the close,
@@ -393,20 +391,24 @@ struct ChartScreen: View {
                     // Pull the engine's active trade ~every 2s so entry/stop/target + exit show live.
                     if sinceFires >= 5 {
                         sinceFires = 0
-                        let fires = await feed.recentFires(limit: 40)
-                        activeFire = fires.first { ($0.symbol == s || $0.symbol == nil) }
+                        let fires = await feed.recentFires(limit: 60).filter { $0.symbol == s || $0.symbol == nil }
+                        engineFires = fires
+                        activeFire = fires.first
                     }
                     // Every ~30s re-pull recent bars so newly-printed candles appear, and refresh
                     // the honest feed status banner.
                     if sinceRepull >= 75 {
                         sinceRepull = 0
                         await feed.refreshStatus()
-                        let fresh = await feed.recentBars(symbol: s, limit: 400)
+                        let rawFresh = await feed.recentBars(symbol: s, limit: 400)
+                        let cut = (rawFresh.last?.date ?? Date()).addingTimeInterval(-4 * 3600)
+                        let fresh = rawFresh.filter { $0.date >= cut }
                         if !fresh.isEmpty {
                             var merged = fresh
                             if let t = liveTick { merged = LiveFold.apply(t, to: merged) }
                             baseBars = merged
-                            if winCount > 0 { winStart = max(0, merged.count - winCount) }  // stay glued to the live edge
+                            // The native chart stays glued to the live edge automatically when the
+                            // user hasn't scrolled back in time.
                         }
                     }
                 }
@@ -423,17 +425,19 @@ struct ChartScreen: View {
                 segmented("STYLE", CandleStyle.allCases, $style) { $0.rawValue }
                 segmented("TIMEFRAME", ChartTimeframe.allCases, $timeframe) { $0.rawValue }
                 Spacer()
-                // Zoom controls
+                // Zoom / pan controls — drive the native chart canvas.
                 HStack(spacing: 6) {
-                    iconBtn("minus.magnifyingglass") { zoom(out: true) }
-                    iconBtn("plus.magnifyingglass") { zoom(out: false) }
-                    iconBtn("arrow.left") { pan(-1) }
-                    iconBtn("arrow.right") { pan(1) }
-                    iconBtn("arrow.up.left.and.arrow.down.right") { winCount = 0; winStart = 0 }   // fit
+                    iconBtn("minus.magnifyingglass") { chartCtl.zoomOut() }
+                    iconBtn("plus.magnifyingglass") { chartCtl.zoomIn() }
+                    iconBtn("arrow.left") { chartCtl.panLeft() }
+                    iconBtn("arrow.right") { chartCtl.panRight() }
+                    iconBtn("arrow.up.left.and.arrow.down.right") { chartCtl.fitAll() }       // fit-all
+                    iconBtn("forward.end.alt.fill") { chartCtl.jumpToLive() }                 // jump to live edge
                 }
             }
             // Indicator toggles
             HStack(spacing: 8) {
+                indToggle("Engines", $ind.engines, BLTheme.green)
                 indToggle("SMA \(ind.smaPeriod)", $ind.sma, BLTheme.gold)
                 indToggle("EMA \(ind.emaPeriod)", $ind.ema, BLTheme.goldHi)
                 indToggle("Bollinger", $ind.bollinger, BLTheme.blue)
@@ -455,8 +459,6 @@ struct ChartScreen: View {
                 if !drawings.drawings(for: effectiveSymbol).isEmpty {
                     GhostButton(label: "Clear drawings", icon: "trash", tint: BLTheme.red) { drawings.clear(effectiveSymbol) }
                 }
-                Toggle(isOn: $showFib) { Text("Auto-Fib").font(.system(size: 11, weight: .semibold, design: .rounded)) }
-                    .toggleStyle(.checkbox).tint(BLTheme.gold)
                 Spacer()
                 if style == .renko {
                     HStack(spacing: 5) {
@@ -491,179 +493,50 @@ struct ChartScreen: View {
         .overlay(RoundedRectangle(cornerRadius: 10).stroke(BLTheme.stroke, lineWidth: 1))
     }
 
-    // MARK: Price chart card (candles + overlays + drawing layer + crosshair)
-    private var priceChartCard: some View {
-        let vis = visible
-        // Robust auto-fit — identical math to the headless render proof; one session-gap candle
-        // can't squash the rest of the chart.
-        let dom = ChartScale.robustDomain(vis)
-        let yDomain = dom.lo...dom.hi
-        // Round-clock x-axis ticks + session breaks (shared with the headless renderer). timeTicks
-        // returns positions within `vis`; map them to the candle index the chart plots on.
-        let xTicks = ChartScale.timeTicks(vis.map(\.date), maxLabels: 7).compactMap { t -> (idx: Int, label: String, brk: Bool)? in
-            guard t.index >= 0, t.index < vis.count else { return nil }
-            return (vis[t.index].index, t.label, t.isSessionBreak)
-        }
-        let xTickLabels = Dictionary(xTicks.map { ($0.idx, $0.label) }, uniquingKeysWith: { a, _ in a })
-        let sessionBreaks = xTicks.filter(\.brk).map(\.idx)
-        // Nice-tick gridline values for the y-axis (1/2/2.5/5 × 10ⁿ steps).
-        let yTicks = ChartScale.ticks(lo: dom.lo, hi: dom.hi, target: 7)
-        let xLo = vis.first?.index ?? 0
-        let xHi = (vis.last?.index ?? 1) + 1
-        // Indicator series aligned to the (full) candle index space, then filtered to visible.
-        let closes = candles.map(\.close)
-        let smaS = ind.sma ? Indicators.sma(closes, ind.smaPeriod) : []
-        let emaS = ind.ema ? Indicators.ema(closes, ind.emaPeriod) : []
-        let ema2S = ind.ema ? Indicators.ema(closes, ind.ema2Period) : []
-        let bb = ind.bollinger ? ChartIndicators.bollinger(closes, period: ind.bbPeriod, k: ind.bbK) : nil
-        let vwapBars = candleBars()
-        let vwapS = ind.vwap ? ChartIndicators.vwap(vwapBars, window: ind.vwapWindow) : []
-        let fibs = showFib ? Fibonacci.levels(bars) : []
+    // MARK: Price chart card — the native interactive canvas (BLChartView). Hosts the SAME
+    // CoreGraphics renderer the headless proof uses, with TradingView-grade scroll-zoom / drag-pan /
+    // pinch / crosshair. Fills the available height like a real terminal chart.
+    private var chartCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            chartHeaderBar
+            BLChartView(candles: candles, indicators: renderIndicators, lineMode: lineMode,
+                        drawings: drawings.drawings(for: effectiveSymbol), symbol: effectiveSymbol,
+                        showVolume: true, activeTool: activeTool, controller: chartCtl,
+                        onCommitDrawing: { d in drawings.add(d, to: effectiveSymbol); activeTool = nil })
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .clipShape(RoundedRectangle(cornerRadius: 12))
+                .overlay(RoundedRectangle(cornerRadius: 12).stroke(BLTheme.stroke, lineWidth: 1))
+            chartHint
+        }.frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
 
-        return Panel(title: chartTitle, icon: style.icon, accent: (vis.last?.up ?? true) ? BLTheme.green : BLTheme.red) {
-            crosshairReadout(vis)
-            Chart {
-                ForEach(vis) { c in
-                    if style == .line {
-                        LineMark(x: .value("i", c.index), y: .value("close", c.close))
-                            .interpolationMethod(.monotone).foregroundStyle(BLTheme.gold).lineStyle(StrokeStyle(lineWidth: 2))
-                    } else {
-                        // Wick
-                        // Wick — bold and always visible (high↔low), even on small-range bars.
-                        RuleMark(x: .value("i", c.index), yStart: .value("low", c.low), yEnd: .value("high", c.high))
-                            .foregroundStyle(c.up ? BLTheme.gold.opacity(0.95) : BLTheme.red.opacity(0.95)).lineStyle(StrokeStyle(lineWidth: 2.2, lineCap: .round))
-                        // Body — thick gold bull / red bear, matching the website demo.
-                        RectangleMark(x: .value("i", c.index),
-                                      yStart: .value("o", c.up ? c.open : c.close),
-                                      yEnd: .value("c", c.up ? c.close : c.open),
-                                      width: .ratio(0.88))
-                            .foregroundStyle(c.up ? BLTheme.gold : BLTheme.red).cornerRadius(1)
-                    }
-                }
-                // Dotted gold session separators (overnight/weekend gaps) — explains the holes.
-                ForEach(sessionBreaks, id: \.self) { bi in
-                    RuleMark(x: .value("sep", bi))
-                        .foregroundStyle(BLTheme.gold.opacity(0.18))
-                        .lineStyle(StrokeStyle(lineWidth: 1, dash: [2,4]))
-                }
-                overlayMarks(smaS, color: BLTheme.gold, name: "SMA")
-                overlayMarks(emaS, color: BLTheme.goldHi, name: "EMA9")        // gold EMA9 (demo)
-                overlayMarks(ema2S, color: BLTheme.blue, name: "EMA21")        // blue EMA21 (demo)
-                if let bb = bb {
-                    overlayMarks(bb.upper, color: BLTheme.blue.opacity(0.7), name: "BB↑", dashed: true)
-                    overlayMarks(bb.mid, color: BLTheme.blue.opacity(0.4), name: "BB", dashed: true)
-                    overlayMarks(bb.lower, color: BLTheme.blue.opacity(0.7), name: "BB↓", dashed: true)
-                }
-                overlayMarks(vwapS, color: BLTheme.green, name: "VWAP")
-                ForEach(fibs) { f in
-                    RuleMark(y: .value("fib", f.price))
-                        .foregroundStyle(BLTheme.gold.opacity(0.35)).lineStyle(StrokeStyle(lineWidth: 0.8, dash: [3,3]))
-                        .annotation(position: .trailing, alignment: .leading) {
-                            Text(String(format: "%.3f", f.ratio)).font(.system(size: 8, design: .rounded)).foregroundColor(BLTheme.gold.opacity(0.7))
-                        }
-                }
-                // Live last-price marker — only when a genuine fresh tick exists (never faked).
-                if let lp = livePriceLine {
-                    RuleMark(y: .value("live", lp))
-                        .foregroundStyle((vis.last?.up ?? true) ? BLTheme.green : BLTheme.red)
-                        .lineStyle(StrokeStyle(lineWidth: 1, dash: [2,3]))
-                        .annotation(position: .trailing, alignment: .leading, spacing: 0) {
-                            Text(TradeMath.num(lp))
-                                .font(.system(size: 10, weight: .heavy, design: .rounded)).monospacedDigit()
-                                .foregroundColor(Color(hex: 0x0E0E0E))
-                                .padding(.horizontal, 5).padding(.vertical, 2)
-                                .background((vis.last?.up ?? true) ? BLTheme.green : BLTheme.red)
-                                .clipShape(RoundedRectangle(cornerRadius: 3))
-                        }
-                }
-                // Engine trade overlay — entry / stop / target (and exit) for the active signal.
-                // Drawn ONLY from a real recorded fire; nil when flat -> nothing (never fabricated).
-                if let f = activeFire {
-                    RuleMark(y: .value("entry", f.entry))
-                        .foregroundStyle(BLTheme.gold).lineStyle(StrokeStyle(lineWidth: 1.4, dash: [6,3]))
-                        .annotation(position: .leading, alignment: .trailing, spacing: 2) {
-                            Text("\(f.direction.uppercased()) \(f.outcome == nil ? "ENTRY" : "EXIT " + (f.outcome ?? "").uppercased()) \(TradeMath.num(f.entry))")
-                                .font(.system(size: 8.5, weight: .heavy, design: .rounded)).foregroundColor(BLTheme.gold)
-                        }
-                    if let st = f.stop {
-                        RuleMark(y: .value("stop", st))
-                            .foregroundStyle(BLTheme.red).lineStyle(StrokeStyle(lineWidth: 1, dash: [4,3]))
-                            .annotation(position: .trailing, alignment: .leading) {
-                                Text("STOP \(TradeMath.num(st))").font(.system(size: 8, weight: .bold, design: .rounded)).foregroundColor(BLTheme.red)
-                            }
-                    }
-                    if let tg = f.target {
-                        RuleMark(y: .value("tgt", tg))
-                            .foregroundStyle(BLTheme.green).lineStyle(StrokeStyle(lineWidth: 1, dash: [4,3]))
-                            .annotation(position: .trailing, alignment: .leading) {
-                                Text("TGT \(TradeMath.num(tg))").font(.system(size: 8, weight: .bold, design: .rounded)).foregroundColor(BLTheme.green)
-                            }
-                    }
+    // Compact header strip above the canvas: symbol, style/timeframe, live pill, last-bar OHLC.
+    private var chartHeaderBar: some View {
+        HStack(spacing: 14) {
+            Text(effectiveSymbol).font(.system(size: 15, weight: .heavy, design: .rounded)).foregroundColor(BLTheme.text)
+            Text("\(style.rawValue) · \(timeframe.rawValue) · \(bars.count) bars")
+                .font(.system(size: 11, weight: .semibold, design: .rounded)).foregroundColor(BLTheme.sub)
+            if source == .live && feed.state.isFlowing {
+                HStack(spacing: 4) {
+                    Circle().fill(BLTheme.green).frame(width: 6, height: 6).modifier(LivePulse(active: true))
+                    Text("LIVE").font(.system(size: 9, weight: .heavy, design: .rounded)).foregroundColor(BLTheme.green)
                 }
             }
-            .chartXScale(domain: Double(xLo)...Double(xHi))
-            .chartYScale(domain: yDomain, type: (ind.logScale && dom.lo > 0) ? .log : .linear)
-            .chartYAxis { AxisMarks(position: .leading, values: yTicks) { v in AxisGridLine().foregroundStyle(BLTheme.stroke.opacity(0.4))
-                AxisValueLabel { if let d = v.as(Double.self) { Text(TradeMath.num(d)).font(.system(size: 9)).foregroundStyle(BLTheme.sub) } } } }
-            .chartXAxis { AxisMarks(values: xTicks.map(\.idx)) { v in AxisGridLine().foregroundStyle(BLTheme.stroke.opacity(0.3))
-                AxisValueLabel { if let i = v.as(Int.self), let lbl = xTickLabels[i] {
-                    Text(lbl).font(.system(size: 8)).monospacedDigit().foregroundStyle(BLTheme.sub) } } } }
-            .frame(height: 360)
-            .chartOverlay { proxy in
-                GeometryReader { geo in
-                    drawingLayer(proxy: proxy, geo: geo, yDomain: yDomain, xLo: xLo, xHi: xHi)
-                }
-            }
-            legend(bb: bb != nil)
+            Spacer()
+            lastBarReadout
         }
     }
-
-    private var chartTitle: String {
-        let s = effectiveSymbol.isEmpty ? "—" : effectiveSymbol
-        let live = (source == .live && feed.state.isFlowing) ? " · LIVE" : ""
-        return "\(s) · \(style.rawValue) · \(timeframe.rawValue) · \(bars.count) bars\(live)"
-    }
-
-    // The live last-price line: shown only on a flowing live feed with a real tick. nil otherwise
-    // (import mode, offline feed, or no tick) — so the chart never draws a fabricated price.
-    private var livePriceLine: Double? {
-        guard source == .live, feed.state.isFlowing, style != .renko else { return nil }
-        if let t = liveTick { return t.price }
-        return lastLiveClose
-    }
-
-    // OHLC bars matching the current candle index space (for VWAP, which needs real volume).
-    private func candleBars() -> [Bar] {
-        switch style {
-        case .renko: return candles.map { Bar(date: $0.date, open: $0.open, high: $0.high, low: $0.low, close: $0.close, volume: $0.volume) }
-        default:     return bars
-        }
-    }
-
-    @ChartContentBuilder
-    private func overlayMarks(_ series: [Double?], color: Color, name: String, dashed: Bool = false) -> some ChartContent {
-        ForEach(Array(series.enumerated()).filter { winCount == 0 || ($0.offset >= winStart && $0.offset < winStart + winCount) }, id: \.offset) { item in
-            if let y = item.element {
-                LineMark(x: .value("i", item.offset), y: .value(name, y), series: .value("s", name))
-                    .interpolationMethod(.monotone)
-                    .foregroundStyle(color)
-                    .lineStyle(StrokeStyle(lineWidth: 1.6, dash: dashed ? [4,3] : []))
-            }
-        }
-    }
-
-    // MARK: Crosshair OHLC readout
-    @ViewBuilder private func crosshairReadout(_ vis: [Candle]) -> some View {
-        let c = crosshair.flatMap { idx in candles.first { $0.index == idx } } ?? vis.last
-        if let c = c {
-            HStack(spacing: 14) {
-                Text(c.date.formatted(date: .abbreviated, time: timeframe == .daily ? .omitted : .shortened))
-                    .font(.system(size: 11, weight: .bold, design: .rounded)).foregroundColor(BLTheme.gold)
+    @ViewBuilder private var lastBarReadout: some View {
+        if let c = candles.last {
+            HStack(spacing: 12) {
                 ohlc("O", c.open); ohlc("H", c.high); ohlc("L", c.low); ohlc("C", c.close)
                 if c.volume > 0 { ohlc("V", c.volume) }
-                Spacer()
-            }.padding(.bottom, 2)
+            }
         }
+    }
+    private var chartHint: some View {
+        Text("Scroll to zoom · drag to pan · pinch · double-click → live edge · ←/→ pan · +/− zoom · F fit. Drawings persist per symbol.")
+            .font(.system(size: 9.5, design: .rounded)).foregroundColor(BLTheme.sub)
     }
     @ViewBuilder private func ohlc(_ l: String, _ v: Double) -> some View {
         HStack(spacing: 3) {
@@ -672,196 +545,45 @@ struct ChartScreen: View {
         }
     }
 
-    // MARK: Drawing layer (maps screen <-> data coords, persists on drag end)
-    // Swift Charts' ChartProxy works in the PLOT AREA's coordinate space, while gestures and
-    // the Canvas work in the overlay (chart-frame) space. We translate by the plot origin so
-    // drawings land exactly under the cursor regardless of axis insets.
-    @ViewBuilder
-    private func drawingLayer(proxy: ChartProxy, geo: GeometryProxy, yDomain: ClosedRange<Double>, xLo: Int, xHi: Int) -> some View {
-        let plot = geo[proxy.plotAreaFrame]   // plot rect in overlay (chart-frame) coords
-        ZStack(alignment: .topLeading) {
-            // Persisted drawings (drawn in overlay space; plot origin added back).
-            Canvas { ctx, _ in
-                for d in drawings.drawings(for: effectiveSymbol) {
-                    drawShape(d, ctx: &ctx, proxy: proxy, plot: plot)
-                }
-                // Live preview while dragging (drag points are already in overlay space).
-                if let s = dragStart, let cur = dragCurrent, let tool = activeTool {
-                    var p = Path()
-                    switch tool {
-                    case .horizontal: p.move(to: CGPoint(x: plot.minX, y: cur.y)); p.addLine(to: CGPoint(x: plot.maxX, y: cur.y))
-                    case .rect: p.addRect(CGRect(x: min(s.x,cur.x), y: min(s.y,cur.y), width: abs(cur.x-s.x), height: abs(cur.y-s.y)))
-                    case .fib:
-                        for r in [0.0,0.236,0.382,0.5,0.618,0.786,1.0] {
-                            let y = s.y + (cur.y - s.y) * r
-                            p.move(to: CGPoint(x: plot.minX, y: y)); p.addLine(to: CGPoint(x: plot.maxX, y: y))
-                        }
-                    default: p.move(to: s); p.addLine(to: cur)
-                    }
-                    ctx.stroke(p, with: .color(BLTheme.gold.opacity(0.6)), style: StrokeStyle(lineWidth: 1.5, dash: [4,3]))
-                }
+    // Build the renderer's overlay config from the SwiftUI indicator toggles + live overlays.
+    private var renderIndicators: RenderIndicators {
+        var r = RenderIndicators()
+        if ind.sma { r.sma = ind.smaPeriod }
+        if ind.ema { r.ema1 = ind.emaPeriod; r.ema2 = ind.ema2Period }
+        if ind.vwap { r.vwapWindow = ind.vwapWindow }
+        if ind.bollinger { r.bollinger = (period: ind.bbPeriod, k: ind.bbK) }
+        if ind.rsi { r.rsiPeriod = ind.rsiPeriod }
+        if ind.macd { r.macd = true }
+        if ind.atr { r.atrPeriod = ind.atrPeriod }
+        r.logScale = ind.logScale
+        r.lastPriceLine = livePriceLine
+        if ind.engines {
+            r.fires = enginesToPlot.map { f in
+                let active = f.engine == activeFire?.engine
+                return RenderFire(direction: f.direction, engine: EngineRoster.label(for: f.engine), entry: f.entry,
+                                  stop: active ? activeFire?.stop : nil, target: active ? activeFire?.target : nil,
+                                  outcome: f.outcome)
             }
-            // Crosshair vertical line (proxy.position is plot-space → add plot origin).
-            if let xi = crosshair, let px = proxy.position(forX: Double(xi)) {
-                Path { p in p.move(to: CGPoint(x: px + plot.minX, y: plot.minY)); p.addLine(to: CGPoint(x: px + plot.minX, y: plot.maxY)) }
-                    .stroke(BLTheme.gold.opacity(0.3), style: StrokeStyle(lineWidth: 1, dash: [2,2]))
-            }
-            Rectangle().fill(Color.clear).contentShape(Rectangle())
-                .gesture(DragGesture(minimumDistance: 1)
-                    .onChanged { val in
-                        if activeTool != nil {
-                            if dragStart == nil { dragStart = val.startLocation }
-                            dragCurrent = val.location
-                        }
-                        // Update crosshair to nearest candle (translate to plot space first).
-                        if let xv: Double = proxy.value(atX: val.location.x - plot.minX) { crosshair = Int(xv.rounded()) }
-                    }
-                    .onEnded { val in
-                        defer { dragStart = nil; dragCurrent = nil }
-                        guard let tool = activeTool, let s = dragStart else { return }
-                        // Translate overlay coords → plot-space before reading data values.
-                        guard let x1: Double = proxy.value(atX: s.x - plot.minX), let x2: Double = proxy.value(atX: val.location.x - plot.minX),
-                              let y1: Double = proxy.value(atY: s.y - plot.minY), let y2: Double = proxy.value(atY: val.location.y - plot.minY) else { return }
-                        let d = Drawing(kind: tool, x1: x1, y1: y1, x2: x2, y2: y2)
-                        drawings.add(d, to: effectiveSymbol)
-                        activeTool = nil
-                    })
         }
+        return r
     }
 
-    private func drawShape(_ d: Drawing, ctx: inout GraphicsContext, proxy: ChartProxy, plot: CGRect) {
-        // proxy.position(...) returns plot-space coords; add plot origin to get overlay coords.
-        func pt(_ x: Double, _ y: Double) -> CGPoint? {
-            guard let px = proxy.position(forX: x), let py = proxy.position(forY: y) else { return nil }
-            return CGPoint(x: px + plot.minX, y: py + plot.minY)
-        }
-        func yPos(_ y: Double) -> CGFloat? { proxy.position(forY: y).map { $0 + plot.minY } }
-        let color = BLTheme.gold.opacity(0.85)
-        switch d.kind {
-        case .trendline:
-            if let a = pt(d.x1, d.y1), let b = pt(d.x2, d.y2) {
-                var p = Path(); p.move(to: a); p.addLine(to: b)
-                ctx.stroke(p, with: .color(color), style: StrokeStyle(lineWidth: 1.8))
-            }
-        case .horizontal:
-            if let y = yPos(d.y1) {
-                var p = Path(); p.move(to: CGPoint(x: plot.minX, y: y)); p.addLine(to: CGPoint(x: plot.maxX, y: y))
-                ctx.stroke(p, with: .color(color), style: StrokeStyle(lineWidth: 1.4, dash: [6,3]))
-            }
-        case .rect:
-            if let a = pt(d.x1, d.y1), let b = pt(d.x2, d.y2) {
-                let r = CGRect(x: min(a.x,b.x), y: min(a.y,b.y), width: abs(b.x-a.x), height: abs(b.y-a.y))
-                ctx.fill(Path(r), with: .color(BLTheme.gold.opacity(0.10)))
-                ctx.stroke(Path(r), with: .color(color), style: StrokeStyle(lineWidth: 1.2))
-            }
-        case .fib:
-            for f in Fibonacci.levels(from: d.y1, to: d.y2) {
-                if let y = yPos(f.price) {
-                    var p = Path(); p.move(to: CGPoint(x: plot.minX, y: y)); p.addLine(to: CGPoint(x: plot.maxX, y: y))
-                    ctx.stroke(p, with: .color(BLTheme.gold.opacity(0.5)), style: StrokeStyle(lineWidth: 0.9, dash: [3,3]))
-                }
-            }
-        }
+    // The live last-price line: shown only on a flowing live feed with a real tick. nil otherwise
+    // (import mode, offline feed, or no tick) — so the chart never draws a fabricated price.
+    private var livePriceLine: Double? {
+        guard source == .live, style != .renko else { return nil }
+        if let t = liveTick { return t.price }       // freshest tick while flowing
+        if let c = lastLiveClose { return c }
+        return bars.last?.close                       // always show the latest reading, even quiet
     }
 
-    // MARK: Indicator panes (RSI / MACD / ATR below the price chart)
-    private var rsiPane: some View {
-        let r = Indicators.rsi(candles.map(\.close), ind.rsiPeriod)
-        return Panel(title: "RSI (\(ind.rsiPeriod))", icon: "waveform.path.ecg", accent: BLTheme.blue) {
-            Chart {
-                RuleMark(y: .value("70", 70)).foregroundStyle(BLTheme.red.opacity(0.4)).lineStyle(StrokeStyle(lineWidth: 0.8, dash: [3,3]))
-                RuleMark(y: .value("30", 30)).foregroundStyle(BLTheme.green.opacity(0.4)).lineStyle(StrokeStyle(lineWidth: 0.8, dash: [3,3]))
-                paneLine(r, color: BLTheme.blue)
-            }
-            .chartYScale(domain: 0...100).frame(height: 120)
-            .chartXScale(domain: paneXDomain)
-            .chartYAxis { AxisMarks(position: .trailing, values: [30,50,70]) { _ in AxisValueLabel().foregroundStyle(BLTheme.sub) } }
-            .chartXAxis(.hidden)
-        }
-    }
-    private var macdPane: some View {
-        let m = ChartIndicators.macd(candles.map(\.close))
-        return Panel(title: "MACD (12,26,9)", icon: "chart.bar.xaxis", accent: BLTheme.goldDim) {
-            Chart {
-                ForEach(idxFilter(m.histogram), id: \.0) { (i, v) in
-                    BarMark(x: .value("i", i), y: .value("hist", v)).foregroundStyle(v >= 0 ? BLTheme.green.opacity(0.7) : BLTheme.red.opacity(0.7))
-                }
-                paneLine(m.macd, color: BLTheme.gold)
-                paneLine(m.signal, color: BLTheme.blue)
-                RuleMark(y: .value("0", 0)).foregroundStyle(BLTheme.sub.opacity(0.3))
-            }
-            .frame(height: 120).chartXScale(domain: paneXDomain)
-            .chartYAxis { AxisMarks(position: .trailing) { _ in AxisValueLabel().foregroundStyle(BLTheme.sub) } }.chartXAxis(.hidden)
-        }
-    }
-    private var atrPane: some View {
-        let a = Indicators.atr(candleBars(), ind.atrPeriod)
-        return Panel(title: "ATR (\(ind.atrPeriod))", icon: "waveform.path", accent: BLTheme.red) {
-            Chart { paneArea(a, color: BLTheme.red) }
-                .frame(height: 110).chartXScale(domain: paneXDomain)
-                .chartYAxis { AxisMarks(position: .trailing) { _ in AxisValueLabel().foregroundStyle(BLTheme.sub) } }.chartXAxis(.hidden)
-        }
+    // Latest fire PER ENGINE (engineFires is newest-first) — one entry line per engine on the chart.
+    private var enginesToPlot: [FireRow] {
+        var seen = Set<String>(); var out: [FireRow] = []
+        for f in engineFires where !seen.contains(f.engine) { seen.insert(f.engine); out.append(f) }
+        return out
     }
 
-    // Volume sub-pane — only rendered when the user's bars actually carry volume (honest: a feed
-    // capture with no volume column shows no fake bars). Coloured by candle direction.
-    @ViewBuilder private var volumePane: some View {
-        let vis = visible
-        let hasVol = vis.contains { $0.volume > 0 }
-        if hasVol {
-            Panel(title: "Volume", icon: "chart.bar.fill", accent: BLTheme.gold) {
-                Chart {
-                    ForEach(vis) { c in
-                        BarMark(x: .value("i", c.index), y: .value("vol", c.volume), width: .ratio(0.72))
-                            .foregroundStyle((c.up ? BLTheme.green : BLTheme.red).opacity(0.30))
-                    }
-                }
-                .frame(height: 90).chartXScale(domain: paneXDomain)
-                .chartYAxis { AxisMarks(position: .trailing) { v in AxisValueLabel {
-                    if let d = v.as(Double.self) { Text(TradeMath.compact(d)).font(.system(size: 8)).foregroundStyle(BLTheme.sub) } } } }
-                .chartXAxis(.hidden)
-            }
-        }
-    }
-    private var paneXDomain: ClosedRange<Double> {
-        let vis = visible
-        return Double(vis.first?.index ?? 0)...Double((vis.last?.index ?? 1) + 1)
-    }
-    private func idxFilter(_ s: [Double?]) -> [(Int, Double)] {
-        s.enumerated().compactMap { (i, v) -> (Int, Double)? in
-            guard let v = v, winCount == 0 || (i >= winStart && i < winStart + winCount) else { return nil }
-            return (i, v)
-        }
-    }
-    @ChartContentBuilder private func paneLine(_ s: [Double?], color: Color) -> some ChartContent {
-        ForEach(idxFilter(s), id: \.0) { (i, v) in
-            LineMark(x: .value("i", i), y: .value("v", v), series: .value("s", "\(color)"))
-                .interpolationMethod(.monotone).foregroundStyle(color).lineStyle(StrokeStyle(lineWidth: 1.6))
-        }
-    }
-    @ChartContentBuilder private func paneArea(_ s: [Double?], color: Color) -> some ChartContent {
-        ForEach(idxFilter(s), id: \.0) { (i, v) in
-            AreaMark(x: .value("i", i), y: .value("v", v))
-                .interpolationMethod(.monotone)
-                .foregroundStyle(LinearGradient(colors: [color.opacity(0.3), color.opacity(0.02)], startPoint: .top, endPoint: .bottom))
-        }
-    }
-
-    // MARK: Legend + drawings list
-    @ViewBuilder private func legend(bb: Bool) -> some View {
-        HStack(spacing: 12) {
-            if ind.sma { legendDot(BLTheme.gold, "SMA \(ind.smaPeriod)") }
-            if ind.ema { legendDot(BLTheme.goldHi, "EMA \(ind.emaPeriod)") }
-            if bb { legendDot(BLTheme.blue, "Bollinger \(ind.bbPeriod)/\(TradeMath.num(ind.bbK))") }
-            if ind.vwap { legendDot(BLTheme.green, "VWAP \(ind.vwapWindow)") }
-            Spacer()
-            Text("Drag a drawing tool on the chart; drawings persist per symbol.")
-                .font(.system(size: 9.5, design: .rounded)).foregroundColor(BLTheme.sub)
-        }.padding(.top, 2)
-    }
-    private func legendDot(_ c: Color, _ t: String) -> some View {
-        HStack(spacing: 4) { Circle().fill(c).frame(width: 7, height: 7); Text(t).font(.system(size: 9.5, weight: .semibold, design: .rounded)).foregroundColor(BLTheme.sub) }
-    }
     @ViewBuilder private var drawingsList: some View {
         let ds = drawings.drawings(for: effectiveSymbol)
         if !ds.isEmpty {
@@ -933,23 +655,6 @@ struct ChartScreen: View {
         }.frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    // MARK: Zoom / pan
-    private func zoom(out: Bool) {
-        let total = candles.count
-        guard total > 0 else { return }
-        if winCount == 0 { winCount = total }
-        let factor = out ? 1.4 : 0.7
-        winCount = max(10, min(total, Int(Double(winCount) * factor)))
-        winStart = max(0, min(winStart, total - winCount))
-        if winCount >= total { winCount = 0; winStart = 0 }
-    }
-    private func pan(_ dir: Int) {
-        let total = candles.count
-        guard winCount > 0, winCount < total else { return }
-        let step = max(1, winCount / 4)
-        winStart = max(0, min(total - winCount, winStart + dir * step))
-    }
-
     // MARK: Import sheet
     private var importSheet: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -969,8 +674,9 @@ struct ChartScreen: View {
     }
     private func loadBars() {
         let parsed = BarCSV.parse(csvText)
-        baseBars = parsed.bars; winStart = 0; winCount = 0; crosshair = nil
+        baseBars = parsed.bars
         renkoBrick = CandleTransform.suggestedBrickSize(baseBars)
+        chartCtl.jumpToLive()
         importNote = baseBars.isEmpty ? "No valid rows found." : "Loaded \(baseBars.count) bars" + (parsed.skipped > 0 ? " (\(parsed.skipped) skipped)" : "") + "."
     }
     private func importFile() {

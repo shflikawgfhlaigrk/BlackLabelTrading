@@ -134,7 +134,7 @@ def screen(store, symbols, engines, cfg=None) -> list[dict]:
     cfg = cfg or store.config()
     lookback = cfg.get("lookback", S.LOOKBACK)
     rows = []
-    for sym in symbols:
+    for sym in S.es_symbols(symbols):
         ohlc = store.ohlc(sym)
         bars = len(ohlc)
         for eng in engines:

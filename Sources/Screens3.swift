@@ -234,7 +234,7 @@ struct StrategyBuilderScreen: View {
                     Text("Rules that map onto live-snapshot metrics (price / RSI vs a constant) can become an alert you’ll get notified on. Indicator-vs-indicator rules (e.g. SMA cross) stay backtest-only — we tell you which, never silently drop logic.")
                         .font(.system(size: 11, design: .rounded)).foregroundColor(BLTheme.sub).fixedSize(horizontal: false, vertical: true)
                     HStack(spacing: 10) {
-                        bltTextField("Symbol", $alertSymbol, placeholder: "AAPL")
+                        bltTextField("ES contract", $alertSymbol, placeholder: "ES or CM.ESU6")
                         GoldButton(label: "Create alert", icon: "bell.fill") { exportAlert() }
                             .disabled(alertSymbol.trimmingCharacters(in: .whitespaces).isEmpty)
                             .opacity(alertSymbol.trimmingCharacters(in: .whitespaces).isEmpty ? 0.5 : 1)
@@ -312,10 +312,15 @@ struct StrategyBuilderScreen: View {
     }
 
     private func exportAlert() {
-        let (alert, unmappable) = VisualStrategyEngine.toAlert(strat, symbol: alertSymbol.uppercased())
+        let s = alertSymbol.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        guard TradingSymbolScope.isES(s) else {
+            exportNote = "Alerts are ES-only. Use ES or a captured ES contract."
+            return
+        }
+        let (alert, unmappable) = VisualStrategyEngine.toAlert(strat, symbol: s)
         if let a = alert {
             alerts.add(a)
-            exportNote = "Alert created for \(alertSymbol.uppercased())." + (unmappable.isEmpty ? "" : " \(unmappable.count) rule(s) couldn’t be mapped and stay backtest-only.")
+            exportNote = "Alert created for \(s)." + (unmappable.isEmpty ? "" : " \(unmappable.count) rule(s) couldn’t be mapped and stay backtest-only.")
         } else {
             exportNote = "No rules in this strategy map to a live-snapshot alert (they’re indicator-vs-indicator). They stay backtest-only — that’s honest."
         }
@@ -458,7 +463,7 @@ struct PaperTradeScreen: View {
                 Panel(title: "Simulated account", icon: "banknote", accent: BLTheme.gold) {
                     HStack(spacing: 10) {
                         bltDblField("Starting balance", $book.startingBalance)
-                        bltTextField("Marks (SYM=price, …)", $marksText, placeholder: "ES=4500, NQ=15500")
+                        bltTextField("Marks (ES=price, …)", $marksText, placeholder: "ES=4500")
                     }
                     LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: 4), spacing: 10) {
                         bltMetricTile("Equity (sim)", TradeMath.money(book.equity(marks: marks)), BLTheme.gold)
