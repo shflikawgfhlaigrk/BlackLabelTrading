@@ -211,9 +211,13 @@ struct SignalsScreen: View {
         }
         .task {
             await loadFleet()
+            await feed.refreshStatus()                       // resolve the live symbol once
+            var ticks = 0
             while !Task.isCancelled {
                 await refreshLive()
-                try? await Task.sleep(nanoseconds: 5_000_000_000)
+                ticks += 1
+                if ticks % 20 == 0 { await feed.refreshStatus() }   // re-resolve symbol ~every 30s
+                try? await Task.sleep(nanoseconds: 1_500_000_000)   // 1.5s — was 5s
             }
         }
         .sheet(isPresented: $showConnectWC) { ConnectWealthChartsSheet().environmentObject(wc).sheetCloseBar() }
@@ -471,15 +475,17 @@ struct SignalsScreen: View {
     // that has a real source. Read-only by design; the buyer never edits these. Honest empties on
     // a cold store (no bars → nothing shown, never fabricated).
     private func refreshLive() async {
-        if live.bars == 0 { factorsLoading = true }
-        await feed.refreshStatus()                          // populate feed.symbols + live state
-        // The live ES contract is whatever the buyer's feed is streaming (e.g. CM.ESU6) — never a
-        // hardcoded root. No live symbol yet → honest empty (nothing computes until real bars exist).
+        // Symbol is resolved by the periodic feed.refreshStatus() in the .task loop — never a
+        // hardcoded root; it's whatever the buyer's feed streams (e.g. CM.ESU6).
         guard let esSym = feed.symbols.live.first ?? feed.symbols.busiest ?? feed.symbols.liveTicks.first else {
             await MainActor.run { live = LiveFactorSnapshot(); factorsLoading = false }
             return
         }
-        let bars = await feed.recentBars(symbol: esSym)
+        if live.bars == 0 { factorsLoading = true }
+        var bars = await feed.recentBars(symbol: esSym)
+        // Fold the live last-price tick into the latest bar so price + price-relative factors update
+        // every cycle, not only when a 15s bar closes. Real tick only (nil when gated) — never invented.
+        if let tick = await feed.liveTick(symbol: esSym) { bars = LiveFold.apply(tick, to: bars) }
         let nqBars = await feed.recentBars(symbol: nqSymbol(for: esSym))   // SMT reference (NQ micro)
         let snap = LiveFactorEngine.compute(bars: bars, nqBars: nqBars, fires: backendFires, now: Date())
         await MainActor.run {
