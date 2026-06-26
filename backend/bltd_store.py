@@ -1041,6 +1041,32 @@ class Store:
             "c=excluded.c,ts_recorded=excluded.ts_recorded", seq, many=True)
         return len(seq)
 
+    def record_bars_batch(self, by_symbol) -> int:
+        """by_symbol: {symbol: [(ts_epoch, o, h, l, c), ...]}.
+
+        Batch-shaped companion to record_bars for a future capture flusher. Keeps the current
+        five-field bar schema, filters non-ES symbols before write, and returns -1 if the batch
+        write fails so callers can requeue instead of dropping source data silently."""
+        if not isinstance(by_symbol, dict):
+            return 0
+        now = int(time.time())
+        seq = []
+        try:
+            for symbol, rows in by_symbol.items():
+                if not is_es_symbol(symbol):
+                    continue
+                for (ts, o, h, l, c) in rows or []:
+                    seq.append((symbol, int(ts), o, h, l, c, now))
+        except (TypeError, ValueError):
+            return -1
+        if not seq:
+            return 0
+        rc = self._exec(
+            "INSERT INTO bars(symbol,ts,o,h,l,c,ts_recorded) VALUES(?,?,?,?,?,?,?) "
+            "ON CONFLICT(symbol,ts) DO UPDATE SET o=excluded.o,h=excluded.h,l=excluded.l,"
+            "c=excluded.c,ts_recorded=excluded.ts_recorded", seq, many=True)
+        return -1 if rc <= 0 else len(seq)
+
     # ---- live tick -----------------------------------------------------
     def live_price(self, symbol: str) -> dict:
         if not symbol or not is_es_symbol(symbol):
@@ -1056,6 +1082,36 @@ class Store:
         self._exec("INSERT INTO wc_live(symbol,price,recorded) VALUES(?,?,?) "
                    "ON CONFLICT(symbol) DO UPDATE SET price=excluded.price,"
                    "recorded=excluded.recorded", (symbol, float(price), int(epoch)))
+
+    def record_ticks_batch(self, items) -> int:
+        """items: [{"symbol": sym, "price": px, "epoch": ts}, ...] or [(sym, px, ts), ...].
+
+        Filters non-ES ticks before write and returns -1 on write failure so a future flusher can
+        requeue. The live tick table remains one latest row per symbol, matching record_tick."""
+        seq = []
+        try:
+            for item in items or []:
+                if isinstance(item, dict):
+                    symbol = item.get("symbol")
+                    price = item.get("price", item.get("close"))
+                    epoch = item.get("epoch", item.get("recorded"))
+                else:
+                    try:
+                        symbol, price, epoch = item
+                    except (TypeError, ValueError):
+                        continue
+                if not is_es_symbol(symbol):
+                    continue
+                seq.append((symbol, float(price), int(epoch)))
+        except (TypeError, ValueError):
+            return -1
+        if not seq:
+            return 0
+        rc = self._exec(
+            "INSERT INTO wc_live(symbol,price,recorded) VALUES(?,?,?) "
+            "ON CONFLICT(symbol) DO UPDATE SET price=excluded.price,"
+            "recorded=excluded.recorded", seq, many=True)
+        return -1 if rc <= 0 else len(seq)
 
     # ---- fires ---------------------------------------------------------
     def record_fire(self, engine, direction, entry, symbol=None, stop=None, target=None,

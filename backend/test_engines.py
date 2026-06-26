@@ -348,6 +348,31 @@ def test_stream_once_no_false_stall_while_candles_flow():
     assert not res.get("stalled"), f"healthy stream must not trip the watchdog: {res}"
 
 
+def test_recv_text_bounded_on_half_dead_socket():
+    # ROOT-CAUSE LOCK: a half-dead CDP socket that trickles bytes but never completes a frame must
+    # NOT wedge recv_text forever. Because sock.recv keeps returning partial data it never raises
+    # socket.timeout, so the only escape is the max_wait deadline. Without it the capture loop blocks
+    # invisibly to the stall watchdog (which only runs between recv_text calls).
+    import bltd_capture as C
+    clock = {"t": 0.0}
+    real_mono = C.time.monotonic
+
+    class _FakeSock:
+        def recv(self, n):
+            clock["t"] += 1.0          # each recv "takes" 1s of (fake) time, never times out
+            return b"\x81"             # perpetual partial frame header — never assembles a full frame
+        def close(self): pass
+
+    ws = C.WSClient.__new__(C.WSClient)  # bypass the real socket handshake
+    ws.sock = _FakeSock()
+    ws._buf = b""
+    C.time.monotonic = lambda: clock["t"]
+    try:
+        assert ws.recv_text(max_wait=3.0) is None, "trickling socket must bail at the deadline"
+    finally:
+        C.time.monotonic = real_mono
+
+
 def test_config_sanitizes_to_known_engines_only():
     clean = S._sanitize({"engines": ["momentum", "bogus", "regime"]})
     assert clean["engines"] == ["momentum", "regime"]   # unknown dropped, known kept in order
@@ -416,6 +441,38 @@ def test_store_rejects_and_hides_non_es_symbols():
                 pass
 
 
+def test_store_batch_writes_filter_non_es_and_report_failure():
+    store, path, cfg = _temp_store()
+    try:
+        rows = [(1_700_000_000 + i, 100.0 + i, 101.0 + i, 99.0 + i, 100.5 + i) for i in range(3)]
+        assert store.record_bars_batch({"CM.ESU6": rows, "CM.NQU6": rows}) == 3
+        assert store.bars("CM.ESU6", 10, newest=False)["bars"] == [
+            [100.0, 101.0, 99.0, 100.5, 1700000000.0],
+            [101.0, 102.0, 100.0, 101.5, 1700000001.0],
+            [102.0, 103.0, 101.0, 102.5, 1700000002.0],
+        ]
+        assert store.bars("CM.NQU6", 10, newest=False)["bars"] == []
+
+        assert store.record_ticks_batch([
+            {"symbol": "CM.NQU6", "price": 17000.0, "epoch": 1_700_000_100},
+            {"symbol": "CM.ESU6", "price": 5100.25, "epoch": 1_700_000_101},
+            ("ESZ26", 5101.25, 1_700_000_102),
+        ]) == 2
+        assert store.live_price("CM.NQU6") == {"gated": True}
+        assert store.live_price("CM.ESU6")["price"] == 5100.25
+        assert store.live_price("ESZ26")["price"] == 5101.25
+
+        store._exec = lambda *a, **k: 0
+        assert store.record_bars_batch({"CM.ESU6": rows}) == -1
+        assert store.record_ticks_batch([("CM.ESU6", 5102.0, 1_700_000_103)]) == -1
+    finally:
+        for p in (path, cfg):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
 def test_screen_filters_to_es_symbols_only():
     import bltd_analytics as A
 
@@ -463,57 +520,127 @@ def test_parse_candle_drops_valueless_and_nonfeed():
     assert S.parse_candle('{"cmd":"feed","data":{"type":"bidask","c":"X"}}') is None
 
 
-def test_on_candle_uses_arrival_when_epoch_missing():
-    # A cts-shape candle (epoch None) must be persisted as a tick stamped at its ARRIVAL time,
-    # not crash and not be dropped. Proves the store actually receives the live price.
+def test_on_candle_buffers_tick_at_arrival_then_flush_persists():
+    # A cts-shape candle (epoch None) must be buffered as a live tick stamped at its ARRIVAL time
+    # (the read loop touches ONLY memory — no SQLite I/O), then the flusher persists it through the
+    # batch API. Proves the no-wedge buffer->flush path actually lands the live price in the store.
     import bltd_capture as C
-
-    recorded = {}
-
-    class _StubStore:
-        def config(self):
-            return S.CONFIG_DEFAULTS
-
-        def record_tick(self, sym, price, ep):
-            recorded[sym] = (price, ep)
-
-        def record_bars(self, *a, **k):
-            return 0
-
-        def ohlc(self, *a, **k):
-            return []
-
-    cap = C.Capture(_StubStore(), bar_seconds=15, lookback=20, edge_gate=True)
-    arrival = 1781853600.0
-    cap.on_candle({"symbol": "CM.ESU6", "close": 7546.5, "epoch": None}, arrival=arrival)
-    assert "CM.ESU6" in recorded, "no-epoch candle must still record a live tick"
-    price, ep = recorded["CM.ESU6"]
-    assert price == 7546.5
-    assert ep == int(arrival)                 # stamped at the real arrival wall-clock
+    store, path, cfg = _temp_store()
+    try:
+        cap = C.Capture(store, bar_seconds=15, lookback=20, edge_gate=True)
+        arrival = 1781853600.0
+        cap.on_candle({"symbol": "CM.ESU6", "close": 7546.5, "epoch": None}, arrival=arrival)
+        # read loop wrote memory only — nothing persisted yet
+        assert cap.latest["CM.ESU6"] == (7546.5, int(arrival))   # stamped at real arrival wall-clock
+        assert store.live_price("CM.ESU6") == {"symbol": "CM.ESU6", "gated": True}
+        cap.flush()
+        lp = store.live_price("CM.ESU6")
+        assert lp["price"] == 7546.5 and lp["ts"] == float(int(arrival))
+    finally:
+        for p in (path, cfg):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
 
 
 def test_capture_drops_non_es_candles():
+    # The ES-only product scope gate lives in on_candle, BEFORE the in-memory buffer, so a non-ES
+    # candle never enters latest/pending_bars and is never persisted by the flusher.
     import bltd_capture as C
+    store, path, cfg = _temp_store()
+    try:
+        cap = C.Capture(store, bar_seconds=15, lookback=20, edge_gate=True)
+        cap.on_candle({"symbol": "CM.NQU6", "close": 17000.0, "epoch": None}, arrival=1781853600.0)
+        cap.on_candle({"symbol": "CM.ESU6", "close": 7546.5, "epoch": None}, arrival=1781853601.0)
+        assert list(cap.latest.keys()) == ["CM.ESU6"]            # NQ dropped before buffering
+        cap.flush()
+        assert store.live_price("CM.NQU6") == {"gated": True}
+        assert store.live_price("CM.ESU6")["price"] == 7546.5
+    finally:
+        for p in (path, cfg):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
 
-    recorded = []
 
-    class _StubStore:
-        def config(self):
-            return S.CONFIG_DEFAULTS
+def test_roll_queues_five_field_bars_off_read_loop_then_flush_persists():
+    # Crossing a bar boundary must QUEUE the closed bar in memory (read loop = no SQLite I/O), and
+    # only the flusher persists it through record_bars_batch. Bars keep the five-field (ts,o,h,l,c)
+    # schema — no volume/quote-delta widening — so the queued rows match the store's batch API.
+    import bltd_capture as C
+    store, path, cfg = _temp_store()
+    try:
+        cap = C.Capture(store, bar_seconds=15, lookback=20, edge_gate=False)
+        for close, arrival in [(100.0, 1_700_000_000.0), (101.0, 1_700_000_001.0),
+                               (102.0, 1_700_000_015.0)]:
+            cap.on_candle({"symbol": "CM.ESU6", "close": close, "epoch": None}, arrival=arrival)
+        queued = cap.pending_bars["CM.ESU6"]
+        assert len(queued) == 1 and len(queued[0]) == 5, queued       # five-field bar, queued
+        assert store.bars("CM.ESU6", 10, newest=False)["bars"] == []  # nothing persisted yet
+        cap.flush()
+        assert store.bars("CM.ESU6", 10, newest=False)["bars"] == [
+            [100.0, 101.0, 100.0, 101.0, 1700000010.0]]
+        assert cap.pending_bars == {}                                 # drained by the flusher
+    finally:
+        for p in (path, cfg):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
 
-        def record_tick(self, sym, price, ep):
-            recorded.append((sym, price, ep))
 
-        def record_bars(self, *a, **k):
-            return 0
+def test_flush_requeues_bars_on_write_failure():
+    # Bars are unique by ts, so a flush whose batch write fails (record_bars_batch returns -1) must
+    # RE-QUEUE the rows so the next flush retries them — capture data is never silently dropped.
+    import bltd_capture as C
+    store, path, cfg = _temp_store()
+    try:
+        cap = C.Capture(store, bar_seconds=15, lookback=20, edge_gate=False)
+        cap.pending_bars = {"CM.ESU6": [(1_700_000_010, 100.0, 101.0, 100.0, 101.0)]}
+        store.record_bars_batch = lambda *a, **k: -1          # simulate a write failure
+        cap.flush()
+        assert cap.pending_bars["CM.ESU6"] == [(1_700_000_010, 100.0, 101.0, 100.0, 101.0)]
+    finally:
+        for p in (path, cfg):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
 
-        def ohlc(self, *a, **k):
-            return []
 
-    cap = C.Capture(_StubStore(), bar_seconds=15, lookback=20, edge_gate=True)
-    cap.on_candle({"symbol": "CM.NQU6", "close": 17000.0, "epoch": None}, arrival=1781853600.0)
-    cap.on_candle({"symbol": "CM.ESU6", "close": 7546.5, "epoch": None}, arrival=1781853601.0)
-    assert [r[0] for r in recorded] == ["CM.ESU6"]
+def test_evaluate_all_fires_off_read_loop_from_store():
+    # The evaluator thread evaluates from the STORE's closed bars (not the read loop), so a proven
+    # signal still records a real fire with engine eval fully decoupled from frame ingestion.
+    import bltd_capture as C
+    store, path, cfg = _temp_store()
+    try:
+        rows = [(1_700_000_000 + i * 15, 100.0 + i * 0.9, 100.0 + i * 0.9,
+                 100.0 + i * 0.9, 100.0 + i * 0.9) for i in range(80)]
+        assert store.record_bars("CM.ESU6", rows) == 80
+        cap = C.Capture(store, bar_seconds=15, lookback=20, edge_gate=False)
+        assert store.latest_fire()["fire"] is None
+        cap.evaluate_all()                          # runs the roster off the read loop, from store
+        assert store.latest_fire()["fire"] is not None
+    finally:
+        for p in (path, cfg):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
+def test_freshness_watchdog_wedge_decision():
+    # PURE wedge decision behind _freshness_watchdog: seed grace, reset on advance, and trip only
+    # after the store's newest tick has stalled for stale_after seconds (then the daemon os._exit's
+    # so launchd respawns a fresh capture).
+    import bltd_capture as C
+    assert C._store_is_wedged(-1, 0.0, 1000, 100.0, stale_after=300.0) == (1000, 100.0, False)
+    assert C._store_is_wedged(1000, 100.0, 1005, 130.0, stale_after=300.0) == (1005, 130.0, False)
+    assert C._store_is_wedged(1005, 130.0, 1005, 400.0, stale_after=300.0) == (1005, 130.0, False)
+    seen, prog, wedged = C._store_is_wedged(1005, 130.0, 1005, 431.0, stale_after=300.0)
+    assert wedged is True and (seen, prog) == (1005, 130.0)
 
 
 if __name__ == "__main__":

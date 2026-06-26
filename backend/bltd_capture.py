@@ -26,6 +26,7 @@ import logging
 import os
 import socket
 import struct
+import threading
 import time
 import urllib.request
 from urllib.parse import urlparse
@@ -147,10 +148,20 @@ class WSClient:
     def send(self, text: str):
         self.sock.sendall(ws_encode_text(text))
 
-    def recv_text(self):
-        """Return the next text-frame payload as a str, or None on timeout/no-frame."""
+    def recv_text(self, max_wait: float = 3.0):
+        """Return the next text-frame payload as a str, or None on timeout/no-frame.
+
+        Bounded by *max_wait*: if a full frame can't be assembled within that window (a half-dead
+        CDP socket that trickles bytes but never completes a frame — the exact wedge that could
+        freeze capture for hours), give up and return None so the caller's loop keeps iterating and
+        its stall watchdog can re-hook. Without this bound the inner recv loop spins forever while
+        the socket keeps returning partial data (so it never raises socket.timeout), blocking the
+        whole capture loop invisibly to the stall check at the top of stream_once."""
         op, data, rest = ws_parse_frame(self._buf)
+        deadline = time.monotonic() + max_wait
         while op is None:
+            if time.monotonic() > deadline:
+                return None
             try:
                 chunk = self.sock.recv(65536)
             except socket.timeout:
@@ -279,6 +290,14 @@ class Capture:
         self.buf = {}                      # symbol -> [(epoch, close), ...] still-forming
         self.last_key = {}                 # symbol -> last persisted bar_key
         self.last_sig = {}                 # (engine, symbol) -> last direction (fire on flip)
+        # In-memory write buffers. The frame read loop touches ONLY these (pure memory, as fast as
+        # a bare reader); a separate flusher thread (see _flusher_loop) batches them into SQLite
+        # every ~0.3s. Doing a SQLite write per candle in the read loop (a fresh connection each)
+        # backed the live WC stream up and wedged capture after ~75s — keeping ALL I/O off the read
+        # loop is the no-wedge core. Five-field bars only (no volume/quote-delta widening): the
+        # pending_bars rows match record_bars_batch's existing (ts,o,h,l,c) schema exactly.
+        self.latest = {}                   # symbol -> (close, epoch)  latest tick, coalesced
+        self.pending_bars = {}             # symbol -> [(ts,o,h,l,c), ...]  closed bars awaiting flush
 
     def on_candle(self, cd: dict, arrival: float = None):
         """One parsed candle dict -> live tick + (on bar roll) closed-bar persist + evaluate.
@@ -297,7 +316,7 @@ class Capture:
         if not S.is_es_symbol(sym):
             return                                     # product scope: ES futures only
         close = cd["close"]
-        self.store.record_tick(sym, close, ep)        # live price marker (always)
+        self.latest[sym] = (close, ep)                # in-memory latest tick (flusher persists it)
         self.buf.setdefault(sym, []).append((ep, close))
         key = ep // self.bar_seconds
         prev = self.last_key.get(sym)
@@ -310,11 +329,46 @@ class Capture:
         bars = S.ohlc_bars(ticks, self.bar_seconds)    # closed buckets only
         if bars:
             rows = [((k + 1) * self.bar_seconds, o, h, l, c) for (k, o, h, l, c) in bars]
-            self.store.record_bars(sym, rows)
+            self.pending_bars.setdefault(sym, []).extend(rows)   # queue; flusher persists (no I/O here)
             last_closed = bars[-1][0]
             # keep only ticks of the still-forming bucket (bound memory)
             self.buf[sym] = [(e, c) for (e, c) in ticks if e // self.bar_seconds > last_closed]
-            self._evaluate(sym)
+            # NOTE: engine evaluation is deliberately NOT run here. Running the roster's edge-gate
+            # OOS backtests inline on every bar roll blocked the read loop long enough that the live
+            # WC frame stream backed up and capture wedged after ~75s (the WS itself stays live for
+            # hours). Evaluation now runs on the _evaluator_loop thread (evaluate_all), reading
+            # closed bars back from the store, so the read loop only does fast in-memory buffering.
+
+    def flush(self):
+        """Persist the in-memory write buffers to the store. Runs on the flusher thread, never in
+        the read loop. Coalesces ticks (one write per symbol regardless of how many candles arrived)
+        and batches the queued closed bars, so SQLite I/O is a few writes/sec, not per-candle.
+
+        Bars are unique by ts, so on a batch write failure (record_bars_batch returns -1) they are
+        RE-QUEUED to retry — never silently dropped. Ticks are self-healing: a failed batch just
+        isn't persisted this round; the next candle re-fills self.latest and the next flush retries."""
+        latest = dict(self.latest)                 # copy (don't race on_candle's writes)
+        pend = self.pending_bars
+        self.pending_bars = {}                     # swap out queued bars (single rebind, GIL-atomic)
+        if latest:
+            self.store.record_ticks_batch([(s, c, e) for s, (c, e) in latest.items()])
+        if pend and self.store.record_bars_batch(pend) < 0:
+            for sym, rows in pend.items():
+                self.pending_bars.setdefault(sym, [])[:0] = rows
+
+    def evaluate_all(self):
+        """Evaluate every active symbol's engines from the STORE's closed bars. Runs on the
+        _evaluator_loop thread, decoupled from frame ingestion, so the heavy edge-gate work can
+        never stall live capture. Symbols come from the store, not the read loop, so this path
+        shares no mutable frame state with on_candle."""
+        syms = self.store.symbols()
+        active = (set(syms.get("live", [])) | set(syms.get("liveTicks", []))
+                  | set(syms.get("backtestable", [])))
+        for sym in active:
+            try:
+                self._evaluate(sym)
+            except Exception as exc:  # noqa: BLE001 — one symbol's failure must not stop the rest
+                log.info("evaluate_all: %s failed: %s", sym, exc)
 
     def _evaluate(self, sym: str):
         ohlc = self.store.ohlc(sym)
@@ -407,22 +461,24 @@ class Capture:
 
 
 def stream_once(store: S.Store, *, max_seconds: float = None, stall_seconds: float = None,
-                _ws=None, _clock=time.monotonic) -> dict:
+                shared_cap=None, _ws=None, _clock=time.monotonic) -> dict:
     """Attach to the live WC feed and capture until the connection drops, *max_seconds* elapses,
     or the feed STALLS — no candle parsed within *stall_seconds* (a silently-dead hook). On a
     stall we return with ``stalled=True`` so main() re-hooks on a FRESH attach, which resumes
     candles immediately (this is what keeps the chart LIVE while the buyer stays connected,
     instead of freezing at "connected · quiet"). Never raises — a dropped hook just returns.
 
-    ``_ws`` / ``_clock`` are injection seams for tests; production always builds a real WSClient
-    and uses the monotonic clock."""
+    ``shared_cap`` lets main() reuse ONE Capture across re-hooks so its in-memory buffers (and the
+    flusher/evaluator threads bound to it) persist between attaches; when None (tests) a fresh
+    Capture is built per attach. ``_ws`` / ``_clock`` are injection seams for tests; production
+    always builds a real WSClient and uses the monotonic clock."""
     stall = STALL_SECONDS if stall_seconds is None else stall_seconds
     ws = _ws
     if ws is None:
         page = pick_wc_page(cdp_pages())
         if not page:
             return {"available": False, "reason": "no logged-in WC page on CDP"}
-    cap = Capture(store)
+    cap = shared_cap if shared_cap is not None else Capture(store)
     frames = candles = 0
     t0 = _clock()
     last_candle = t0          # arm the watchdog from attach so a never-starting hook re-hooks too
@@ -480,17 +536,98 @@ def _frame_candle(raw: str):
     return S.parse_candle(payload)
 
 
+# ===========================================================================
+# Reliability threads — keep ALL SQLite I/O and the heavy edge-gate evaluation OFF the frame read
+# loop, and self-heal a silently-wedged daemon. Ported from the live runtime against the generic
+# source roster + the five-field bar schema (no quote-delta / no bltd_parsers).
+# ===========================================================================
+def _store_is_wedged(prev_seen, prev_progress, cur, now, *, stale_after):
+    """PURE wedge decision for the freshness watchdog (unit-tested in isolation). Given the
+    previously-seen newest tick timestamp, the wall-clock when it last advanced, the current newest
+    tick, and *now*, return ``(new_seen, new_progress, wedged)``. ``wedged`` is True only when the
+    store's newest tick has not advanced for *stale_after* seconds — capture is alive enough to be
+    checked but is persisting nothing (blocked recv, dead hook, or failing writes)."""
+    if cur > prev_seen:
+        return cur, now, False
+    return prev_seen, prev_progress, (now - prev_progress > stale_after)
+
+
+def _freshness_watchdog(store_path, *, stale_after=300.0, check_every=15.0):
+    """Self-heal a wedged capture. The in-loop stall watchdog only fires if stream_once's loop is
+    actually iterating — it can't see a blocked recv, a silently-failing store write, or a hook that
+    parses frames but persists nothing. This thread watches GROUND TRUTH instead: the store's newest
+    tick timestamp. If it stops advancing for *stale_after* seconds WHILE the WC feed is reachable,
+    capture is wedged — force-exit so launchd (KeepAlive) respawns a fresh daemon that re-attaches
+    and resumes. Gated on feed_available() so a merely logged-out WC (nothing to wedge) never drives
+    a respawn loop; the first observation seeds the baseline so a fresh start gets grace."""
+    import sqlite3 as _sq
+    last_seen, last_progress = -1, time.time()
+    while True:
+        time.sleep(check_every)
+        try:
+            cx = _sq.connect(store_path, timeout=2)
+            row = cx.execute("SELECT max(recorded) FROM wc_live").fetchone()
+            cx.close()
+            cur = (row[0] or 0) if row else 0
+        except Exception:  # noqa: BLE001
+            continue
+        last_seen, last_progress, wedged = _store_is_wedged(
+            last_seen, last_progress, cur, time.time(), stale_after=stale_after)
+        if wedged and feed_available():
+            # os._exit fires even when the main thread is hard-blocked; launchd KeepAlive respawns
+            # a fresh daemon that re-attaches. Only trips when the feed IS reachable but the store
+            # stopped advancing — i.e. a real wedge, not a logged-out session.
+            log.warning("capture: store not advancing for %.0fs while feed reachable — exiting so "
+                        "launchd respawns a fresh capture", time.time() - last_progress)
+            os._exit(1)
+
+
+def _evaluator_loop(cap, *, every=8.0):
+    """Run the signal engines off the capture read loop, every *every* seconds. Decoupling the
+    edge-gate evaluation from frame ingestion is what lets a single WS attach stream indefinitely
+    instead of wedging after ~75s under the old design that ran the engines inline in _roll."""
+    while True:
+        time.sleep(every)
+        try:
+            cap.evaluate_all()
+        except Exception as exc:  # noqa: BLE001
+            log.info("evaluator loop: %s", exc)
+
+
+def _flusher_loop(cap, *, every=0.3):
+    """Persist the read loop's in-memory tick/bar buffers every *every* seconds. Keeping ALL SQLite
+    I/O here (off the frame read loop) is what lets capture keep pace with the live WS indefinitely
+    — the read loop only touches memory, as fast as a bare reader."""
+    while True:
+        time.sleep(every)
+        try:
+            cap.flush()
+        except Exception as exc:  # noqa: BLE001
+            log.info("flusher: %s", exc)
+
+
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     store = S.Store(S.default_store_path())
     log.info("capture: own store at %s; CDP :%d; edge_gate=%s", store.path, CDP_PORT, EDGE_GATE)
+    # ONE shared Capture across re-hooks: the frame read loop fills its in-memory tick/bar buffers
+    # (PURE MEMORY); the flusher thread drains them to SQLite and the evaluator thread runs the
+    # edge-gated engines off the read loop. The read loop NEVER touches SQLite — that's the no-wedge
+    # core. The freshness watchdog force-exits a silently-wedged daemon so launchd respawns it.
+    cap = Capture(store)
+    threading.Thread(target=_freshness_watchdog, args=(store.path,), daemon=True).start()
+    threading.Thread(target=_flusher_loop, args=(cap,), daemon=True).start()
+    # Source keeps capture as the fire generator (no separate evaluator process), so the evaluator
+    # runs by default; set BLTD_CAPTURE_ENGINES=0 to capture data only without firing.
+    if os.environ.get("BLTD_CAPTURE_ENGINES", "1") != "0":
+        threading.Thread(target=_evaluator_loop, args=(cap,), daemon=True).start()
     while True:
         if not ensure_chrome():
             log.info("capture: WC not reachable on CDP :%d — the product's debug Chrome is "
                      "open; sign into YOUR WealthCharts there (gated, never faked)", CDP_PORT)
             time.sleep(5)
             continue
-        r = stream_once(store)
+        r = stream_once(store, shared_cap=cap)
         log.info("capture: %s", r)
         time.sleep(2)
 
