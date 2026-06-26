@@ -16,6 +16,7 @@ struct Bar: Identifiable, Codable, Hashable {
     var low: Double
     var close: Double
     var volume: Double = 0
+    var delta: Double = 0      // order-flow delta: quote-rule buy vol − sell vol over the bar
 }
 
 // CSV import for bars: accepts `date,open,high,low,close[,volume]` with a header row optional.

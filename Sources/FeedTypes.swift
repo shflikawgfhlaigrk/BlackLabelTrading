@@ -144,7 +144,8 @@ enum FeedBars {
             // guarantees this, but we never trust a row enough to draw an impossible candle.
             let hi = max(h, max(o, c)), lo = min(l, min(o, c))
             let vol = r.count >= 6 ? (num(r[5]) ?? 0) : 0   // real WC bar volume (0 on legacy rows)
-            out.append(Bar(date: Date(timeIntervalSince1970: ts), open: o, high: hi, low: lo, close: c, volume: vol))
+            let dlt = r.count >= 7 ? (num(r[6]) ?? 0) : 0   // order-flow delta (0 on legacy rows)
+            out.append(Bar(date: Date(timeIntervalSince1970: ts), open: o, high: hi, low: lo, close: c, volume: vol, delta: dlt))
         }
         return out.sorted { $0.date < $1.date }
     }

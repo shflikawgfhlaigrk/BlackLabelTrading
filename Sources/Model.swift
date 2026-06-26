@@ -184,12 +184,13 @@ struct SignalInputs: Codable {
 // ─────────────────────────────────────────────────────────────────────────────
 // Live factor engine — auto-computes factor raw scores [-1,1] from the buyer's OWN
 // captured ES data + real edge-gated fire journal. HONEST BY CONSTRUCTION: a factor is
-// present ONLY when it has a real source. The capture stores OHLC close prices only (no
-// volume, no order-flow), so factors needing volume (VWAP, Volume), order-flow delta
-// (CVD Divergence/Flow, VPIN), or a correlated asset (SMT) have NO input and are simply
-// absent (→ contribute 0, shown as "no live data"). Nothing is fabricated or estimated.
+// present ONLY when it has a real source; the rest stay absent (→ 0, "no live data").
+// Nothing is fabricated or estimated.
 //   • From close prices: Trend, Momentum, StepGMA, HMM-regime, Session.
-//   • From the real fire journal: Alpha Monitor (net live edge direction).
+//   • From real bar volume (WC cq): Volume, VWAP.
+//   • From real order-flow delta (WC bid/ask + prints, Lee-Ready): CVD Flow, CVD Divergence, VPIN.
+//   • From the real fire journal: Alpha Monitor.
+//   • Still no source (absent): SMT — needs a correlated asset (e.g. NQ) on the buyer's WC.
 struct LiveFactorSnapshot {
     var factors: [String: Double] = [:]
     var available: Set<String> = []
@@ -259,6 +260,22 @@ enum LiveFactorEngine {
         // Session — time-of-day edge (US index prime hours), signed by short-term momentum.
         if let r = Indicators.rsi(closes, 14).compactMap({ $0 }).last {
             put(.session, clamp(sessionQuality(now) * ((r - 50) / 50)))
+        }
+        // CVD family — from REAL per-bar order-flow delta (quote-rule buy − sell volume), captured
+        // from WC's bid/ask quotes + prints. Present only once the buyer's bars actually carry delta.
+        let win = min(20, bars.count)
+        let recentBars = bars.suffix(win)
+        let cumVol = recentBars.reduce(0.0) { $0 + $1.volume }
+        let cumDelta = recentBars.reduce(0.0) { $0 + $1.delta }
+        if cumVol > 0 && recentBars.contains(where: { $0.delta != 0 }) {
+            let flow = cumDelta / cumVol
+            put(.cvdFlow, clamp(flow))                                    // net aggressive buy/sell pressure
+            let toxicity = recentBars.reduce(0.0) { $0 + abs($1.delta) } / cumVol
+            put(.vpin, clamp(toxicity * (cumDelta >= 0 ? 1 : -1)))        // order-flow toxicity, signed
+            if let c0 = recentBars.first?.close, let cN = recentBars.last?.close {
+                let priceDir = max(-1.0, min(1.0, (cN - c0) / (A * 2)))
+                put(.cvdDivergence, clamp(flow - priceDir))              // order flow vs price disagreement
+            }
         }
         // Alpha Monitor — net direction of the buyer's REAL edge-gated fires, scaled by how much
         // live edge is actually firing. A pure read of the real signal journal; no fabrication.
