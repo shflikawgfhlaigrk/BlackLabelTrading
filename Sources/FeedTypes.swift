@@ -143,7 +143,8 @@ enum FeedBars {
             // Defensive geometry: high must be the max, low the min — the store already
             // guarantees this, but we never trust a row enough to draw an impossible candle.
             let hi = max(h, max(o, c)), lo = min(l, min(o, c))
-            out.append(Bar(date: Date(timeIntervalSince1970: ts), open: o, high: hi, low: lo, close: c, volume: 0))
+            let vol = r.count >= 6 ? (num(r[5]) ?? 0) : 0   // real WC bar volume (0 on legacy rows)
+            out.append(Bar(date: Date(timeIntervalSince1970: ts), open: o, high: hi, low: lo, close: c, volume: vol))
         }
         return out.sorted { $0.date < $1.date }
     }
