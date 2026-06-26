@@ -85,11 +85,9 @@ struct SignalsScreen: View {
     @EnvironmentObject var wc: WealthChartsStore
     @EnvironmentObject var feed: FeedClient
     @State private var inp = SignalInputs()
-    @State private var scenarioIdx = 0
     @State private var committed = false
-    @State private var priceStr = "5000"
-    @State private var atrStr = "12"
-    @State private var pvStr = "50"
+    @State private var live = LiveFactorSnapshot()
+    @State private var factorsLoading = false
     @State private var showConnectWC = false
     // Backend engine fleet (real per-engine OOS verdicts on the buyer's own captured bars) + the
     // real edge-gated fire journal. Empty until the buyer's WC feed has captured bars — honest.
@@ -107,9 +105,9 @@ struct SignalsScreen: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
                 HStack(alignment: .top) {
-                    ScreenTitle(title: "Signals", subtitle: "Scenario scoring — not a live broker feed. 12 modules · 13 risk gates · 2-of-8 multi-TF consensus · direction lock.", icon: "dot.radiowaves.left.and.right")
+                    ScreenTitle(title: "Signals", subtitle: "Live factor scoring from your own captured ES bars · 12 modules · 13 risk gates · 2-of-8 multi-TF consensus · direction lock.", icon: "dot.radiowaves.left.and.right")
                     Spacer()
-                    StatusPill(text: "Scenario", tint: BLTheme.blue)
+                    StatusPill(text: live.hasData ? "Live" : "Awaiting feed", tint: live.hasData ? BLTheme.green : BLTheme.gold)
                 }
 
                 // Reachable WealthCharts entry point from the main dashboard (also in Settings).
@@ -146,23 +144,24 @@ struct SignalsScreen: View {
 
                 // Two-column: factor controls | factor breakdown.
                 HStack(alignment: .top, spacing: 16) {
-                    Panel(title: "Factor inputs", icon: "slider.horizontal.3") {
-                        HStack(spacing: 10) {
-                            Field(title: "Symbol", text: $inp.symbol, prompt: "ES")
-                            Field(title: "Price", text: $priceStr, prompt: "5000")
+                    Panel(title: "Live factors", icon: "antenna.radiowaves.left.and.right",
+                          accent: live.hasData ? BLTheme.green : BLTheme.gold) {
+                        if live.hasData {
+                            HStack(spacing: 10) {
+                                Stat(label: "Symbol", value: "ES")
+                                Stat(label: "Price", value: TradeMath.num(live.price ?? 0))
+                                Stat(label: "ATR", value: TradeMath.num(live.atr ?? 0))
+                            }
+                            Text("Auto-computed from your captured bars · \(live.available.count)/\(SignalFactor.allCases.count) factors have a live source")
+                                .font(.system(size: 10.5, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+                                .fixedSize(horizontal: false, vertical: true)
+                            Divider().background(BLTheme.stroke).padding(.vertical, 2)
+                            ForEach(SignalFactor.allCases) { f in liveFactorRow(f) }
+                        } else {
+                            EmptyState(icon: "antenna.radiowaves.left.and.right",
+                                       title: factorsLoading ? "Reading your live bars…" : "Awaiting your WealthCharts feed",
+                                       hint: "Factors compute automatically once your own captured ES bars are available (≥\(LiveFactorEngine.minBars) bars). Read-only by design — nothing is shown until it's real.")
                         }
-                        HStack(spacing: 10) {
-                            Field(title: "ATR", text: $atrStr, prompt: "12")
-                            Field(title: "$/point", text: $pvStr, prompt: "50")
-                        }
-                        Divider().background(BLTheme.stroke).padding(.vertical, 2)
-                        ForEach(SignalFactor.allCases) { f in
-                            FactorSlider(label: f.rawValue, value: factorBinding(f))
-                        }
-                        HStack(spacing: 8) {
-                            GhostButton(label: "Reset", icon: "arrow.counterclockwise") { resetFactors() }
-                            GhostButton(label: "Next scenario", icon: "forward.fill", tint: BLTheme.gold) { stepScenario() }
-                        }.padding(.top, 4)
                     }
                     .frame(maxWidth: .infinity)
 
@@ -210,11 +209,13 @@ struct SignalsScreen: View {
             }
             .padding(24)
         }
-        .onAppear { syncFromInputs() }
-        .onChange(of: priceStr) { _ in pushNumbers() }
-        .onChange(of: atrStr) { _ in pushNumbers() }
-        .onChange(of: pvStr) { _ in pushNumbers() }
-        .task { await loadFleet() }
+        .task {
+            await loadFleet()
+            while !Task.isCancelled {
+                await refreshLive()
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+            }
+        }
         .sheet(isPresented: $showConnectWC) { ConnectWealthChartsSheet().environmentObject(wc).sheetCloseBar() }
     }
 
@@ -466,28 +467,42 @@ struct SignalsScreen: View {
         }
     }
 
-    // Bindings & helpers.
-    private func factorBinding(_ f: SignalFactor) -> Binding<Double> {
-        Binding(get: { inp.factors[f.rawValue] ?? 0 },
-                set: { inp.factors[f.rawValue] = $0 })
-    }
-    private func syncFromInputs() {
-        priceStr = TradeMath.numTrim(inp.price); atrStr = TradeMath.numTrim(inp.atr); pvStr = TradeMath.numTrim(inp.pointValue)
-    }
-    private func pushNumbers() {
-        inp.price = Double(priceStr) ?? inp.price
-        inp.atr = Double(atrStr) ?? inp.atr
-        inp.pointValue = Double(pvStr) ?? inp.pointValue
-    }
-    private func resetFactors() {
-        withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
-            for f in SignalFactor.allCases { inp.factors[f.rawValue] = 0 }
+    // Live factor loading — pulls the buyer's own recent ES bars and auto-computes every factor
+    // that has a real source. Read-only by design; the buyer never edits these. Honest empties on
+    // a cold store (no bars → nothing shown, never fabricated).
+    private func refreshLive() async {
+        if live.bars == 0 { factorsLoading = true }
+        let bars = await feed.recentBars(symbol: "ES")
+        let snap = LiveFactorEngine.compute(bars: bars, now: Date())
+        await MainActor.run {
+            live = snap
+            factorsLoading = false
+            inp.symbol = "ES"
+            if let p = snap.price { inp.price = p }
+            if let a = snap.atr { inp.atr = a }
+            inp.pointValue = 50                 // ES = $50/pt (contract spec, not user input)
+            inp.factors = snap.factors          // unavailable factors absent → contribute 0
         }
     }
-    private func stepScenario() {
-        scenarioIdx = (scenarioIdx + 1) % SignalEngine.scenarios.count
-        withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) { inp = SignalEngine.scenarios[scenarioIdx].inputs }
-        syncFromInputs()
+
+    // Read-only live factor row — the live raw score, or an honest "no live data" tag for factors
+    // that need order-flow / correlated-asset data the OHLCV store doesn't carry.
+    @ViewBuilder private func liveFactorRow(_ f: SignalFactor) -> some View {
+        let v = live.factors[f.rawValue]
+        HStack(spacing: 10) {
+            Image(systemName: f.icon).font(.system(size: 11, weight: .bold)).foregroundColor(v != nil ? BLTheme.gold : BLTheme.sub).frame(width: 18)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(f.rawValue).font(.system(size: 12.5, weight: .semibold, design: .rounded)).foregroundColor(BLTheme.text)
+                Text("w \(String(format: "%.0f%%", f.weight*100)) · \(f.blurb)").font(.system(size: 10, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub).lineLimit(1)
+            }
+            Spacer()
+            if let v = v {
+                Text(String(format: "%+.2f", v)).font(.system(size: 13, weight: .bold, design: .rounded)).monospacedDigit()
+                    .foregroundColor(v > 0.05 ? BLTheme.green : (v < -0.05 ? BLTheme.red : BLTheme.sub))
+            } else {
+                Text("no live data").font(.system(size: 10, weight: .heavy, design: .rounded)).foregroundColor(BLTheme.sub.opacity(0.8))
+            }
+        }
     }
 }
 

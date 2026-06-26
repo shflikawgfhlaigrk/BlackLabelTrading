@@ -167,7 +167,10 @@ struct SignalResult {
     var rewardDollars: Double { rewardPoints * pointValue }
 }
 
-// User-adjustable inputs. Each factor raw score is in [-1, 1].
+// Signal inputs. Each factor raw score is in [-1, 1] — now AUTO-COMPUTED live by
+// LiveFactorEngine from the buyer's own captured ES bars (no longer hand-entered).
+// Factors with no live source (order-flow CVD/VPIN, correlated-asset SMT, alpha-decay)
+// are simply absent → contribute 0 and render as "no live data".
 struct SignalInputs: Codable {
     var symbol: String = "ES"
     var price: Double = 5000
@@ -176,6 +179,97 @@ struct SignalInputs: Codable {
     var factors: [String: Double] = SignalFactor.allCases.reduce(into: [:]) { $0[$1.rawValue] = 0 }
 
     func raw(_ f: SignalFactor) -> Double { factors[f.rawValue] ?? 0 }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Live factor engine — auto-computes factor raw scores [-1,1] from the buyer's OWN
+// captured ES bars (OHLCV). HONEST BY CONSTRUCTION: a factor is present ONLY when it
+// has a real source in the data. Factors that need order-flow (CVD Divergence/Flow,
+// VPIN), a correlated asset (SMT), or a live alpha-decay metric have no source in an
+// OHLCV-only / ES-only store, so they are simply absent (→ contribute 0, shown as
+// "no live data"). Nothing is fabricated; the buyer never hand-enters factors.
+struct LiveFactorSnapshot {
+    var factors: [String: Double] = [:]
+    var available: Set<String> = []
+    var price: Double? = nil
+    var atr: Double? = nil
+    var asOf: Date? = nil
+    var bars: Int = 0
+    var hasData: Bool { bars >= LiveFactorEngine.minBars && price != nil && !available.isEmpty }
+}
+
+enum LiveFactorEngine {
+    static let minBars = 50
+
+    static func compute(bars: [Bar], now: Date) -> LiveFactorSnapshot {
+        var s = LiveFactorSnapshot()
+        s.bars = bars.count
+        guard bars.count >= minBars, let last = bars.last else { return s }
+        let closes = bars.map(\.close)
+        s.price = last.close
+        s.asOf = last.date
+        let atr = Indicators.atr(bars, 14).compactMap { $0 }.last
+            ?? max(0.01, bars.suffix(14).map { $0.high - $0.low }.reduce(0, +) / 14)
+        let A = max(0.01, atr)
+        s.atr = A
+        func clamp(_ x: Double) -> Double { max(-1, min(1, x)) }
+        func put(_ f: SignalFactor, _ v: Double) { s.factors[f.rawValue] = v; s.available.insert(f.rawValue) }
+
+        // VWAP — distance of price from session VWAP, in ATRs.
+        if let vw = ChartIndicators.vwap(bars, window: min(bars.count, 30)).compactMap({ $0 }).last {
+            put(.vwap, clamp((last.close - vw) / (A * 2)))
+        }
+        // Volume — participation vs 20-bar average, signed by the bar's direction.
+        let recentVol = bars.map(\.volume).suffix(20)
+        if recentVol.reduce(0, +) > 0 {
+            let avg = recentVol.reduce(0, +) / Double(recentVol.count)
+            if avg > 0 {
+                let dir = (last.close - last.open) >= 0 ? 1.0 : -1.0
+                put(.volume, clamp(dir * ((last.volume / avg) - 1.0)))
+            }
+        }
+        // Trend — fast vs slow EMA, in ATRs.
+        if let ef = Indicators.ema(closes, 20).compactMap({ $0 }).last,
+           let es = Indicators.ema(closes, 50).compactMap({ $0 }).last {
+            put(.trend, clamp((ef - es) / (A * 1.5)))
+        }
+        // Momentum — RSI(14) mapped to [-1,1].
+        if let r = Indicators.rsi(closes, 14).compactMap({ $0 }).last {
+            put(.momentum, clamp((r - 50) / 50))
+        }
+        // StepGMA — Guppy multi-EMA alignment (fast pack vs slow pack), in ATRs.
+        let fastP = [3, 5, 8, 10, 12, 15], slowP = [30, 35, 40, 45, 50, 60]
+        let fastE = fastP.compactMap { Indicators.ema(closes, $0).compactMap { $0 }.last }
+        let slowE = slowP.compactMap { Indicators.ema(closes, $0).compactMap { $0 }.last }
+        if fastE.count == fastP.count, slowE.count == slowP.count {
+            let af = fastE.reduce(0, +) / Double(fastE.count)
+            let al = slowE.reduce(0, +) / Double(slowE.count)
+            put(.stepGMA, clamp((af - al) / (A * 1.5)))
+        }
+        // HMM Regime — Kaufman efficiency ratio (trend vs chop), signed by net move. Labeled proxy.
+        let n = min(20, closes.count - 1)
+        if n > 1 {
+            let seg = Array(closes.suffix(n + 1))
+            let net = seg.last! - seg.first!
+            let path = zip(seg.dropFirst(), seg).map { abs($0 - $1) }.reduce(0, +)
+            if path > 0 { put(.hmmRegime, clamp(abs(net) / path * (net >= 0 ? 1 : -1))) }
+        }
+        // Session — time-of-day edge (US index prime hours), signed by short-term momentum.
+        if let r = Indicators.rsi(closes, 14).compactMap({ $0 }).last {
+            put(.session, clamp(sessionQuality(now) * ((r - 50) / 50)))
+        }
+        return s
+    }
+
+    // 0…1 session quality: RTH prime hours score highest, overnight lowest. New York (ET).
+    static func sessionQuality(_ date: Date) -> Double {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(identifier: "America/New_York") ?? cal.timeZone
+        let mins = cal.component(.hour, from: date) * 60 + cal.component(.minute, from: date)
+        if (mins >= 570 && mins < 660) || (mins >= 840 && mins < 960) { return 1.0 } // 9:30–11:00, 14:00–16:00 ET
+        if mins >= 570 && mins < 960 { return 0.6 }                                    // midday RTH
+        return 0.2                                                                     // overnight / globex
+    }
 }
 
 enum SignalEngine {
