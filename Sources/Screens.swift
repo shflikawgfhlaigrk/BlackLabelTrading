@@ -472,8 +472,16 @@ struct SignalsScreen: View {
     // a cold store (no bars → nothing shown, never fabricated).
     private func refreshLive() async {
         if live.bars == 0 { factorsLoading = true }
-        let bars = await feed.recentBars(symbol: "ES")
-        let snap = LiveFactorEngine.compute(bars: bars, fires: backendFires, now: Date())
+        await feed.refreshStatus()                          // populate feed.symbols + live state
+        // The live ES contract is whatever the buyer's feed is streaming (e.g. CM.ESU6) — never a
+        // hardcoded root. No live symbol yet → honest empty (nothing computes until real bars exist).
+        guard let esSym = feed.symbols.live.first ?? feed.symbols.busiest ?? feed.symbols.liveTicks.first else {
+            await MainActor.run { live = LiveFactorSnapshot(); factorsLoading = false }
+            return
+        }
+        let bars = await feed.recentBars(symbol: esSym)
+        let nqBars = await feed.recentBars(symbol: nqSymbol(for: esSym))   // SMT reference (NQ micro)
+        let snap = LiveFactorEngine.compute(bars: bars, nqBars: nqBars, fires: backendFires, now: Date())
         await MainActor.run {
             live = snap
             factorsLoading = false
@@ -483,6 +491,13 @@ struct SignalsScreen: View {
             inp.pointValue = 50                 // ES = $50/pt (contract spec, not user input)
             inp.factors = snap.factors          // unavailable factors absent → contribute 0
         }
+    }
+
+    // Map the live ES contract to its matching-expiry NQ micro for SMT (e.g. CM.ESU6 -> CM.MNQU6).
+    // NQ is a correlated REFERENCE only — the product stays ES-only for signals.
+    private func nqSymbol(for es: String) -> String {
+        if let r = es.range(of: "ES") { return es.replacingCharacters(in: r, with: "MNQ") }
+        return es
     }
 
     // Read-only live factor row — the live raw score, or an honest "no live data" tag for factors

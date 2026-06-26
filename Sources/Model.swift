@@ -204,7 +204,7 @@ struct LiveFactorSnapshot {
 enum LiveFactorEngine {
     static let minBars = 50
 
-    static func compute(bars: [Bar], fires: [FireRow], now: Date) -> LiveFactorSnapshot {
+    static func compute(bars: [Bar], nqBars: [Bar], fires: [FireRow], now: Date) -> LiveFactorSnapshot {
         var s = LiveFactorSnapshot()
         s.bars = bars.count
         guard bars.count >= minBars, let last = bars.last else { return s }
@@ -275,6 +275,16 @@ enum LiveFactorEngine {
             if let c0 = recentBars.first?.close, let cN = recentBars.last?.close {
                 let priceDir = max(-1.0, min(1.0, (cN - c0) / (A * 2)))
                 put(.cvdDivergence, clamp(flow - priceDir))              // order flow vs price disagreement
+            }
+        }
+        // SMT — smart-money correlated-asset divergence: ES vs NQ relative-return disagreement,
+        // from the buyer's OWN captured NQ micro series. Absent if NQ isn't captured.
+        if bars.count >= 10, nqBars.count >= 10 {
+            let m = min(min(20, bars.count), nqBars.count)
+            let esC = bars.suffix(m).map(\.close), nqC = nqBars.suffix(m).map(\.close)
+            if let e0 = esC.first, let eN = esC.last, let q0 = nqC.first, let qN = nqC.last, e0 != 0, q0 != 0 {
+                let esRet = (eN - e0) / e0, nqRet = (qN - q0) / q0
+                put(.smt, clamp((esRet - nqRet) * 1000))   // ES relative strength vs NQ (~0.1% rel = full)
             }
         }
         // Alpha Monitor — net direction of the buyer's REAL edge-gated fires, scaled by how much
