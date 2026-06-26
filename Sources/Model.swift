@@ -183,11 +183,13 @@ struct SignalInputs: Codable {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Live factor engine — auto-computes factor raw scores [-1,1] from the buyer's OWN
-// captured ES bars (OHLCV). HONEST BY CONSTRUCTION: a factor is present ONLY when it
-// has a real source in the data. Factors that need order-flow (CVD Divergence/Flow,
-// VPIN), a correlated asset (SMT), or a live alpha-decay metric have no source in an
-// OHLCV-only / ES-only store, so they are simply absent (→ contribute 0, shown as
-// "no live data"). Nothing is fabricated; the buyer never hand-enters factors.
+// captured ES data + real edge-gated fire journal. HONEST BY CONSTRUCTION: a factor is
+// present ONLY when it has a real source. The capture stores OHLC close prices only (no
+// volume, no order-flow), so factors needing volume (VWAP, Volume), order-flow delta
+// (CVD Divergence/Flow, VPIN), or a correlated asset (SMT) have NO input and are simply
+// absent (→ contribute 0, shown as "no live data"). Nothing is fabricated or estimated.
+//   • From close prices: Trend, Momentum, StepGMA, HMM-regime, Session.
+//   • From the real fire journal: Alpha Monitor (net live edge direction).
 struct LiveFactorSnapshot {
     var factors: [String: Double] = [:]
     var available: Set<String> = []
@@ -201,7 +203,7 @@ struct LiveFactorSnapshot {
 enum LiveFactorEngine {
     static let minBars = 50
 
-    static func compute(bars: [Bar], now: Date) -> LiveFactorSnapshot {
+    static func compute(bars: [Bar], fires: [FireRow], now: Date) -> LiveFactorSnapshot {
         var s = LiveFactorSnapshot()
         s.bars = bars.count
         guard bars.count >= minBars, let last = bars.last else { return s }
@@ -257,6 +259,16 @@ enum LiveFactorEngine {
         // Session — time-of-day edge (US index prime hours), signed by short-term momentum.
         if let r = Indicators.rsi(closes, 14).compactMap({ $0 }).last {
             put(.session, clamp(sessionQuality(now) * ((r - 50) / 50)))
+        }
+        // Alpha Monitor — net direction of the buyer's REAL edge-gated fires, scaled by how much
+        // live edge is actually firing. A pure read of the real signal journal; no fabrication.
+        let recentFires = fires.prefix(12)
+        if !recentFires.isEmpty {
+            let longs = recentFires.filter { $0.direction.lowercased() == "long" }.count
+            let shorts = recentFires.filter { $0.direction.lowercased() == "short" }.count
+            let net = Double(longs - shorts) / Double(recentFires.count)
+            let density = min(1.0, Double(recentFires.count) / 8.0)
+            put(.alphaMonitor, clamp(net * density))
         }
         return s
     }

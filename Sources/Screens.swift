@@ -473,7 +473,7 @@ struct SignalsScreen: View {
     private func refreshLive() async {
         if live.bars == 0 { factorsLoading = true }
         let bars = await feed.recentBars(symbol: "ES")
-        let snap = LiveFactorEngine.compute(bars: bars, now: Date())
+        let snap = LiveFactorEngine.compute(bars: bars, fires: backendFires, now: Date())
         await MainActor.run {
             live = snap
             factorsLoading = false
