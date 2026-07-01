@@ -75,15 +75,30 @@ echo "==> SDK: $SDK"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
-# --- compile (hardened-runtime compatible) ---
-echo "==> Compiling Sources/*.swift"
+# --- compile universal2 (arm64 + x86_64 -> lipo). Trading now ships a TRUE universal2 app: the Swift
+# binary AND the bundled CPython runtime (vendor/python-runtime) are both universal2, so it runs
+# natively on Apple Silicon AND Intel. (2026-07-01: arm64-only binary + arm64-only vendored Python
+# locked Intel buyers out; vendored a lipo-merged universal2 CPython 3.11.15 from the free
+# python-build-standalone project, so the whole app is universal.) ---
+echo "==> Compiling Sources/*.swift (universal2: arm64 + x86_64)"
 SWIFT_FILES=( "$SRC"/*.swift )
-xcrun --sdk macosx swiftc \
-  -O -sdk "$SDK" -target arm64-apple-macosx13.0 \
-  -framework SwiftUI -framework AppKit -framework Charts \
-  -framework AuthenticationServices -framework CryptoKit -framework UserNotifications -framework LocalAuthentication \
-  -o "$APP/Contents/MacOS/$BIN_NAME" \
-  "${SWIFT_FILES[@]}"
+TRD_FRAMEWORKS=( -framework SwiftUI -framework AppKit -framework Charts
+  -framework AuthenticationServices -framework CryptoKit -framework UserNotifications -framework LocalAuthentication )
+build_trd_arch () {
+  local arch="$1"
+  echo "==> Compiling ${arch} (deployment target macOS 13.0)"
+  xcrun --sdk macosx swiftc \
+    -O -sdk "$SDK" -target "${arch}-apple-macosx13.0" \
+    "${TRD_FRAMEWORKS[@]}" \
+    -o "$BUILD/$BIN_NAME-${arch}" \
+    "${SWIFT_FILES[@]}"
+}
+build_trd_arch arm64
+build_trd_arch x86_64
+echo "==> lipo -> universal"
+lipo -create "$BUILD/$BIN_NAME-arm64" "$BUILD/$BIN_NAME-x86_64" -output "$APP/Contents/MacOS/$BIN_NAME"
+rm -f "$BUILD/$BIN_NAME-arm64" "$BUILD/$BIN_NAME-x86_64"
+lipo -archs "$APP/Contents/MacOS/$BIN_NAME"
 
 # --- Info.plist ---
 cat > "$APP/Contents/Info.plist" <<PLIST
