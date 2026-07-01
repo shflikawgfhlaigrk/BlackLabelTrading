@@ -179,6 +179,29 @@ if [ -n "$STRAY" ]; then echo "FAIL: data files in bundle (must ship EMPTY):" >&
 # --deep signs the nested launcher script's resources too. --options runtime = hardened runtime,
 # required for notarization. --timestamp is used for a Developer ID identity (notary needs a secure
 # timestamp); ad-hoc skips it.
+# Sign every nested Mach-O in the bundled Python runtime FIRST (inside-out). Apple's `--deep` does
+# NOT reliably reach a bundled interpreter's many binaries (bin/python3.11 + hundreds of .so/.dylib),
+# and notarization REJECTS any unsigned nested code (2026-07-01: a freshly lipo'd universal2 CPython
+# was unsigned -> "The binary is not signed"). Each leaf gets hardened runtime + the same entitlements
+# (disable-library-validation lets python3.11 load the .so set).
+if [ "$SIGN_MODE" = "developerid" ]; then
+  SIGN_ID="$IDENTITY"; TS_FLAG="--timestamp"
+else
+  SIGN_ID="-"; TS_FLAG="--timestamp=none"
+fi
+RT="$APP/Contents/Resources/backend/python-runtime"
+if [ -d "$RT" ]; then
+  echo "==> Signing bundled python-runtime Mach-O (inside-out)"
+  # shellcheck disable=SC2038
+  find "$RT" -type f \( -name '*.so' -o -name '*.dylib' -o -name 'python3*' \) -print0 \
+    | while IFS= read -r -d '' f; do
+        if file "$f" | grep -q 'Mach-O'; then
+          codesign --force --options runtime $TS_FLAG --entitlements "$ENTS" --sign "$SIGN_ID" "$f" 2>/dev/null \
+            || { echo "FAIL: could not sign runtime binary $f" >&2; exit 1; }
+        fi
+      done
+fi
+
 echo "==> Signing (hardened runtime, Developer-ID entitlements)"
 if [ "$SIGN_MODE" = "developerid" ]; then
   codesign --force --deep --options runtime --timestamp \
