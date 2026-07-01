@@ -1,11 +1,11 @@
-"""Black Label Trading — the product's OWN local store + WC capture helpers + edge gate.
+"""Black Label Trading — the product's OWN local store + webhook/browser-capture helpers + edge gate.
 
 SELF-CONTAINED. This module is the product's whole data + analysis spine. It has ZERO
 dependency on Michael's Utah/Postgres: the store is a local SQLite database the product owns
 (default ~/Library/Application Support/Black Label Trading/trading.sqlite3), the engines run
-in-process here in pure stdlib Python, and the WC capture (bltd_capture.py) writes the BUYER's
-own bars/ticks/fires into this store. Nothing is baked in — the database starts EMPTY and is
-filled only by the buyer's own WealthCharts feed at runtime.
+in-process here in pure stdlib Python, and webhook/browser capture writes the BUYER's own
+bars/ticks/fires into this store. Nothing is baked in — the database starts EMPTY and is filled
+only by the buyer's own pushed or captured feed at runtime.
 
 - stdlib-only (sqlite3 + json) — no Postgres driver, no utah, no third-party deps.
 - Cold/unreachable store degrades to an honest empty payload, never a crash, never a fabricated
@@ -63,13 +63,26 @@ CONFIG_DEFAULTS = {
     "mrStopMult": 8.0,         # mean-reversion stop in sd multiples
     "mrWinFloor": 0.87,        # mean-reversion OOS win-rate floor to count as edge
     "bkTargetR": 2.0,          # breakout reward:risk target
-    "symbols": ["ES"],         # product scope: ES only; capture/screen ignore all non-ES symbols
-    # risk / prop-firm rules (signals-only — informational, shapes alert sizing, never executes)
+    "fdrQ": 0.10,              # Benjamini–Hochberg false-discovery rate for the screen grid (across
+                              # all engine×symbol cells) so the candidate count isn't inflated by grid size
+    "symbols": [],             # capture filter: EMPTY = accept every in_scope symbol. A non-empty
+                               # list must name the feed's own codes; ["ES"] dropped 100% of
+                               # prop-feed bars (MESU6/CM.ESU6 never string-match "ES").
+    # risk / prop-firm rules. These are ENFORCED execution risk gates when execution is armed+live
+    # (see bltd_exec.RiskGateChain); informational otherwise.
     "accountSize": 50000.0,
     "riskPerTradePct": 1.0,
     "maxDailyLossPct": 3.0,
     "maxTrades": 0,            # 0 = unlimited
     "propFirm": "",            # free-text label of the buyer's prop firm
+    # execution risk params (also enforced by the exec engine). NOTE: arm/mode/kill are NOT here —
+    # they live in a dedicated exec_kv table so a /api/config POST can never flip them on.
+    "execMaxContracts": 0,     # 0 = no execution cap set (engine treats 0 as "no cap configured")
+    "execMaxDrawdown": 0.0,    # $ trailing-drawdown guard vs the real-equity high-water mark
+    # NOTE: per-order confirm is NOT here on purpose. It lived in config and a plain /api/config POST
+    # could flip it off (2026-07-01 audit). It now lives in exec_kv ("confirmEachOrder", default "1")
+    # and can only be disabled through /api/exec/confirmeachorder WITH a fresh OS-auth — same class of
+    # gate as going live. The engine already never consults it for the live path (confirm is mandatory).
     # alert/signal delivery channels (the daemon writes a fire; channels mirror it out)
     "alertSound": True,
     "alertWebhook": "",        # POST each fire as JSON to this URL (e.g. Discord/Slack)
@@ -79,14 +92,17 @@ _CONFIG_RANGES = {
     "lookback": (3, 200), "barSeconds": (1, 3600), "oosFrac": (0.1, 0.9),
     "minTrades": (1, 1000), "mrZ": (0.5, 6.0), "mrTgtFrac": (0.05, 1.0),
     "mrStopMult": (0.5, 50.0), "mrWinFloor": (0.0, 1.0), "bkTargetR": (0.25, 20.0),
+    "fdrQ": (0.001, 1.0),
     "accountSize": (0.0, 1e9), "riskPerTradePct": (0.0, 100.0),
     "maxDailyLossPct": (0.0, 100.0), "maxTrades": (0, 100000),
+    "execMaxContracts": (0, 1000), "execMaxDrawdown": (0.0, 1e9),
 }
 _KNOWN_ENGINES = ("meanrev", "breakout", "research", "momentum", "structure", "regime",
                   "channel", "context_a", "context_b")
 ES_ROOT = "ES"
+MES_ROOT = "MES"  # micro E-mini S&P — the most-traded TopStep instrument; first-class family member
 _ES_MONTH_CODES = "FGHJKMNQUVXZ"
-_ES_CONTRACT_RE = re.compile(rf"^ES[{_ES_MONTH_CODES}]\d{{1,2}}$")
+_ES_CONTRACT_RE = re.compile(rf"^M?ES[{_ES_MONTH_CODES}]\d{{1,2}}$")
 
 
 def normalize_symbol(symbol) -> str:
@@ -105,8 +121,9 @@ def normalize_symbol(symbol) -> str:
 
 
 def is_es_symbol(symbol) -> bool:
+    """ES *family*: ES and MES (micro), root or dated contract."""
     s = normalize_symbol(symbol)
-    return s == ES_ROOT or bool(_ES_CONTRACT_RE.match(s))
+    return s in (ES_ROOT, MES_ROOT) or bool(_ES_CONTRACT_RE.match(s))
 
 
 def es_symbols(symbols) -> list[str]:
@@ -115,6 +132,51 @@ def es_symbols(symbols) -> list[str]:
     for sym in symbols or []:
         raw = str(sym or "").strip()
         if raw and is_es_symbol(raw) and raw not in seen:
+            seen.add(raw)
+            out.append(raw)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# INSTRUMENT SCOPE. The shipped Topstep setup is ES-family only by default. That keeps stale
+# WealthCharts/equity rows from older local stores out of the symbol picker and chart, and it matches
+# the customer-facing setup docs. Developers can still set BLTD_SCOPE=all to exercise the wider
+# parser/feed stack in tests; the release default remains narrow and predictable.
+# ---------------------------------------------------------------------------
+INSTRUMENT_SCOPE = (os.environ.get("BLTD_SCOPE", "es") or "es").strip().lower()
+
+
+def futures_root_any(symbol) -> str:
+    """Futures root of ANY instrument symbol ('CM.ESU6'->'ES', 'MNQU6'->'MNQ', 'EURUSD'->'EURUSD').
+    Used by the execution ledger to net contracts/positions by instrument. Mirrors bltd_exec."""
+    s = normalize_symbol(symbol)
+    if len(s) >= 3 and s[-1].isdigit():
+        i, d = len(s) - 1, 0
+        while i >= 0 and s[i].isdigit():
+            i -= 1; d += 1
+        if 1 <= d <= 2 and i >= 1 and s[i] in _ES_MONTH_CODES:
+            return s[:i]
+    return s
+
+
+def in_scope(symbol) -> bool:
+    """True if this symbol is an instrument the product accepts (stores/charts).
+
+    Release default is ES-family only. The opt-in developer scope 'all' accepts any sane, non-empty
+    normalized symbol for parser/feed tests."""
+    if is_es_symbol(symbol):
+        return True
+    if INSTRUMENT_SCOPE != "all":
+        return False
+    return bool(normalize_symbol(symbol))
+
+
+def scoped_symbols(symbols) -> list[str]:
+    """Dedup of in-scope symbols, order-preserved."""
+    out, seen = [], set()
+    for sym in symbols or []:
+        raw = str(sym or "").strip()
+        if raw and in_scope(raw) and raw not in seen:
             seen.add(raw)
             out.append(raw)
     return out
@@ -410,19 +472,66 @@ def _mr_trades(ohlc, lookback=LOOKBACK, cfg=None):
     return out
 
 
-def _summarize(trades, min_trades=MIN_TRADES):
+# Significance bar for the OOS edge proof. expectancy>0 alone is NOT proof: under a 2:1 target a
+# driftless random walk clears expectancy>0 >50% of the time, so the directional engines would
+# "prove" an edge on pure noise. An edge is proven only if the OOS win-rate SIGNIFICANTLY beats the
+# R-geometry breakeven (one-sided binomial, p<0.05) on a sufficient sample. Verified: this collapses
+# the random-walk false-positive rate from ~55-63% to the ~5% floor; honest engines are unaffected.
+SIG_MIN_N = 30          # minimum OOS trades before significance can be assessed
+SIG_ALPHA = 0.05        # one-sided binomial significance level
+
+
+def _binom_sf(k, n, p):
+    """P(X >= k) for X ~ Binomial(n, p), exact via stdlib. n is the (small) OOS trade count."""
+    if k <= 0:
+        return 1.0
+    return sum(math.comb(n, i) * (p ** i) * ((1.0 - p) ** (n - i)) for i in range(k, n + 1))
+
+
+def _edge_pvalue(trades, wins, n, expectancy, min_trades, target_r=None):
+    """One-sided binomial p-value that the OOS win-rate beats the R-geometry breakeven (1/(1+winR)).
+    Returns 1.0 (no evidence) when the sample is too small / no wins / non-positive expectancy, so
+    a thin or losing series can never look significant. This is the single edge statistic; both the
+    per-test gate and the grid-wide FDR correction derive from it.
+
+    winR is the INTENDED target R, NOT the realized max win — using max() would data-snoop the
+    breakeven downward (one lucky runner lowers the bar and inflates significance). When the caller
+    knows its fixed target we cap at it; for a variable-R engine we use the robust median winning R.
+    For the current fixed-2:1 engines max==median==target so this changes nothing today; it is the
+    guard that keeps the gate honest if an uncapped-R (trailing/runner) engine ever ships."""
+    if n < max(min_trades, SIG_MIN_N) or wins <= 0 or expectancy <= 0:
+        return 1.0
+    win_rs = [t["r"] for t in trades if t["r"] > 0]
+    if not win_rs:
+        return 1.0
+    if target_r is not None and target_r > 0:
+        win_r = min(max(win_rs), float(target_r))   # cap at the intended reward:risk
+    else:
+        win_r = sorted(win_rs)[len(win_rs) // 2]    # robust median for variable-R geometry
+    breakeven = 1.0 / (1.0 + win_r)                  # win-rate needed just to break even at this R
+    return _binom_sf(wins, n, breakeven)
+
+
+def _edge_proven(trades, wins, n, expectancy, min_trades, target_r=None):
+    """Per-test gate: the edge p-value clears SIG_ALPHA. (The screen grid additionally applies a
+    Benjamini–Hochberg FDR correction across all (engine,symbol) cells — see bltd_analytics.screen.)"""
+    return _edge_pvalue(trades, wins, n, expectancy, min_trades, target_r) < SIG_ALPHA
+
+
+def _summarize(trades, min_trades=MIN_TRADES, target_r=None):
     n = len(trades)
     if n == 0:
         return {"trades": 0, "wins": 0, "winRate": 0.0, "expectancyR": 0.0, "netPts": 0.0,
-                "edgeProven": False, "reason": "no trades triggered on this series"}
+                "edgeProven": False, "pEdge": 1.0, "reason": "no trades triggered on this series"}
     rs = [t["r"] for t in trades]
     wins = sum(1 for r in rs if r > 0)
     total_r = sum(rs)
     expectancy = total_r / n
     net_pts = sum((t["exit"] - t["entry"]) if t["dir"] == "long" else (t["entry"] - t["exit"]) for t in trades)
+    p_edge = _edge_pvalue(trades, wins, n, expectancy, min_trades, target_r)
     return {"trades": n, "wins": wins, "winRate": round(wins / n, 4),
             "expectancyR": round(expectancy, 4), "netPts": round(net_pts, 4),
-            "edgeProven": n >= min_trades and expectancy > 0, "reason": ""}
+            "edgeProven": p_edge < SIG_ALPHA, "pEdge": round(p_edge, 6), "reason": ""}
 
 
 def prove_meanrev(ohlc, cfg=None):
@@ -504,7 +613,8 @@ def prove_breakout(ohlc, cfg=None):
     oos_frac = cfg.get("oosFrac", OOS_FRAC)
     min_trades = cfg.get("minTrades", MIN_TRADES)
     split = int(len(ohlc) * (1.0 - oos_frac))
-    s = _summarize(_bk_trades(ohlc[split:], lookback, cfg), min_trades)
+    s = _summarize(_bk_trades(ohlc[split:], lookback, cfg), min_trades,
+                   target_r=cfg.get("bkTargetR", BK_TARGET_R))
     reason = (f"OOS candidate: expectancy {s['expectancyR']:+.3f}R on {s['trades']} trades; live verification required"
               if s["edgeProven"] else
               f"not proven: OOS expectancy {s['expectancyR']:+.3f}R on {s['trades']} trades")
@@ -594,7 +704,8 @@ def _consensus_prove(ohlc, cfg, dir_fn, label):
     lookback = cfg.get("lookback", LOOKBACK)
     min_trades = cfg.get("minTrades", MIN_TRADES)
     split = int(len(ohlc) * (1.0 - oos_frac))
-    s = _summarize(_consensus_engine_trades(ohlc[split:], lookback, cfg, dir_fn), min_trades)
+    s = _summarize(_consensus_engine_trades(ohlc[split:], lookback, cfg, dir_fn), min_trades,
+                   target_r=MO_TARGET_R)   # fixed 2:1 reward:risk — cap so a runner can't snoop it
     reason = (f"OOS candidate: expectancy {s['expectancyR']:+.3f}R / net {s['netPts']:+.2f} pts on {s['trades']} trades; live verification required"
               if s["edgeProven"] else
               f"not proven: OOS expectancy {s['expectancyR']:+.3f}R on {s['trades']} trades")
@@ -918,6 +1029,25 @@ CREATE TABLE IF NOT EXISTS fires (
     synthetic INTEGER NOT NULL DEFAULT 0,
     ts INTEGER NOT NULL
 );
+-- EXECUTION control state (arm/mode/kill/firm/...). Deliberately a SEPARATE table, NOT in the
+-- config blob, so a /api/config POST can never flip arm/mode/kill (set_config only touches config).
+CREATE TABLE IF NOT EXISTS exec_kv (
+    k TEXT PRIMARY KEY,
+    v TEXT
+);
+-- EXECUTION order/decision audit. Every precheck decision (placed or blocked) is recorded here —
+-- the source of truth for trades-today, open paper contracts, dedup, and an honest audit trail.
+CREATE TABLE IF NOT EXISTS exec_orders (
+    client_order_id TEXT PRIMARY KEY,
+    engine TEXT, symbol TEXT, direction TEXT,
+    size INTEGER, route TEXT, reason TEXT,
+    status TEXT,                  -- blocked | paper_working | pending | working | filled | closed | cancelled
+    realized_pnl REAL,           -- set when closed (NULL while open)
+    confirmed INTEGER NOT NULL DEFAULT 0,
+    is_automated INTEGER NOT NULL DEFAULT 1,
+    ts INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS exec_orders_ts ON exec_orders(ts);
 """
 
 LIVE_BAR_WINDOW = 600     # feedLive: a bar recorded in the last 10 min
@@ -940,7 +1070,12 @@ class Store:
 
     def __init__(self, path: str, config_path: str | None = None):
         self.path = path
-        self.config_path = config_path or default_config_path()
+        # Config travels WITH the store: it lives next to the store DB unless an explicit config_path
+        # (or BLTD_CONFIG) is given. In production store+config both sit in the app-support dir, so this
+        # is identical to default_config_path(); for a test/temp store it keeps set_config writes inside
+        # the temp dir instead of clobbering the buyer's real app-support config.json (test isolation).
+        self.config_path = (config_path or os.environ.get("BLTD_CONFIG")
+                            or os.path.join(os.path.dirname(os.path.abspath(path)), "config.json"))
         self._lock = threading.Lock()
         self._edge_cache = {}  # (engine,symbol) -> (expiry, verdict)
         self._ok = False
@@ -994,27 +1129,38 @@ class Store:
         today = int(time.time()) - (int(time.time()) % 86400)  # UTC midnight
         fires_today = self._q("SELECT symbol FROM fires WHERE synthetic=0 AND ts>=?", (today,))
         live_syms = self._q("SELECT DISTINCT symbol FROM bars WHERE ts_recorded>?", (cutoff,))
-        return {"online": self.online(), "feedLive": any(is_es_symbol(s) for (s,) in live_syms),
-                "signalsToday": sum(1 for (s,) in fires_today if is_es_symbol(s))}
+        return {"online": self.online(), "feedLive": any(in_scope(s) for (s,) in live_syms),
+                "signalsToday": sum(1 for (s,) in fires_today if in_scope(s))}
 
     # ---- symbols -------------------------------------------------------
     def symbols(self) -> dict:
-        bt = es_symbols([r[0] for r in self._q(
+        bt = scoped_symbols([r[0] for r in self._q(
             "SELECT symbol FROM bars GROUP BY symbol HAVING count(*)>=40 ORDER BY symbol")])
-        live = es_symbols([r[0] for r in self._q(
+        live = scoped_symbols([r[0] for r in self._q(
             "SELECT DISTINCT symbol FROM bars WHERE ts_recorded>? ORDER BY symbol",
             (int(time.time()) - LIVE_BAR_WINDOW,))])
-        ticks = es_symbols([r[0] for r in self._q(
+        ticks = scoped_symbols([r[0] for r in self._q(
             "SELECT symbol FROM wc_live WHERE recorded>? ORDER BY symbol",
             (int(time.time()) - LIVE_TICK_WINDOW,))])
-        busiest_rows = self._q("SELECT symbol FROM bars GROUP BY symbol ORDER BY count(*) DESC")
-        busiest = next((r[0] for r in busiest_rows if is_es_symbol(r[0])), None)
+        # "busiest" drives the app's default chart symbol, so it must follow what is LIVE right now,
+        # not all-time volume. Otherwise a retired instrument (an old front month carrying a huge
+        # all-time bar count, or a final burst before it stopped) hijacks the default and the app opens
+        # on a dead chart while another symbol is actively trading. Rule: among symbols live right now
+        # (a bar in the last LIVE_BAR_WINDOW), pick the most active; only when nothing is live (market
+        # closed / fresh store) fall back to the all-time leader for backtesting.
+        live_rows = self._q(
+            "SELECT symbol FROM bars WHERE ts_recorded>? GROUP BY symbol ORDER BY count(*) DESC",
+            (int(time.time()) - LIVE_BAR_WINDOW,))
+        busiest = next((r[0] for r in live_rows if in_scope(r[0])), None)
+        if busiest is None:
+            busiest_rows = self._q("SELECT symbol FROM bars GROUP BY symbol ORDER BY count(*) DESC")
+            busiest = next((r[0] for r in busiest_rows if in_scope(r[0])), None)
         return {"backtestable": bt, "live": live, "liveTicks": ticks,
                 "busiest": busiest}
 
     # ---- bars ----------------------------------------------------------
     def bars(self, symbol: str, limit: int, newest: bool) -> dict:
-        if not symbol or not is_es_symbol(symbol):
+        if not symbol or not in_scope(symbol):
             return {"symbol": symbol, "bars": []}
         if newest:
             rows = self._q(
@@ -1029,7 +1175,7 @@ class Store:
     def record_bars(self, symbol: str, rows) -> int:
         """rows: [(ts_epoch, o, h, l, c), ...]. Upsert by (symbol, ts) so overlapping capture
         windows never double-count. Returns count attempted."""
-        if not is_es_symbol(symbol):
+        if not in_scope(symbol):
             return 0
         now = int(time.time())
         seq = [(symbol, int(ts), o, h, l, c, now) for (ts, o, h, l, c) in rows]
@@ -1045,7 +1191,7 @@ class Store:
         """by_symbol: {symbol: [(ts_epoch, o, h, l, c), ...]}.
 
         Batch-shaped companion to record_bars for a future capture flusher. Keeps the current
-        five-field bar schema, filters non-ES symbols before write, and returns -1 if the batch
+        five-field bar schema, filters out-of-scope symbols before write, and returns -1 if the batch
         write fails so callers can requeue instead of dropping source data silently."""
         if not isinstance(by_symbol, dict):
             return 0
@@ -1053,7 +1199,7 @@ class Store:
         seq = []
         try:
             for symbol, rows in by_symbol.items():
-                if not is_es_symbol(symbol):
+                if not in_scope(symbol):
                     continue
                 for (ts, o, h, l, c) in rows or []:
                     seq.append((symbol, int(ts), o, h, l, c, now))
@@ -1069,15 +1215,19 @@ class Store:
 
     # ---- live tick -----------------------------------------------------
     def live_price(self, symbol: str) -> dict:
-        if not symbol or not is_es_symbol(symbol):
+        if not symbol or not in_scope(symbol):
             return {"gated": True}
-        rows = self._q("SELECT price,recorded FROM wc_live WHERE symbol=?", (symbol,))
+        # Recency-gated: a "live" last price must be FRESH (same LIVE_TICK_WINDOW the symbols()
+        # liveTicks set uses). A stale row is gated, never served as the live line — otherwise the
+        # chart would show an hours-old price as live (stale-as-live fabrication).
+        rows = self._q("SELECT price,recorded FROM wc_live WHERE symbol=? AND recorded>?",
+                       (symbol, int(time.time()) - LIVE_TICK_WINDOW))
         if not rows:
             return {"symbol": symbol, "gated": True}
         return {"symbol": symbol, "price": rows[0][0], "ts": float(rows[0][1])}
 
     def record_tick(self, symbol: str, price: float, epoch: int) -> None:
-        if not is_es_symbol(symbol):
+        if not in_scope(symbol):
             return
         self._exec("INSERT INTO wc_live(symbol,price,recorded) VALUES(?,?,?) "
                    "ON CONFLICT(symbol) DO UPDATE SET price=excluded.price,"
@@ -1086,7 +1236,7 @@ class Store:
     def record_ticks_batch(self, items) -> int:
         """items: [{"symbol": sym, "price": px, "epoch": ts}, ...] or [(sym, px, ts), ...].
 
-        Filters non-ES ticks before write and returns -1 on write failure so a future flusher can
+        Filters out-of-scope ticks before write and returns -1 on write failure so a future flusher can
         requeue. The live tick table remains one latest row per symbol, matching record_tick."""
         seq = []
         try:
@@ -1100,7 +1250,7 @@ class Store:
                         symbol, price, epoch = item
                     except (TypeError, ValueError):
                         continue
-                if not is_es_symbol(symbol):
+                if not in_scope(symbol):
                     continue
                 seq.append((symbol, float(price), int(epoch)))
         except (TypeError, ValueError):
@@ -1116,7 +1266,9 @@ class Store:
     # ---- fires ---------------------------------------------------------
     def record_fire(self, engine, direction, entry, symbol=None, stop=None, target=None,
                     rationale=None, synthetic=False) -> int:
-        if symbol is not None and not is_es_symbol(symbol):
+        # Storage gate only — WHETHER to fire is decided upstream by the edge-gate (proven OOS edge
+        # per engine,symbol). in_scope just keeps junk symbols out of the journal.
+        if symbol is not None and not in_scope(symbol):
             return 0
         return self._exec(
             "INSERT INTO fires(engine,direction,entry,symbol,stop,target,rationale,synthetic,ts) "
@@ -1128,7 +1280,7 @@ class Store:
         rows = self._q(
             "SELECT id,engine,direction,entry,symbol,stop,target,rationale,outcome,pnl,ts "
             "FROM fires WHERE synthetic=0 ORDER BY id DESC LIMIT 100")
-        row = next((r for r in rows if is_es_symbol(r[4])), None)
+        row = next((r for r in rows if in_scope(r[4])), None)
         return {"fire": self._fire_dict(row) if row else None}
 
     @staticmethod
@@ -1142,7 +1294,7 @@ class Store:
         """The signal journal: recorded real (non-synthetic) fires, newest first, optionally
         filtered. Each row carries its outcome/pnl if the daemon has graded it. Honest empty on
         a cold store."""
-        if symbol and not is_es_symbol(symbol):
+        if symbol and not in_scope(symbol):
             return {"fires": []}
         where = ["synthetic=0"]
         params: list = []
@@ -1156,13 +1308,13 @@ class Store:
         rows = self._q(
             "SELECT id,engine,direction,entry,symbol,stop,target,rationale,outcome,pnl,ts "
             f"FROM fires WHERE {' AND '.join(where)} ORDER BY id DESC LIMIT ?", tuple(params))
-        return {"fires": [self._fire_dict(r) for r in rows if is_es_symbol(r[4])][:int(limit)]}
+        return {"fires": [self._fire_dict(r) for r in rows if in_scope(r[4])][:int(limit)]}
 
     def journal_stats(self, symbol: str | None = None, engine: str | None = None) -> dict:
         """Performance analytics over the journal of *graded* fires (hypothetical, signals-only).
         Counts only fires the daemon has marked target/stop with a pnl — never invents an outcome
         for an open signal."""
-        if symbol and not is_es_symbol(symbol):
+        if symbol and not in_scope(symbol):
             return {"graded": 0, "wins": 0, "losses": 0, "winRate": 0.0, "netPnl": 0.0,
                     "avgWin": 0.0, "avgLoss": 0.0, "byEngine": {}}
         where = ["synthetic=0", "outcome IS NOT NULL", "pnl IS NOT NULL"]
@@ -1175,7 +1327,7 @@ class Store:
             params.append(engine)
         rows = self._q(
             f"SELECT outcome,pnl,engine,symbol FROM fires WHERE {' AND '.join(where)}", tuple(params))
-        rows = [r for r in rows if is_es_symbol(r[3])]
+        rows = [r for r in rows if in_scope(r[3])]
         n = len(rows)
         if n == 0:
             return {"graded": 0, "wins": 0, "losses": 0, "winRate": 0.0, "netPnl": 0.0,
@@ -1199,7 +1351,7 @@ class Store:
     def ohlc(self, symbol: str, limit: int = 5000):
         """A symbol's bars as [(o,h,l,c), ...] oldest->newest — the engine/gate input. Public so
         the capture daemon can evaluate the live signal off the same series the gate proves."""
-        if not is_es_symbol(symbol):
+        if not in_scope(symbol):
             return []
         rows = self._q("SELECT o,h,l,c FROM bars WHERE symbol=? ORDER BY ts LIMIT ?",
                        (symbol, limit))
@@ -1220,18 +1372,129 @@ class Store:
         self._edge_cache.clear()
         return written
 
-    def edge_ok(self, engine: str, symbol: str, cfg: dict | None = None) -> dict:
+    # ---- execution control state (separate from config; /api/config can NEVER touch these) -----
+    _EXEC_DEFAULTS = {"armed": "0", "mode": "paper", "kill": "0", "firm": "",
+                      "firmAck": "0", "broker": "", "liveAuthExpiry": "0",
+                      "confirmEachOrder": "1"}  # "1" = require per-order confirm (safe default)
+
+    def _exec_kv(self, k: str) -> str:
+        rows = self._q("SELECT v FROM exec_kv WHERE k=?", (k,))
+        return rows[0][0] if rows else self._EXEC_DEFAULTS.get(k, "")
+
+    def set_exec_kv(self, k: str, v) -> None:
+        """Set ONE exec-state key. Only the dedicated /api/exec/* routes call this — never config."""
+        self._exec("INSERT INTO exec_kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                   [(k, str(v))], many=True)
+
+    def exec_flags(self) -> dict:
+        """Current execution control flags (the engine reads this each fire). Kill also honors the
+        out-of-band sentinel file (checked in bltd_exec). confirmEachOrder is exec_kv-only (a
+        /api/config POST can never flip it; disabling needs /api/exec/confirmeachorder + OS-auth)."""
+        cfg = self.config()
+        return {"armed": self._exec_kv("armed") == "1",
+                "mode": self._exec_kv("mode") or "paper",
+                "kill": self._exec_kv("kill") == "1",
+                "firm": (self._exec_kv("firm") or cfg.get("propFirm", "")),
+                "firmAck": self._exec_kv("firmAck") == "1",
+                "broker": self._exec_kv("broker"),
+                # From exec_kv, NOT config: /api/config can never flip this on/off. Default "1".
+                "confirmEachOrder": self._exec_kv("confirmEachOrder") != "0"}
+
+    def exec_live_authorized(self) -> bool:
+        """Live needs a FRESH human OS-auth capability (set by the Swift app after Touch ID/password)
+        — a short-lived expiry the backend verifies, NOT the shared signin token. Expired => not
+        authorized. (Creds-present/account-resolved are also required; the live adapter re-checks.)"""
+        try:
+            return time.time() < float(self._exec_kv("liveAuthExpiry") or 0)
+        except (TypeError, ValueError):
+            return False
+
+    def exec_demo_validated(self) -> bool:
+        """Whether the buyer has validated the full live order path on a broker DEMO/eval account.
+        Default False — a funded/real account can't place an order until this is set (the order code
+        is built to the documented API but unproven against the live endpoint until demo-confirmed)."""
+        return self._exec_kv("demoValidated") == "1"
+
+    def exec_order_confirmed(self, cid: str) -> bool:
+        rows = self._q("SELECT confirmed FROM exec_orders WHERE client_order_id=?", (cid,))
+        return bool(rows and rows[0][0])
+
+    def exec_confirm_order(self, cid: str) -> None:
+        self._exec("UPDATE exec_orders SET confirmed=1 WHERE client_order_id=?", [(cid,)], many=True)
+
+    def _today0(self) -> int:
+        return int(time.time()) - (int(time.time()) % 86400)
+
+    def exec_day_realized_loss(self) -> float:
+        rows = self._q("SELECT realized_pnl FROM exec_orders WHERE realized_pnl IS NOT NULL AND ts>=?",
+                       (self._today0(),))
+        return -sum(min(0.0, r[0]) for r in rows)   # positive magnitude of today's realized losses
+
+    def exec_open_contracts(self, symbol: str) -> int:
+        root = futures_root_any(symbol)
+        rows = self._q("SELECT symbol,size FROM exec_orders WHERE status IN ('paper_working','pending','working')")
+        return sum(int(s or 0) for (sym, s) in rows if futures_root_any(sym) == root)
+
+    def exec_equity(self) -> float:
+        # accountSize + cumulative realized PnL (paper has none until exits simulated in a later slice)
+        rows = self._q("SELECT realized_pnl FROM exec_orders WHERE realized_pnl IS NOT NULL")
+        return float(self.config().get("accountSize", 0) or 0) + sum(r[0] for r in rows)
+
+    def exec_equity_hwm(self) -> float:
+        try:
+            hwm = float(self._exec_kv("equityHwm") or 0)
+        except (TypeError, ValueError):
+            hwm = 0.0
+        eq = self.exec_equity()
+        if eq > hwm:
+            self.set_exec_kv("equityHwm", eq); return eq
+        return hwm
+
+    def exec_trades_today(self) -> int:
+        rows = self._q("SELECT count(*) FROM exec_orders WHERE route IN ('paper','live') AND ts>=?",
+                       (self._today0(),))
+        return int(rows[0][0]) if rows else 0
+
+    def exec_has_open_position(self, engine: str, symbol: str, direction: str) -> bool:
+        root = futures_root_any(symbol)
+        rows = self._q("SELECT symbol,direction FROM exec_orders WHERE status IN ('paper_working','pending','working')")
+        return any(futures_root_any(sym) == root and d == direction for (sym, d) in rows)
+
+    def exec_already_fired(self, cid: str) -> bool:
+        return bool(self._q("SELECT 1 FROM exec_orders WHERE client_order_id=?", (cid,)))
+
+    def exec_record_decision(self, d: dict) -> None:
+        status = "blocked" if d.get("route") == "blocked" else (
+            "paper_working" if d.get("route") == "paper" else "pending")
+        self._exec(
+            "INSERT INTO exec_orders(client_order_id,engine,symbol,direction,size,route,reason,"
+            "status,confirmed,is_automated,ts) VALUES(?,?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(client_order_id) DO UPDATE SET route=excluded.route,reason=excluded.reason,"
+            "status=excluded.status,size=excluded.size",
+            [(d.get("client_order_id"), d.get("engine"), d.get("symbol"), d.get("direction"),
+              int(d.get("size", 0)), d.get("route"), d.get("reason"), status, 0,
+              1 if d.get("is_automated", True) else 0, int(time.time()))], many=True)
+
+    def exec_orders(self, limit: int = 100) -> dict:
+        rows = self._q("SELECT client_order_id,engine,symbol,direction,size,route,reason,status,"
+                       "realized_pnl,ts FROM exec_orders ORDER BY ts DESC LIMIT ?", (int(limit),))
+        return {"orders": [{"clientOrderId": r[0], "engine": r[1], "symbol": r[2], "direction": r[3],
+                            "size": r[4], "route": r[5], "reason": r[6], "status": r[7],
+                            "realizedPnl": r[8], "ts": r[9]} for r in rows]}
+
+    def edge_ok(self, engine: str, symbol: str, cfg: dict | None = None, bypass_cache: bool = False) -> dict:
         """The product's OWN edge gate: backtest THIS engine on THIS symbol's bars (OOS split)
         and return {ok, reason, ...}. Runs entirely in-process. TTL-cached. Honest empty
         verdict when there aren't enough bars. Uses the buyer's tuned config (lookback / OOS /
-        win-floor / geometry) — nothing hardcoded."""
+        win-floor / geometry) — nothing hardcoded. bypass_cache=True forces a FRESH verdict (the
+        execution engine uses this so a stale 120s-cached 'ok' can never authorize a live order)."""
         cfg = cfg or self.config()
-        if not is_es_symbol(symbol):
-            return {"ok": False, "reason": f"unsupported symbol '{symbol}' — Black Label Trading engines are ES-only"}
+        if not in_scope(symbol):
+            return {"ok": False, "reason": f"'{symbol}' is not a recognized instrument"}
         key = (engine, symbol)
         cached = self._edge_cache.get(key)
         now = time.time()
-        if cached and cached[0] > now:
+        if cached and cached[0] > now and not bypass_cache:
             return cached[1]
         prover = PROVERS.get(engine)
         lookback = cfg.get("lookback", LOOKBACK)

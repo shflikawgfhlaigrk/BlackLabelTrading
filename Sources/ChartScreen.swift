@@ -30,8 +30,8 @@ struct ChartIndicatorSet: Codable, Equatable {
 
 // Timeframe resampling: aggregate the user's base bars up to a coarser interval. This is an
 // honest down-sampling of the user's OWN data — no new bars are invented.
-// Real minute timeframes (base capture bars are 15s, so 1m = 4 base bars) — matches the
-// WealthCharts default (1-minute candles) instead of choppy 15-second micro-bars.
+// Real minute timeframes (base capture bars are 15s, so 1m = 4 base bars) so the live chart
+// opens on readable 1-minute candles instead of choppy 15-second micro-bars.
 enum ChartTimeframe: String, CaseIterable, Identifiable, Codable {
     case m1 = "1m", m5 = "5m", m15 = "15m", m30 = "30m", h1 = "1h"
     var id: String { rawValue }
@@ -68,9 +68,9 @@ enum Resampler {
     }
 }
 
-// Where the chart's bars come from. Live = the buyer's own WealthCharts capture (via the
-// product's own backend); Import = a CSV the user pastes. Both are the user's OWN data — Live
-// is never fabricated, it shows an honest "feed offline" state when capture isn't flowing.
+// Where the chart's bars come from. Live = the buyer's own webhook-pushed platform data (via
+// the product's own backend); Import = a CSV the user pastes. Both are the user's OWN data -
+// Live is never fabricated, it shows an honest "feed offline" state when capture isn't flowing.
 enum ChartSource: String, CaseIterable, Identifiable {
     case live = "Live feed", importCSV = "Import"
     var id: String { rawValue }
@@ -86,7 +86,7 @@ struct ChartScreen: View {
     @State private var csvText = ""
     @State private var importNote = ""
     @State private var style: CandleStyle = .candles
-    @State private var timeframe: ChartTimeframe = .m1   // default 1-minute candles (WealthCharts-style)
+    @State private var timeframe: ChartTimeframe = .m1   // default 1-minute candles
     @State private var ind = ChartScreen.loadIndicators()
     @State private var renkoBrick: Double = 0
     @State private var showImporter = false
@@ -168,8 +168,8 @@ struct ChartScreen: View {
         .onDisappear { stopLivePoll() }
     }
 
-    // MARK: Honest live-feed banner — every word reflects a REAL backend response. No "connected"
-    // unless the buyer's own WC session is genuinely reachable and flowing.
+    // MARK: Honest live-feed banner - every word reflects a REAL backend response. No "connected"
+    // unless the buyer's own webhook data is genuinely reachable and flowing.
     @ViewBuilder private var feedBanner: some View {
         let st = feed.state
         HStack(spacing: 10) {
@@ -187,8 +187,8 @@ struct ChartScreen: View {
                 ProgressView().controlSize(.small).tint(BLTheme.gold)
             }
             if st == .loggedOut || st == .notSignedIn || st == .connecting {
-                GhostButton(label: "Connect WealthCharts", icon: "bolt.horizontal") {
-                    Task { loadingFeed = true; await feed.launchCapture(); await refreshFeed(); loadingFeed = false }
+                GhostButton(label: "Refresh webhook", icon: "arrow.clockwise") {
+                    Task { loadingFeed = true; await refreshFeed(); loadingFeed = false }
                 }
             }
             if st == .offline {
@@ -209,12 +209,18 @@ struct ChartScreen: View {
         }
     }
     private func bannerHint(_ s: FeedState) -> String {
+        // The SEPARATE evaluator process produces signals; if it's down, bars keep landing but
+        // signals silently stop. Say so honestly, regardless of feed state.
+        if feed.capture.evaluatorDownWhileConnected {
+            return "Data is flowing, but the signal engine is offline — signals are paused. Restart the app to resume."
+        }
+        let src = feed.capture.sourceLabel
         switch s {
-        case .live: return "Ticks flowing from your WealthCharts session into your local store."
+        case .live: return "Ticks flowing from \(src) into your local store."
         case .idle: return "Feed reachable, no fresh ticks right now (market quiet / closed)."
-        case .connecting: return "Capture window open — waiting for your WealthCharts feed to come up."
-        case .loggedOut: return "Sign in to WealthCharts in the capture window to start your own feed."
-        case .notSignedIn: return "Backend reachable — connecting your session…"
+        case .connecting: return "Webhook receiver ready - waiting for pushed ticks or bars."
+        case .loggedOut: return "Waiting for Topstep data — sign into TopstepX in the app-owned browser."
+        case .notSignedIn: return "Backend reachable - connecting your local session..."
         case .offline: return "The product backend isn't reachable. It serves your own captured data."
         }
     }
@@ -301,7 +307,7 @@ struct ChartScreen: View {
             switch feed.state {
             case .offline:
                 EmptyState(icon: "wifi.slash", title: "Your data backend isn't running",
-                           hint: "Black Label Trading ships its OWN data backend inside the app. It captures YOUR WealthCharts feed into a local store on this Mac (nothing leaves your machine) and serves it here. Start it, then refresh — or switch to Import to chart a CSV.")
+                           hint: "Black Label Trading ships its own data backend inside the app. It receives webhook-pushed ticks or bars into a local store on this Mac and serves them here. Start it, then refresh - or switch to Import to chart a CSV.")
                 HStack(spacing: 8) {
                     GoldButton(label: "Start my backend", icon: "bolt.fill") {
                         Task { loadingFeed = true; await feed.ensureBackendRunning(); await reconnectFeed(); loadingFeed = false }
@@ -309,18 +315,18 @@ struct ChartScreen: View {
                     GhostButton(label: "Retry connection", icon: "arrow.clockwise") { Task { await reconnectFeed() } }
                 }
             case .loggedOut, .notSignedIn, .connecting:
-                EmptyState(icon: "dot.radiowaves.left.and.right", title: "Connect your WealthCharts feed",
-                           hint: "Open the capture window and sign into YOUR WealthCharts account. Bars start landing in your local store within ~30s — then they appear here. Nothing is ever fabricated.")
-                GoldButton(label: "Connect WealthCharts", icon: "bolt.horizontal") {
-                    Task { loadingFeed = true; await feed.launchCapture(); await refreshFeed(); loadingFeed = false }
+                EmptyState(icon: "dot.radiowaves.left.and.right", title: "Waiting for Topstep data",
+                           hint: "Use the bundled Topstep bridge and sign into your own TopstepX session in the app-owned browser. The bridge posts observed market data into the local webhook/store. Once real data flows, it appears here. Nothing is ever fabricated.")
+                GoldButton(label: "Refresh webhook", icon: "arrow.clockwise") {
+                    Task { loadingFeed = true; await refreshFeed(); loadingFeed = false }
                 }
             default:
                 if feed.symbols.pickerList.isEmpty {
                     EmptyState(icon: "hourglass", title: "Feed connected — store is still filling",
-                               hint: "Your WealthCharts session is reachable but your local store has no bars yet. Leave a chart open in WealthCharts; bars accumulate here. Honest empty until real bars arrive.")
+                               hint: "\(feed.capture.sourceLabel.prefix(1).uppercased())\(feed.capture.sourceLabel.dropFirst()) is reachable but your local store has no bars yet. Keep your session open; bars accumulate here, and signals appear after enough bars build (several minutes) and only when a proven edge is present. Honest empty until real bars arrive.")
                 } else {
-                    EmptyState(icon: "chart.xyaxis.line", title: "Pick an ES contract to chart",
-                               hint: "Your captured ES contracts are in the dropdown next to the symbol field. Choose one to load its real bars.")
+                    EmptyState(icon: "chart.xyaxis.line", title: "Pick a contract to chart",
+                               hint: "Your captured instruments are in the dropdown next to the symbol field. Choose one to load its real bars.")
                     if let busiest = feed.symbols.busiest {
                         GoldButton(label: "Chart \(busiest)", icon: "chart.bar") { symbol = busiest; Task { await loadLiveBars() } }
                     }

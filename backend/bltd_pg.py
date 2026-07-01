@@ -65,7 +65,9 @@ class PgStore:
     def live_price(self, symbol: str) -> dict:
         if not symbol:
             return {"gated": True}
-        rows = self._q("SELECT price::float8, extract(epoch from recorded)::float8 FROM wc_live WHERE symbol=%s", (symbol,))
+        # Recency-gated (mirrors the SQLite store): a stale row is never served as the live line.
+        rows = self._q("SELECT price::float8, extract(epoch from recorded)::float8 FROM wc_live "
+                       "WHERE symbol=%s AND recorded > now() - interval '30 seconds'", (symbol,))
         if not rows:
             return {"symbol": symbol, "gated": True}
         return {"symbol": symbol, "price": rows[0][0], "ts": rows[0][1]}

@@ -75,332 +75,6 @@ struct Trade: Identifiable, Codable, Hashable {
 // Mirrors the website's composite-scoring model: each factor produces a raw score in [-1, 1],
 // is multiplied by a weight, summed into a composite, then mapped to a LONG/SHORT/FLAT signal.
 // Signal modules — mirrors the website's named stack (StepGMA · CVD · VWAP · VPIN · HMM regime · alpha monitor …).
-enum SignalFactor: String, CaseIterable, Identifiable, Codable {
-    case cvdDivergence = "CVD Divergence"
-    case cvdFlow       = "CVD Flow"
-    case vwap          = "VWAP"
-    case vpin          = "VPIN"
-    case stepGMA       = "StepGMA"
-    case volume        = "Volume"
-    case trend         = "Trend"
-    case momentum      = "Momentum"
-    case hmmRegime     = "HMM Regime"
-    case alphaMonitor  = "Alpha Monitor"
-    case session       = "Session"
-    case smt           = "SMT"
-    var id: String { rawValue }
-    // Relative weight in the composite (sums to ~1.0).
-    var weight: Double {
-        switch self {
-        case .cvdDivergence: return 0.14
-        case .cvdFlow:       return 0.12
-        case .vwap:          return 0.09
-        case .vpin:          return 0.08
-        case .stepGMA:       return 0.10
-        case .volume:        return 0.07
-        case .trend:         return 0.13
-        case .momentum:      return 0.09
-        case .hmmRegime:     return 0.07
-        case .alphaMonitor:  return 0.05
-        case .session:       return 0.03
-        case .smt:           return 0.03
-        }
-    }
-    var icon: String {
-        switch self {
-        case .cvdDivergence: return "arrow.triangle.swap"
-        case .cvdFlow:       return "waveform.path.ecg"
-        case .vwap:          return "chart.xyaxis.line"
-        case .vpin:          return "drop.fill"
-        case .stepGMA:       return "stairs"
-        case .volume:        return "chart.bar.fill"
-        case .trend:         return "chart.line.uptrend.xyaxis"
-        case .momentum:      return "bolt.fill"
-        case .hmmRegime:     return "circle.grid.cross.fill"
-        case .alphaMonitor:  return "scope"
-        case .session:       return "clock.fill"
-        case .smt:           return "arrow.left.arrow.right.circle.fill"
-        }
-    }
-    var blurb: String {
-        switch self {
-        case .cvdDivergence: return "Price vs. cumulative delta disagreement"
-        case .cvdFlow:       return "Net aggressive buy/sell pressure"
-        case .vwap:          return "Distance / reclaim of volume-weighted price"
-        case .vpin:          return "Order-flow toxicity / informed-trade conviction"
-        case .stepGMA:       return "Stepped guppy moving-average alignment"
-        case .volume:        return "Participation relative to average"
-        case .trend:         return "Higher-timeframe directional bias"
-        case .momentum:      return "Rate of change / thrust"
-        case .hmmRegime:     return "Hidden-Markov regime classification"
-        case .alphaMonitor:  return "Live edge / alpha decay monitor"
-        case .session:       return "Time-of-day edge weighting"
-        case .smt:           return "Smart-money correlated-asset divergence"
-        }
-    }
-}
-
-enum SignalDirection: String, Codable {
-    case long = "LONG", short = "SHORT", flat = "FLAT"
-    var tint: Color {
-        switch self { case .long: return BLTheme.green; case .short: return BLTheme.red; case .flat: return BLTheme.sub }
-    }
-    var icon: String {
-        switch self { case .long: return "arrow.up.right"; case .short: return "arrow.down.right"; case .flat: return "minus" }
-    }
-}
-
-// A computed signal: composite score + plan (entry/stop/target) + risk.
-struct SignalResult {
-    var direction: SignalDirection
-    var score: Double            // composite, -100…100
-    var confidence: Double       // 0…100
-    var entry: Double
-    var stop: Double
-    var target: Double
-    var symbol: String
-    var pointValue: Double       // $ per point
-    var riskPoints: Double { abs(entry - stop) }
-    var rewardPoints: Double { abs(target - entry) }
-    var rr: Double { riskPoints > 0 ? rewardPoints / riskPoints : 0 }
-    var riskDollars: Double { riskPoints * pointValue }
-    var rewardDollars: Double { rewardPoints * pointValue }
-}
-
-// Signal inputs. Each factor raw score is in [-1, 1] — now AUTO-COMPUTED live by
-// LiveFactorEngine from the buyer's own captured ES bars (no longer hand-entered).
-// Factors with no live source (order-flow CVD/VPIN, correlated-asset SMT, alpha-decay)
-// are simply absent → contribute 0 and render as "no live data".
-struct SignalInputs: Codable {
-    var symbol: String = "ES"
-    var price: Double = 5000
-    var atr: Double = 12          // used to size stop/target
-    var pointValue: Double = 50   // ES = $50/pt
-    var factors: [String: Double] = SignalFactor.allCases.reduce(into: [:]) { $0[$1.rawValue] = 0 }
-
-    func raw(_ f: SignalFactor) -> Double { factors[f.rawValue] ?? 0 }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Live factor engine — auto-computes factor raw scores [-1,1] from the buyer's OWN
-// captured ES data + real edge-gated fire journal. HONEST BY CONSTRUCTION: a factor is
-// present ONLY when it has a real source; the rest stay absent (→ 0, "no live data").
-// Nothing is fabricated or estimated.
-//   • From close prices: Trend, Momentum, StepGMA, HMM-regime, Session.
-//   • From real bar volume (WC cq): Volume, VWAP.
-//   • From real order-flow delta (WC bid/ask + prints, Lee-Ready): CVD Flow, CVD Divergence, VPIN.
-//   • From the real fire journal: Alpha Monitor.
-//   • Still no source (absent): SMT — needs a correlated asset (e.g. NQ) on the buyer's WC.
-struct LiveFactorSnapshot {
-    var factors: [String: Double] = [:]
-    var available: Set<String> = []
-    var price: Double? = nil
-    var atr: Double? = nil
-    var asOf: Date? = nil
-    var bars: Int = 0
-    var hasData: Bool { bars >= LiveFactorEngine.minBars && price != nil && !available.isEmpty }
-}
-
-enum LiveFactorEngine {
-    static let minBars = 50
-
-    static func compute(bars: [Bar], nqBars: [Bar], fires: [FireRow], now: Date) -> LiveFactorSnapshot {
-        var s = LiveFactorSnapshot()
-        s.bars = bars.count
-        guard bars.count >= minBars, let last = bars.last else { return s }
-        let closes = bars.map(\.close)
-        s.price = last.close
-        s.asOf = last.date
-        let atr = Indicators.atr(bars, 14).compactMap { $0 }.last
-            ?? max(0.01, bars.suffix(14).map { $0.high - $0.low }.reduce(0, +) / 14)
-        let A = max(0.01, atr)
-        s.atr = A
-        func clamp(_ x: Double) -> Double { max(-1, min(1, x)) }
-        func put(_ f: SignalFactor, _ v: Double) { s.factors[f.rawValue] = v; s.available.insert(f.rawValue) }
-
-        // VWAP — distance of price from session VWAP, in ATRs.
-        if let vw = ChartIndicators.vwap(bars, window: min(bars.count, 30)).compactMap({ $0 }).last {
-            put(.vwap, clamp((last.close - vw) / (A * 2)))
-        }
-        // Volume — participation vs 20-bar average, signed by the bar's direction.
-        let recentVol = bars.map(\.volume).suffix(20)
-        if recentVol.reduce(0, +) > 0 {
-            let avg = recentVol.reduce(0, +) / Double(recentVol.count)
-            if avg > 0 {
-                let dir = (last.close - last.open) >= 0 ? 1.0 : -1.0
-                put(.volume, clamp(dir * ((last.volume / avg) - 1.0)))
-            }
-        }
-        // Trend — fast vs slow EMA, in ATRs.
-        if let ef = Indicators.ema(closes, 20).compactMap({ $0 }).last,
-           let es = Indicators.ema(closes, 50).compactMap({ $0 }).last {
-            put(.trend, clamp((ef - es) / (A * 1.5)))
-        }
-        // Momentum — RSI(14) mapped to [-1,1].
-        if let r = Indicators.rsi(closes, 14).compactMap({ $0 }).last {
-            put(.momentum, clamp((r - 50) / 50))
-        }
-        // StepGMA — Guppy multi-EMA alignment (fast pack vs slow pack), in ATRs.
-        let fastP = [3, 5, 8, 10, 12, 15], slowP = [30, 35, 40, 45, 50, 60]
-        let fastE = fastP.compactMap { Indicators.ema(closes, $0).compactMap { $0 }.last }
-        let slowE = slowP.compactMap { Indicators.ema(closes, $0).compactMap { $0 }.last }
-        if fastE.count == fastP.count, slowE.count == slowP.count {
-            let af = fastE.reduce(0, +) / Double(fastE.count)
-            let al = slowE.reduce(0, +) / Double(slowE.count)
-            put(.stepGMA, clamp((af - al) / (A * 1.5)))
-        }
-        // HMM Regime — Kaufman efficiency ratio (trend vs chop), signed by net move. Labeled proxy.
-        let n = min(20, closes.count - 1)
-        if n > 1 {
-            let seg = Array(closes.suffix(n + 1))
-            let net = seg.last! - seg.first!
-            let path = zip(seg.dropFirst(), seg).map { abs($0 - $1) }.reduce(0, +)
-            if path > 0 { put(.hmmRegime, clamp(abs(net) / path * (net >= 0 ? 1 : -1))) }
-        }
-        // Session — time-of-day edge (US index prime hours), signed by short-term momentum.
-        if let r = Indicators.rsi(closes, 14).compactMap({ $0 }).last {
-            put(.session, clamp(sessionQuality(now) * ((r - 50) / 50)))
-        }
-        // CVD family — from REAL per-bar order-flow delta (quote-rule buy − sell volume), captured
-        // from WC's bid/ask quotes + prints. Present only once the buyer's bars actually carry delta.
-        let win = min(20, bars.count)
-        let recentBars = bars.suffix(win)
-        let cumVol = recentBars.reduce(0.0) { $0 + $1.volume }
-        let cumDelta = recentBars.reduce(0.0) { $0 + $1.delta }
-        if cumVol > 0 && recentBars.contains(where: { $0.delta != 0 }) {
-            let flow = cumDelta / cumVol
-            put(.cvdFlow, clamp(flow))                                    // net aggressive buy/sell pressure
-            let toxicity = recentBars.reduce(0.0) { $0 + abs($1.delta) } / cumVol
-            put(.vpin, clamp(toxicity * (cumDelta >= 0 ? 1 : -1)))        // order-flow toxicity, signed
-            if let c0 = recentBars.first?.close, let cN = recentBars.last?.close {
-                let priceDir = max(-1.0, min(1.0, (cN - c0) / (A * 2)))
-                put(.cvdDivergence, clamp(flow - priceDir))              // order flow vs price disagreement
-            }
-        }
-        // SMT — smart-money correlated-asset divergence: ES vs NQ relative-return disagreement,
-        // from the buyer's OWN captured NQ micro series. Absent if NQ isn't captured.
-        if bars.count >= 10, nqBars.count >= 10 {
-            let m = min(min(20, bars.count), nqBars.count)
-            let esC = bars.suffix(m).map(\.close), nqC = nqBars.suffix(m).map(\.close)
-            if let e0 = esC.first, let eN = esC.last, let q0 = nqC.first, let qN = nqC.last, e0 != 0, q0 != 0 {
-                let esRet = (eN - e0) / e0, nqRet = (qN - q0) / q0
-                put(.smt, clamp((esRet - nqRet) * 1000))   // ES relative strength vs NQ (~0.1% rel = full)
-            }
-        }
-        // Alpha Monitor — net direction of the buyer's REAL edge-gated fires, scaled by how much
-        // live edge is actually firing. A pure read of the real signal journal; no fabrication.
-        let recentFires = fires.prefix(12)
-        if !recentFires.isEmpty {
-            let longs = recentFires.filter { $0.direction.lowercased() == "long" }.count
-            let shorts = recentFires.filter { $0.direction.lowercased() == "short" }.count
-            let net = Double(longs - shorts) / Double(recentFires.count)
-            let density = min(1.0, Double(recentFires.count) / 8.0)
-            put(.alphaMonitor, clamp(net * density))
-        }
-        return s
-    }
-
-    // 0…1 session quality: RTH prime hours score highest, overnight lowest. New York (ET).
-    static func sessionQuality(_ date: Date) -> Double {
-        var cal = Calendar(identifier: .gregorian)
-        cal.timeZone = TimeZone(identifier: "America/New_York") ?? cal.timeZone
-        let mins = cal.component(.hour, from: date) * 60 + cal.component(.minute, from: date)
-        if (mins >= 570 && mins < 660) || (mins >= 840 && mins < 960) { return 1.0 } // 9:30–11:00, 14:00–16:00 ET
-        if mins >= 570 && mins < 960 { return 0.6 }                                    // midday RTH
-        return 0.2                                                                     // overnight / globex
-    }
-}
-
-enum SignalEngine {
-    // Weighted composite in [-1, 1] -> scaled to -100…100.
-    static func composite(_ inp: SignalInputs) -> Double {
-        let sum = SignalFactor.allCases.reduce(0.0) { $0 + inp.raw($1) * $1.weight }
-        return max(-1, min(1, sum)) * 100
-    }
-    // Per-factor weighted contribution (for display).
-    static func contribution(_ f: SignalFactor, _ inp: SignalInputs) -> Double { inp.raw(f) * f.weight * 100 }
-
-    static func evaluate(_ inp: SignalInputs) -> SignalResult {
-        let score = composite(inp)
-        let dir: SignalDirection = score >= 25 ? .long : (score <= -25 ? .short : .flat)
-        let conf = min(100, abs(score) / 0.85)   // saturates near full conviction
-        let atr = max(0.01, inp.atr)
-        let stopDist = atr * 1.2
-        let targetDist = atr * 1.2 * 2.0          // ~2R plan
-        let entry = inp.price
-        var stop = entry, target = entry
-        switch dir {
-        case .long:  stop = entry - stopDist; target = entry + targetDist
-        case .short: stop = entry + stopDist; target = entry - targetDist
-        case .flat:  stop = entry - stopDist; target = entry + targetDist
-        }
-        return SignalResult(direction: dir, score: score, confidence: conf,
-                            entry: entry, stop: stop, target: target,
-                            symbol: inp.symbol.isEmpty ? "ES" : inp.symbol.uppercased(),
-                            pointValue: inp.pointValue)
-    }
-
-    // A small built-in scenario the user can step through (labelled scenario, not live data).
-    static let scenarios: [(name: String, inputs: SignalInputs)] = [
-        ("Bullish trend continuation", {
-            var i = SignalInputs(); i.symbol = "ES"; i.price = 5012; i.atr = 11; i.pointValue = 50
-            i.factors = ["CVD Divergence": 0.4, "CVD Flow": 0.8, "VWAP": 0.7, "VPIN": 0.6, "StepGMA": 0.8,
-                         "Volume": 0.6, "Trend": 0.9, "Momentum": 0.7, "HMM Regime": 0.7, "Alpha Monitor": 0.5,
-                         "Session": 0.5, "SMT": 0.3]; return i
-        }()),
-        ("Bearish ES CVD divergence", {
-            var i = SignalInputs(); i.symbol = "ES"; i.price = 4988; i.atr = 12.5; i.pointValue = 50
-            i.factors = ["CVD Divergence": -0.9, "CVD Flow": -0.6, "VWAP": -0.5, "VPIN": -0.7, "StepGMA": -0.6,
-                         "Volume": 0.5, "Trend": -0.7, "Momentum": -0.5, "HMM Regime": -0.6, "Alpha Monitor": -0.4,
-                         "Session": 0.2, "SMT": -0.6]; return i
-        }()),
-        ("ES chop / no edge", {
-            var i = SignalInputs(); i.symbol = "ES"; i.price = 5002; i.atr = 8.0; i.pointValue = 50
-            i.factors = ["CVD Divergence": 0.1, "CVD Flow": -0.15, "VWAP": 0.0, "VPIN": -0.1, "StepGMA": 0.05,
-                         "Volume": -0.2, "Trend": 0.05, "Momentum": -0.1, "HMM Regime": 0.0, "Alpha Monitor": -0.2,
-                         "Session": -0.3, "SMT": 0.1]; return i
-        }())
-    ]
-}
-
-// MARK: - 13 independent risk gates (mirrors the website's "13 gatekeepers" — pass/fail before a signal is valid)
-// Each gate inspects the current inputs/computed result and returns pass/fail with a reason.
-// A signal is only "valid" (armable) when every gate passes. This is on-device scoring logic,
-// NOT a live broker feed — same honest framing as the website.
-enum RiskGate: String, CaseIterable, Identifiable {
-    case conviction      = "Conviction threshold"
-    case consensus       = "Multi-TF consensus"
-    case directionLock   = "Direction lock"
-    case cvdAgreement    = "CVD agreement"
-    case flowConfirm     = "Order-flow confirmation"
-    case volumeFloor     = "Volume floor"
-    case trendAlign      = "Trend alignment"
-    case momentumQuality = "Momentum quality"
-    case sessionWindow   = "Session window"
-    case smtClear        = "SMT divergence clear"
-    case riskReward      = "Risk:reward floor"
-    case atrSanity       = "ATR / volatility sanity"
-    case spreadCost      = "Spread / cost guard"
-    var id: String { rawValue }
-    var icon: String {
-        switch self {
-        case .conviction:      return "gauge.with.dots.needle.67percent"
-        case .consensus:       return "rectangle.3.group.fill"
-        case .directionLock:   return "lock.fill"
-        case .cvdAgreement:    return "arrow.triangle.swap"
-        case .flowConfirm:     return "waveform.path.ecg"
-        case .volumeFloor:     return "chart.bar.fill"
-        case .trendAlign:      return "chart.line.uptrend.xyaxis"
-        case .momentumQuality: return "bolt.fill"
-        case .sessionWindow:   return "clock.fill"
-        case .smtClear:        return "arrow.left.arrow.right.circle.fill"
-        case .riskReward:      return "arrow.left.arrow.right"
-        case .atrSanity:       return "waveform.path"
-        case .spreadCost:      return "dollarsign.arrow.circlepath"
-        }
-    }
-}
-
 struct GateCheck: Identifiable {
     let gate: RiskGate
     let passed: Bool
@@ -481,7 +155,8 @@ struct SignalLog: Identifiable, Codable, Hashable {
     var created = Date()
     // Honest grading: a committed signal starts pending, then is graded win/loss by the user.
     var grade: String = "pending"          // pending | win | loss
-    var pnl: Double = 0                     // realized P&L in dollars once graded
+    var pnl: Double = 0                     // MODELED P&L in dollars: a win banks the planned target
+                                           // reward, a loss the 1R risk — NOT a broker-realized fill.
     var gatesPassed: Int = 13               // how many of the 13 gates passed at commit
     var tfAgree: Int = 0                    // multi-TF agreeing count at commit (x of 8)
     var dir: SignalDirection { SignalDirection(rawValue: direction) ?? .flat }
@@ -609,7 +284,28 @@ final class AppModel: ObservableObject {
     // Signal log (honestly-graded session ledger)
     func commit(_ s: SignalLog) { signals.insert(s, at: 0) }
     func deleteSignal(_ s: SignalLog) { signals.removeAll { $0.id == s.id } }
-    // Grade a committed signal honestly: win banks +reward, loss debits -risk (1R), pending resets.
+
+    // Vault-backed daily logs: write the GRADED session ledger, grouped by day with per-day totals,
+    // to a CSV in the app's own local vault dir. Real data only (your graded signals); modeled P&L
+    // is labeled as such. Returns the file path, or nil when there is nothing graded to log.
+    func exportDailyLogs() -> String? {
+        let graded = signals.filter { $0.grade == "win" || $0.grade == "loss" }
+        guard !graded.isEmpty else { return nil }
+        let df = DateFormatter(); df.locale = Locale(identifier: "en_US_POSIX"); df.dateFormat = "yyyy-MM-dd"
+        let entries = graded.sorted { $0.created < $1.created }.map {   // oldest-first daily log
+            SessionLedger.Entry(day: df.string(from: $0.created), symbol: $0.symbol,
+                                direction: $0.direction, grade: $0.grade, pnl: $0.pnl)
+        }
+        let csv = SessionLedger.dailyCSV(entries)
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Black Label Trading/logs", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let url = dir.appendingPathComponent("session-daily-log.csv")
+        do { try csv.write(to: url, atomically: true, encoding: .utf8); return url.path } catch { return nil }
+    }
+    // Grade a committed signal: a win banks the reward AT THE PLANNED TARGET, a loss the 1R risk,
+    // pending resets. This is a MODELED outcome (target/stop), not a broker-realized fill — every
+    // surface that shows it must say "at target / modeled", never "realized" (honesty binding).
     func grade(_ s: SignalLog, as grade: String) {
         guard let i = signals.firstIndex(where: { $0.id == s.id }) else { return }
         signals[i].grade = grade
@@ -658,54 +354,6 @@ final class AppModel: ObservableObject {
 }
 
 // MARK: - Trading math
-enum TradeMath {
-    /// Position sizing from account, risk%, entry and stop.
-    static func positionSize(account: Double, riskPct: Double, entry: Double, stop: Double)
-        -> (riskDollars: Double, perUnitRisk: Double, size: Double, notional: Double) {
-        let riskDollars = account * riskPct / 100
-        let perUnit = abs(entry - stop)
-        let size = perUnit > 0 ? (riskDollars / perUnit) : 0
-        let notional = size * entry
-        return (riskDollars, perUnit, size, notional)
-    }
-    /// Reward:risk ratio + R for a given entry/stop/target.
-    static func riskReward(entry: Double, stop: Double, target: Double) -> (risk: Double, reward: Double, ratio: Double) {
-        let risk = abs(entry - stop)
-        let reward = abs(target - entry)
-        return (risk, reward, risk > 0 ? reward / risk : 0)
-    }
-    /// Compounding projector: balance after `months` of monthly growth `pct`.
-    static func compound(start: Double, monthlyPct: Double, months: Int) -> [Double] {
-        var out: [Double] = []
-        var bal = start
-        let r = monthlyPct / 100
-        for _ in 0..<max(0, months) { bal *= (1 + r); out.append(bal) }
-        return out
-    }
-    static func money(_ v: Double) -> String {
-        let f = NumberFormatter(); f.numberStyle = .currency; f.maximumFractionDigits = 0
-        return f.string(from: NSNumber(value: v)) ?? "$0"
-    }
-    static func money2(_ v: Double) -> String {
-        let f = NumberFormatter(); f.numberStyle = .currency; f.maximumFractionDigits = 2
-        return f.string(from: NSNumber(value: v)) ?? "$0"
-    }
-    static func pct(_ v: Double) -> String { String(format: "%.1f%%", v) }
-    static func num(_ v: Double) -> String {
-        if v.isInfinite { return "∞" }
-        return String(format: "%.2f", v)
-    }
-    // Trim trailing zeros for text-field display.
-    static func numTrim(_ v: Double) -> String { v == v.rounded() ? String(Int(v)) : String(v) }
-    // Compact magnitude (1.2K / 3.4M) for axis labels like volume.
-    static func compact(_ v: Double) -> String {
-        let a = abs(v)
-        if a >= 1_000_000_000 { return String(format: "%.1fB", v / 1_000_000_000) }
-        if a >= 1_000_000 { return String(format: "%.1fM", v / 1_000_000) }
-        if a >= 1_000 { return String(format: "%.1fK", v / 1_000) }
-        return numTrim(v)
-    }
-}
 
 // MARK: - Local accounts (on-device, App Store 5.1.1(v) deletion supported)
 enum AuthError: String, Error {
@@ -765,8 +413,8 @@ enum AppSettingsStore {
     }
 }
 
-// MARK: - WealthCharts account connection (on-device only — signals-only, manual execution)
-// HONEST FRAMING: This stores the buyer's OWN WealthCharts account reference on THIS Mac.
+// MARK: - Local platform account reference (on-device only — signals-only, manual execution)
+// HONEST FRAMING: This stores the buyer's OWN platform account reference on THIS Mac.
 // It is NOT a live broker feed and it does NOT auto-trade or move money. The username and
 // connection note live in UserDefaults; the password (if entered) lives in the macOS
 // Keychain — never in plaintext, never bundled, never sent anywhere by this app.
@@ -778,7 +426,7 @@ struct WealthChartsAccount: Codable, Equatable {
     var isConfigured: Bool { !username.trimmingCharacters(in: .whitespaces).isEmpty }
 }
 
-// Keychain helper — generic password item scoped to this app + the WC username.
+// Keychain helper — generic password item scoped to this app + the saved username.
 enum WCKeychain {
     private static let service = "com.blacklabel.trading.wealthcharts"
 
@@ -817,7 +465,7 @@ enum WCKeychain {
     }
 }
 
-// Observable store for the WealthCharts connection. Username/note in UserDefaults,
+// Observable store for the local platform account reference. Username/note in UserDefaults,
 // password in Keychain. No network calls — purely local persistence.
 final class WealthChartsStore: ObservableObject {
     @Published var account: WealthChartsAccount { didSet { persist() } }
@@ -858,5 +506,12 @@ final class WealthChartsStore: ObservableObject {
         account = WealthChartsAccount()
         UserDefaults.standard.removeObject(forKey: Self.key)
         hasSecret = false
+    }
+}
+
+// SwiftUI color for the pure SignalDirection (kept here so SignalCore stays SwiftUI-free).
+extension SignalDirection {
+    var tint: Color {
+        switch self { case .long: return BLTheme.green; case .short: return BLTheme.red; case .flat: return BLTheme.sub }
     }
 }

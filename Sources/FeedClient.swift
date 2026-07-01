@@ -1,13 +1,15 @@
 // Black Label Trading — live feed client (SwiftUI @MainActor ObservableObject).
 //
 // HONEST FRAMING: this talks ONLY to the product's OWN self-contained backend (bltd_api.py,
-// default http://127.0.0.1:8787). That backend serves ONLY what the buyer's own WealthCharts
-// session captured into the buyer's own local store. NOTHING is fetched from Black Label / Utah /
-// any third party here. The engine/feed surface is ES-only; non-ES symbols are ignored even if
-// stale rows exist in the local store. When the backend is down, or the buyer's WC session is logged out, the
+// default http://127.0.0.1:8787). That backend serves ONLY what the buyer's own webhook sender
+// pushed into the buyer's own local store. NOTHING is fetched from Black Label / Utah /
+// any third party here. The shipped Topstep setup is ES-family only; non-ES symbols are filtered so
+// stale local rows cannot populate the picker. Signals fire only where the edge-gate proves an edge.
+// When the backend is down, or no webhook data has arrived, the
 // client reports an honest FeedState (.offline / .loggedOut / .idle) and shows NO bars — it never
-// fabricates prices. Signals-only: this client reads bars/ticks/fires; it can NEVER place a
-// trade or move money.
+// fabricates prices. This client reads bars/ticks/fires and relays the user's OWN execution
+// commands to the backend's /api/exec/* control plane; it never places an order on its own and
+// execution is OFF by default (a live order needs arm+live+own-creds+firm-ToS+risk+edge+kill-clear).
 //
 // The backend URL is buyer-configurable (Settings) so a buyer can run the backend on another
 // host/port on their own machine. The decode contract lives in FeedTypes.swift (test-locked).
@@ -18,10 +20,14 @@ import Combine
 final class FeedClient: ObservableObject {
     // Observed, honest state — every field reflects a real backend response.
     @Published var state: FeedState = .offline
+    @Published var capture = CaptureStatus()   // full honest probe (source + evaluator liveness)
     @Published var symbols = FeedSymbols()
     @Published var lastError: String? = nil
     @Published var lastSync: Date? = nil
     @Published private(set) var connecting = false
+    // Honest prerequisite (e.g. "a Python 3 runtime is required") when the bundled backend can't
+    // start because the host is missing a dependency. nil unless the launcher wrote a sentinel.
+    @Published var prereq: PrereqInfo? = nil
 
     // Buyer-configurable backend location (own machine / own network only).
     @Published var baseURL: String {
@@ -92,6 +98,35 @@ final class FeedClient: ObservableObject {
         }
     }
 
+    // MARK: - Execution control plane (default OFF). Thin pass-through to the backend's dedicated,
+    // auth-gated /api/exec/* routes. A live order is impossible unless armed+live+own-creds+firm-ToS
+    // +risk+edge+kill-clear all hold in the backend engine — the UI cannot bypass that.
+    @Published var exec = ExecStatus()
+
+    func refreshExec() async {
+        if let o = await getJSON("/api/exec/status") { exec = ExecStatus.decode(o) }
+    }
+
+    func execOrders() async -> [[String: Any]]? {
+        guard let o = await getJSON("/api/exec/orders") else { return nil }
+        return o["orders"] as? [[String: Any]]
+    }
+
+    @discardableResult
+    func execCommand(_ cmd: String, _ body: [String: Any] = [:]) async -> Bool {
+        guard let req0 = authed("/api/exec/\(cmd)") else { return false }
+        var req = req0; req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        defer { Task { await refreshExec() } }
+        do {
+            let (data, resp) = try await session.data(for: req)
+            guard (resp as? HTTPURLResponse)?.statusCode == 200 else { return false }
+            let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            return (obj?["ok"] as? Bool) ?? true
+        } catch { lastError = friendly(error); return false }
+    }
+
     // MARK: - Self-contained backend bootstrap. The product SHIPS its own data backend inside the
     // app bundle (Contents/Resources/backend/launch-backend.sh, stdlib-only Python). When the local
     // backend on the default URL isn't reachable, the app starts the BUNDLED one so the buyer gets
@@ -114,10 +149,14 @@ final class FeedClient: ObservableObject {
         do { try proc.run() } catch { lastError = "Couldn't start bundled backend"; return false }
         // Poll briefly for the backend to come up (it binds fast; SQLite store is created empty).
         for _ in 0..<20 {
-            if await healthOK() { return true }
+            if await healthOK() { prereq = nil; return true }
             try? await Task.sleep(nanoseconds: 300_000_000)
         }
-        return await healthOK()
+        let ok = await healthOK()
+        // If it still isn't up, the launcher may have written an honest prerequisite sentinel
+        // (e.g. no working python3 on this Mac). Surface it instead of an opaque "offline".
+        if ok { prereq = nil } else { prereq = PrereqInfo.read() }
+        return ok
     }
     private func bundledBackendScript() -> URL? {
         // Fallback lookup (subdirectory resource APIs can vary): Resources/backend/launch-backend.sh.
@@ -135,9 +174,10 @@ final class FeedClient: ObservableObject {
 
     // MARK: - Capture status + symbol catalogue (the honest feed banner).
     func refreshStatus() async {
-        guard signedIn else { state = .notSignedIn; return }
-        guard let cap = await getJSON("/api/capture") else { state = .offline; return }
+        guard signedIn else { state = .notSignedIn; capture = CaptureStatus(); return }
+        guard let cap = await getJSON("/api/capture") else { state = .offline; capture = CaptureStatus(); return }
         let cs = CaptureStatus.decode(cap)
+        capture = cs
         state = cs.state(signedIn: true)
         if let syms = await getJSON("/api/symbols") { symbols = FeedSymbols.decode(syms) }
         lastSync = Date()
@@ -181,16 +221,79 @@ final class FeedClient: ObservableObject {
         return FireFeed.decode(obj)
     }
 
-    // MARK: - Connect the buyer's own WealthCharts session (launches the product-owned debug
-    // Chrome at WC sign-in; reports REAL reachability). Signals-only — opens a login, nothing else.
+    // MARK: - Connect the buyer's own browser trading session (launches the product-owned debug
+    // Chrome at supported platform sign-ins; reports REAL reachability). Signals-only — opens
+    // login tabs, reads market-data frames after the buyer signs in, never uses broker APIs.
     func launchCapture() async {
         guard let req0 = authed("/api/connect") else { return }
         var req = req0; req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = "{}".data(using: .utf8)
         connecting = true; defer { connecting = false }
-        _ = try? await session.data(for: req)
+        // Surface the honest no-Chrome prerequisite (RC4): browser capture needs a Chromium browser.
+        // If none is installed the backend reports chromePresent:false instead of looping silently.
+        if let (data, _) = try? await session.data(for: req),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            if (obj["chromePresent"] as? Bool) == false {
+                prereq = PrereqInfo(
+                    reason: (obj["chromeReason"] as? String)
+                        ?? "Google Chrome is required for browser capture.",
+                    fix: "",
+                    detail: (obj["chromeDetail"] as? String)
+                        ?? "Install Google Chrome (or Chromium, Brave, or Edge), then reopen and connect your platform.")
+            } else if obj["chromePresent"] != nil {
+                prereq = nil
+            }
+        }
         await refreshStatus()
+    }
+
+    // MARK: - Feed sources. The surfaced path is webhook ingestion: the buyer's sender/bridge posts
+    // observed ticks or OHLC bars into the local backend, which normalizes them into the SAME store.
+
+    /// The catalogue of connectable feed sources + their credential fields (for the picker).
+    func feedSources() async -> [FeedSourceInfo] {
+        guard signedIn, let obj = await getJSON("/api/feed/sources") else { return [] }
+        return FeedSourceInfo.decodeList(obj)
+    }
+
+    /// The currently connected webhook feed's honest status, or nil.
+    func feedStatus() async -> ApiFeedStatus? {
+        guard signedIn, let obj = await getJSON("/api/feed/status") else { return nil }
+        return ApiFeedStatus.decode(obj)
+    }
+
+    /// Local webhook receiver details for the buyer's sender/bridge. The token is a local backend
+    /// write token, not a prop-firm credential.
+    func webhookInfo() async -> WebhookInfo? {
+        guard signedIn, let obj = await getJSON("/api/webhook/info") else { return nil }
+        return WebhookInfo.decode(obj)
+    }
+
+    /// Legacy internal hook. The visible product uses webhook ingestion and does not request API keys.
+    @discardableResult
+    func connectFeed(source: String, creds: [String: String]) async -> ApiFeedStatus? {
+        guard let req0 = authed("/api/feed/connect") else { return nil }
+        var req = req0; req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: ["source": source, "creds": creds])
+        connecting = true; defer { connecting = false }
+        do {
+            let (data, resp) = try await session.data(for: req)
+            guard (resp as? HTTPURLResponse)?.statusCode == 200,
+                  let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+            return ApiFeedStatus.decode(obj)
+        } catch { lastError = friendly(error); return nil }
+    }
+
+    /// Disconnect the active managed feed, if any.
+    @discardableResult
+    func disconnectFeed() async -> Bool {
+        guard let req0 = authed("/api/feed/disconnect") else { return false }
+        var req = req0; req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = "{}".data(using: .utf8)
+        return (try? await session.data(for: req)) != nil
     }
 
     private func enc(_ s: String) -> String {

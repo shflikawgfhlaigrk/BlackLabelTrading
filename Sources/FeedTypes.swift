@@ -2,8 +2,8 @@
 //
 // HONEST FRAMING: this is the wire-format <-> domain-model translation for the product's OWN
 // self-contained backend (bltd_api.py on 127.0.0.1). The backend serves ONLY what the buyer's
-// own WealthCharts session captured into the buyer's own local store — nothing is downloaded
-// from us, sampled, or invented. When the store is cold / the WC session is logged out, the
+// own Topstep webhook sender wrote into the buyer's own local store - nothing is downloaded from us,
+// sampled, or invented. When the store is cold / no Topstep data has arrived, the
 // payloads are empty and decode to empty results (a real "feed offline" state upstream), NEVER
 // to fabricated bars. The networking + @MainActor wiring lives in FeedClient.swift; the math
 // here is verifiable headlessly so the decode contract is test-locked.
@@ -42,6 +42,49 @@ enum TradingSymbolScope {
         }
         return out
     }
+
+    // Shipped Topstep setup is ES-family only. Keep this filter in the client too so stale rows from
+    // older local stores cannot appear in the picker if a backend response is cached or mixed.
+    static func inScope(_ raw: String?) -> Bool {
+        isES(raw)
+    }
+
+    static func filterScoped(_ symbols: [String]) -> [String] {
+        var seen = Set<String>()
+        var out: [String] = []
+        for s in symbols where inScope(s) && !seen.contains(s) {
+            seen.insert(s)
+            out.append(s)
+        }
+        return out
+    }
+
+    // Futures root of a contract symbol: "CM.ESU6"->"ES", "MNQU6"->"MNQ", "CLF26"->"CL". A
+    // non-futures symbol (no trailing <monthCode><1-2 digits>) passes through ("EURUSD"->"EURUSD").
+    static func futuresRoot(_ raw: String?) -> String {
+        let chars = Array(normalized(raw))
+        guard chars.count >= 3 else { return String(chars) }
+        var i = chars.count - 1
+        var digits = 0
+        while i >= 0 && chars[i].isNumber { i -= 1; digits += 1 }
+        if (1...2).contains(digits), i >= 1, monthCodes.contains(chars[i]) {
+            return String(chars[0..<i])
+        }
+        return String(chars)
+    }
+
+    // $ per 1.00 point, by futures root. Only roots whose contract spec is KNOWN are mapped; an
+    // unmapped instrument returns nil so the UI shows points only and labels dollar figures
+    // "n/a for this instrument" — NEVER computes dollars with a wrong (e.g. ES $50) multiplier.
+    private static let pointValues: [String: Double] = [
+        "ES": 50, "MES": 5, "NQ": 20, "MNQ": 2, "YM": 5, "MYM": 0.5,
+        "RTY": 50, "M2K": 5, "CL": 1000, "MCL": 100, "GC": 100, "MGC": 10, "SI": 5000,
+    ]
+
+    static func pointValue(for raw: String?) -> Double? { pointValues[futuresRoot(raw)] }
+
+    // Clean display label for the buyer's live instrument (strips the venue prefix): "CM.ESU6"->"ESU6".
+    static func displaySymbol(_ raw: String?) -> String { normalized(raw) }
 }
 
 // MARK: - Feed connection state (drives the honest banner in the chart screen).
@@ -50,17 +93,16 @@ enum TradingSymbolScope {
 enum FeedState: Equatable {
     case offline            // backend unreachable (product backend not running)
     case notSignedIn        // backend up, no session token yet
-    case loggedOut          // backend up + signed in, but the buyer's WC session is logged out
-                            // (CDP not reachable / no logged-in WC page) -> no live capture
-    case connecting         // launched capture chrome, waiting for the WC feed to come up
-    case live               // WC feed reachable and ticks are flowing into the buyer's store
+    case loggedOut          // backend up + signed in, but no webhook tick/bar has arrived
+    case connecting         // webhook receiver ready, waiting for pushed market data
+    case live               // webhook data reachable and ticks are flowing into the buyer's store
     case idle               // signed in, feed reachable, but no fresh ticks right now (market closed / quiet)
 
     var label: String {
         switch self {
         case .offline:     return "Backend offline"
         case .notSignedIn: return "Not connected"
-        case .loggedOut:   return "WealthCharts logged out"
+        case .loggedOut:   return "No webhook data"
         case .connecting:  return "Connecting feed…"
         case .live:        return "Live feed"
         case .idle:        return "Feed connected · quiet"
@@ -73,13 +115,16 @@ enum FeedState: Equatable {
 }
 
 // MARK: - Capture status as reported by GET /api/capture.
-// Mirrors the backend's REAL pipeline probe: is the buyer's WC reachable on CDP, is the feed
-// available, and which symbols have fresh ticks. Nothing here is assumed — it is observed.
+// Mirrors the backend's REAL pipeline probe: has the local webhook receiver seen pushed data, is
+// the feed available, and which symbols have fresh ticks. Nothing here is assumed - it is observed.
 struct CaptureStatus: Equatable {
     var cdpReachable = false
     var feedAvailable = false
     var feedLive = false
     var liveTicks: [String] = []
+    var feedSource: String? = nil        // observed feed source key, usually webhook
+    var evaluatorAlive = true            // capture-daemon evaluator heartbeat; default true so a
+                                         // backend that doesn't report it never shows a false alarm
 
     // Reduce the observed capture probe to a single honest FeedState.
     func state(signedIn: Bool) -> FeedState {
@@ -90,12 +135,30 @@ struct CaptureStatus: Equatable {
         return .loggedOut
     }
 
+    // Human label for the active pushed/captured source.
+    var sourceLabel: String {
+        switch (feedSource ?? "").lowercased() {
+        case "webhook", "topstepx-bridge": return "your Topstep webhook feed"
+        case "topstepx": return "your TopstepX browser feed"
+        case "browser", "": return "your Topstep webhook feed"
+        default: return "your Topstep feed"
+        }
+    }
+    // Browser capture is not the surfaced feed path; retained for older call sites/tests.
+    var isApiFeed: Bool {
+        false
+    }
+    // Bars can land while the SEPARATE evaluator process is down -> signals silently stop. Surface it.
+    var evaluatorDownWhileConnected: Bool { feedAvailable && !evaluatorAlive }
+
     static func decode(_ obj: [String: Any]) -> CaptureStatus {
         var c = CaptureStatus()
         c.cdpReachable = (obj["cdpReachable"] as? Bool) ?? false
         c.feedAvailable = (obj["feedAvailable"] as? Bool) ?? false
         c.feedLive = (obj["feedLive"] as? Bool) ?? false
         c.liveTicks = (obj["liveTicks"] as? [String]) ?? []
+        c.feedSource = obj["feedSource"] as? String
+        c.evaluatorAlive = (obj["evaluatorAlive"] as? Bool) ?? true
         return c
     }
 }
@@ -119,11 +182,11 @@ struct FeedSymbols: Equatable {
 
     static func decode(_ obj: [String: Any]) -> FeedSymbols {
         var s = FeedSymbols()
-        s.backtestable = TradingSymbolScope.filterES((obj["backtestable"] as? [String]) ?? [])
-        s.live = TradingSymbolScope.filterES((obj["live"] as? [String]) ?? [])
-        s.liveTicks = TradingSymbolScope.filterES((obj["liveTicks"] as? [String]) ?? [])
+        s.backtestable = TradingSymbolScope.filterScoped((obj["backtestable"] as? [String]) ?? [])
+        s.live = TradingSymbolScope.filterScoped((obj["live"] as? [String]) ?? [])
+        s.liveTicks = TradingSymbolScope.filterScoped((obj["liveTicks"] as? [String]) ?? [])
         let busiest = obj["busiest"] as? String
-        s.busiest = TradingSymbolScope.isES(busiest) ? busiest : nil
+        s.busiest = TradingSymbolScope.inScope(busiest) ? busiest : nil
         return s
     }
 }
@@ -169,7 +232,7 @@ struct LiveTick: Equatable {
     static func decode(_ obj: [String: Any]) -> LiveTick? {
         if (obj["gated"] as? Bool) == true { return nil }
         guard let sym = obj["symbol"] as? String,
-              TradingSymbolScope.isES(sym),
+              TradingSymbolScope.inScope(sym),
               let p = FeedBars.num(obj["price"] as Any),
               let t = FeedBars.num(obj["ts"] as Any) else { return nil }
         return LiveTick(symbol: sym, price: p, ts: Date(timeIntervalSince1970: t))
@@ -244,7 +307,7 @@ enum EngineRoster {
         guard let rows = obj["rows"] as? [[String: Any]] else { return [] }
         return rows.compactMap { r in
             guard let e = r["engine"] as? String, let s = r["symbol"] as? String else { return nil }
-            guard TradingSymbolScope.isES(s) else { return nil }
+            guard TradingSymbolScope.inScope(s) else { return nil }
             return EngineRow(
                 engine: e, symbol: s,
                 edge: (r["edge"] as? Bool) ?? false,
@@ -275,6 +338,7 @@ struct FireRow: Equatable, Identifiable {
     var outcome: String?
     var pnl: Double?
     var ts: String?
+    var tsEpoch: Double?     // raw unix epoch (seconds) — robust time anchor for chart markers
 }
 
 enum FireFeed {
@@ -284,7 +348,7 @@ enum FireFeed {
             guard let e = r["engine"] as? String, let d = r["direction"] as? String,
                   let entry = FeedBars.num(r["entry"] as Any),
                   let sym = r["symbol"] as? String,
-                  TradingSymbolScope.isES(sym) else { return nil }
+                  TradingSymbolScope.inScope(sym) else { return nil }
             return FireRow(
                 id: Int(FeedBars.num(r["id"] as Any) ?? 0),
                 engine: e, direction: d, entry: entry,
@@ -294,7 +358,8 @@ enum FireFeed {
                 rationale: r["rationale"] as? String,
                 outcome: r["outcome"] as? String,
                 pnl: FeedBars.num(r["pnl"] as Any),
-                ts: r["ts"] as? String)
+                ts: r["ts"] as? String,
+                tsEpoch: FeedBars.num(r["tsEpoch"] as Any))
         }
     }
 }

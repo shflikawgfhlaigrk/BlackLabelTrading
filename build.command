@@ -17,6 +17,40 @@ APP="$BUILD/$APPNAME.app"
 BIN_NAME="Black Label Trading"
 BUNDLE_ID="com.blacklabel.trading"
 
+# --- mode flags --------------------------------------------------------------
+# --devid   : sign Developer-ID + hardened runtime + NON-sandbox entitlements (app-devid.entitlements,
+#             an empty dict) — notarization-ready, and the ONLY build the in-app updater can
+#             self-replace (the sandbox forbids self-replace). The adhoc default path is unchanged.
+# --install : after building, install the fresh bundle into /Applications (atomic swap).
+DEVID=0; INSTALL=0
+for a in "$@"; do case "$a" in --devid) DEVID=1;; --install) INSTALL=1;; esac; done
+
+DEVID_ENTITLEMENTS="$SRC/app-devid.entitlements"
+ADHOC_ENTITLEMENTS="$SRC/app-developerid.entitlements"
+DEVID_IDENTITY=""
+if [ "$DEVID" = "1" ]; then
+  # Resolve the first VALID Developer ID Application identity by HASH (avoids the "ambiguous —
+  # matches N identities" error when more than one valid cert is in the keychain).
+  DEVID_IDENTITY="$(security find-identity -v -p codesigning | awk '/Developer ID Application/{print $2; exit}')"
+  if [ -z "$DEVID_IDENTITY" ]; then
+    echo "ABORT: --devid requested but no 'Developer ID Application' identity is in the keychain."; exit 1
+  fi
+  [ -f "$DEVID_ENTITLEMENTS" ] || { echo "ABORT: missing $DEVID_ENTITLEMENTS"; exit 1; }
+fi
+
+# Sign a bundle per mode: Dev-ID (hardened runtime + non-sandbox + secure timestamp, notarization-
+# ready) or adhoc (the Developer-ID entitlements the bundled Python backend needs — the convenience
+# local build). DEFAULT (no --devid) is byte-for-byte the prior adhoc behavior.
+sign_bundle() {
+  local target="$1"
+  if [ "$DEVID" = "1" ]; then
+    codesign --force --deep --options runtime --timestamp \
+      --entitlements "$DEVID_ENTITLEMENTS" -s "$DEVID_IDENTITY" "$target"
+  else
+    codesign --force --deep --sign - --entitlements "$ADHOC_ENTITLEMENTS" "$target"
+  fi
+}
+
 SDK="$(xcrun --sdk macosx --show-sdk-path)"
 echo "==> SDK: $SDK"
 echo "==> swiftc: $(xcrun --sdk macosx -f swiftc)"
@@ -33,7 +67,7 @@ xcrun --sdk macosx swiftc \
   -sdk "$SDK" \
   -target arm64-apple-macosx13.0 \
   -framework SwiftUI -framework AppKit -framework Charts \
-  -framework AuthenticationServices -framework CryptoKit \
+  -framework AuthenticationServices -framework CryptoKit -framework LocalAuthentication -framework Security \
   -o "$APP/Contents/MacOS/$BIN_NAME" \
   "${SWIFT_FILES[@]}"
 echo "==> Linked executable: $APP/Contents/MacOS/$BIN_NAME"
@@ -54,7 +88,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleName</key><string>Black Label Trading</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>1.0</string>
-  <key>CFBundleVersion</key><string>1</string>
+  <key>CFBundleVersion</key><string>5</string>
   <key>GoogleClientID</key><string></string>
   <key>ITSAppUsesNonExemptEncryption</key><false/>
   <key>LSApplicationCategoryType</key><string>public.app-category.finance</string>
@@ -85,8 +119,8 @@ fi
 [ -f "$SRC/PrivacyInfo.xcprivacy" ] && cp -f "$SRC/PrivacyInfo.xcprivacy" "$APP/Contents/Resources/PrivacyInfo.xcprivacy"
 
 # --- bundle the SELF-CONTAINED data backend (stdlib-only Python; ships NO data) ---
-# The buyer's app captures THEIR OWN WealthCharts feed into THEIR OWN local SQLite store and
-# serves it on 127.0.0.1:8787. These are code only — the store is created empty at runtime.
+# The buyer's app starts its bundled Topstep bridge and receives THEIR OWN feed into THEIR OWN
+# local SQLite store over /webhook/feed. These are code only — the store is created empty at runtime.
 if [ -d "$ROOT/backend" ]; then
   echo "==> Bundling self-contained backend (code only, no data)"
   mkdir -p "$APP/Contents/Resources/backend"
@@ -102,15 +136,28 @@ fi
 # the restricted applesignin entitlement (AMFI SIGKILLs an ad-hoc app that carries applesignin).
 # The Apple button is runtime-gated on the entitlement, so this build hides it. For a notarizable,
 # distributable bundle use ./build-developer-id.sh (hardened runtime + Developer ID + spctl/notary).
-echo "==> Signing (adhoc) with Developer-ID entitlements"
-codesign --force --deep --sign - \
-  --entitlements "$SRC/app-developerid.entitlements" \
-  "$APP"
+echo "==> Signing ($([ "$DEVID" = "1" ] && echo "Developer-ID + hardened runtime + non-sandbox (app-devid.entitlements)" || echo "adhoc with Developer-ID entitlements"))"
+sign_bundle "$APP"
+codesign --verify --deep --strict "$APP"
 
 echo "==> Built: $APP"
 codesign -dv "$APP" 2>&1 | sed 's/^/    /'
 
-if [ "${1:-}" == "--install" ]; then
+# In Dev-ID mode, emit a notarization-ready zip + the exact next steps. (spctl will say "rejected"
+# until the zip is notarized + stapled — that is expected here, not a failure.)
+if [ "$DEVID" = "1" ]; then
+  mkdir -p "$ROOT/dist"
+  DEVID_ZIP="$ROOT/dist/trading-devid-unnotarized.zip"
+  rm -f "$DEVID_ZIP"
+  /usr/bin/ditto --norsrc --noextattr --noqtn -c -k --keepParent "$APP" "$DEVID_ZIP"
+  echo "==> Dev-ID zip (UNNOTARIZED, ready to notarize): $DEVID_ZIP"
+  echo "    sha256 (current): $(shasum -a 256 "$DEVID_ZIP" | cut -d' ' -f1)"
+  codesign -dv --verbose=2 "$APP" 2>&1 | grep -E "Identifier|TeamIdentifier|flags|Authority=Developer ID" | sed 's/^/    /' || true
+  echo "    NEXT: notarize (xcrun notarytool submit --wait / notarize.command), staple"
+  echo "          (xcrun stapler staple), then take the STAPLED zip's sha256 for the manifest."
+fi
+
+if [ "$INSTALL" = "1" ]; then
   echo "==> Installing into /Applications/$APPNAME.app (atomic stage → verify → swap)"
   DEST="/Applications/$APPNAME.app"
   # §5.9 ATOMIC install (was: cp -Rf "$APP" "$DEST" straight into the live path on
@@ -127,8 +174,9 @@ if [ "${1:-}" == "--install" ]; then
   [ -f "$SRC/PrivacyInfo.xcprivacy" ] && cp -f "$SRC/PrivacyInfo.xcprivacy" "$APP/Contents/Resources/PrivacyInfo.xcprivacy"
   echo "==> Staging build into $STAGE"
   cp -Rf "$APP" "$STAGE"
-  echo "==> Re-signing staged bundle (adhoc, with Developer-ID entitlements)"
-  codesign --force --deep --sign - --entitlements "$SRC/app-developerid.entitlements" "$STAGE"
+  echo "==> Re-signing staged bundle ($([ "$DEVID" = "1" ] && echo "Developer-ID + hardened runtime + non-sandbox" || echo "adhoc, with Developer-ID entitlements"))"
+  codesign --remove-signature "$STAGE" 2>/dev/null || true
+  sign_bundle "$STAGE"
   # Verify the staged bundle is whole + signed BEFORE disturbing the live bundle.
   [ -f "$STAGE/Contents/Info.plist" ] || { echo "ABORT: staged bundle incomplete (no Info.plist)"; rm -rf "$STAGE"; exit 1; }
   codesign --verify --deep --strict "$STAGE" || { echo "ABORT: staged bundle fails codesign"; rm -rf "$STAGE"; exit 1; }

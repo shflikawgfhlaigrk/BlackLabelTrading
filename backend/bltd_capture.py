@@ -1,16 +1,17 @@
-"""Black Label Trading — WealthCharts live capture daemon (SELF-CONTAINED, stdlib-only).
+"""Black Label Trading — Topstep/browser live capture daemon (SELF-CONTAINED, stdlib-only).
 
-Ports Utah's WC capture *capability* (utah.integrations.wc_feed, read-only reference) into an
-equivalent the PRODUCT owns. The BUYER signs into their OWN WealthCharts in a Chrome launched
-with remote debugging; this daemon attaches over the Chrome DevTools Protocol, listens to WC's
-realtime candle WebSocket, aggregates ticks into closed bars, and writes the buyer's OWN
+Ports the proven browser-capture capability into an equivalent the PRODUCT owns. The BUYER signs
+into their OWN TopstepX session in a Chrome launched with remote debugging; this daemon attaches
+over the Chrome DevTools Protocol, listens to realtime candle WebSocket frames, aggregates ticks
+into closed bars, and writes the buyer's OWN
 bars/ticks into the product's OWN SQLite store (bltd_store). It then runs the in-process engines
 + edge gate and records a real fire when an engine proves held-out OOS edge on that symbol.
 
 ZERO third-party deps: the CDP WebSocket client is hand-rolled on the stdlib `socket` + a
 minimal RFC6455 implementation, so the product needs no `websockets`/`websocket-client` package.
-SIGNALS-ONLY: read-only on the feed (only Network.enable), never sends an order. Never Yahoo.
-Never fabricates a price — junk frames are dropped. Gates honestly when WC is unreachable.
+CAPTURE is read-only on the feed (only Network.enable); it never sends an order. Order entry is the
+separate bltd_exec engine (OFF by default), invoked after a fire. Never Yahoo.
+Never fabricates a price — junk frames are dropped. Gates honestly when the feed is unreachable.
 
 Run:  python3 bltd_capture.py
 Env:  BLTD_CDP_PORT (default 9223), BLTD_BAR_SECONDS (15), BLTD_LOOKBACK (20),
@@ -29,9 +30,10 @@ import struct
 import threading
 import time
 import urllib.request
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import bltd_store as S
+import bltd_parsers as P
 
 log = logging.getLogger("bltd.capture")
 
@@ -217,13 +219,90 @@ def feed_available() -> bool:
 
 
 # ===========================================================================
-# Chrome lifecycle — the product owns a dedicated remote-debug Chrome profile so the buyer
-# logs into THEIR OWN WealthCharts there (ports the intent of wc_feed.ensure_chrome_wc, but
-# with a PRODUCT-owned profile under the app-support dir — never ~/.utah, never Michael's data).
+# TopstepX auto-inject: discover logged-in TopstepX tabs in the product Chrome and scrape them via
+# the TopstepX parser. This release is sold/setup for TopstepX, so the Connect action must not open
+# or attach WealthCharts/TradingView/etc. by accident.
 # ===========================================================================
-CHROME_APP = "/Applications/Google Chrome.app"
+def discover_feed_pages():
+    """Logged-in TopstepX tabs on the CDP port, as [(name, page), ...]. Counts a tab only when
+    it's a real page with a debugger socket and isn't a login/signin page."""
+    out, pages = [], (cdp_pages() or [])
+    for p in pages:
+        url = (p.get("url") or "")
+        low = url.lower()
+        if (p.get("type") == "page" and p.get("webSocketDebuggerUrl")
+                and "/login" not in low and "signin" not in low
+                and ("topstepx.com" in low or "topstepx" in low)):
+            out.append(("topstepx", p))
+    return out
+
+
+def feeds_available() -> bool:
+    return bool(discover_feed_pages())
+
+
+def watchdog_feed_available() -> bool:
+    """Feed reachability for the self-heal watchdog: any logged-in trading tab, not WC-only."""
+    return feeds_available()
+
+
+# ===========================================================================
+# Chrome lifecycle — the product owns a dedicated remote-debug Chrome profile so the buyer
+# logs into THEIR OWN TopstepX there, with a PRODUCT-owned profile under the app-support dir.
+# ===========================================================================
+# Browser capture needs a Chromium-family browser exposing --remote-debugging-port. Google Chrome is
+# the reference, but Chromium/Brave/Edge all speak the SAME CDP, so the buyer is NOT hard-blocked on a
+# single vendor — resolve the first one actually installed. If NONE is present we never pretend a
+# launch succeeded; we write an honest prerequisite sentinel the app surfaces (RC4 — no silent block).
+_CHROME_CANDIDATES = (
+    "/Applications/Google Chrome.app",
+    "/Applications/Chromium.app",
+    "/Applications/Brave Browser.app",
+    "/Applications/Microsoft Edge.app",
+)
+
+
+def resolve_chrome() -> str | None:
+    """The first installed Chromium-family browser (env override wins). None if nothing is installed."""
+    env = (os.environ.get("BLTD_CHROME_APP") or "").strip()
+    if env and os.path.isdir(env):
+        return env
+    for app in _CHROME_CANDIDATES:
+        if os.path.isdir(app):
+            return app
+    return None
+
+
+def chrome_present() -> bool:
+    return resolve_chrome() is not None
+
+
+def _support_dir() -> str:
+    return os.path.expanduser("~/Library/Application Support/Black Label Trading")
+
+
+def write_chrome_prereq() -> None:
+    """Honest sentinel: browser capture needs a Chromium browser and none is installed. The app reads
+    this and guides the buyer instead of looping 'no logged-in feed' forever. Never fabricates a feed."""
+    try:
+        os.makedirs(_support_dir(), exist_ok=True)
+        with open(os.path.join(_support_dir(), "prereq.json"), "w") as fh:
+            json.dump({"ok": False,
+                       "reason": "Google Chrome is required for browser capture.",
+                       "fix": "",
+                       "detail": "Black Label Trading reads the live data feeding your platform's "
+                                 "charts through a Chromium browser. Install Google Chrome (or "
+                                 "Chromium, Brave, or Edge), then reopen and connect your platform.",
+                       "ts": int(time.time())}, fh)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("capture: could not write chrome prereq: %s", exc)
+
+
+# Backwards-compatible module constant (messaging / default path). Launch functions re-resolve at
+# call time so a browser installed after startup is picked up without forcing a daemon restart.
+CHROME_APP = resolve_chrome() or _CHROME_CANDIDATES[0]
 CHROME_PROFILE = os.path.expanduser(os.environ.get(
-    "BLTD_CHROME_PROFILE", "~/Library/Application Support/Black Label Trading/chrome-wc"))
+    "BLTD_CHROME_PROFILE", "~/Library/Application Support/Black Label Trading/chrome-topstepx"))
 # Don't let Chrome throttle the (possibly backgrounded) WC feed tab — same reason as Utah.
 _NO_THROTTLE = ("--disable-background-timer-throttling",
                 "--disable-backgrounding-occluded-windows",
@@ -236,18 +315,27 @@ def cdp_reachable() -> bool:
 
 
 def launch_chrome() -> bool:
-    """Open the product's remote-debug Chrome on the WC sign-in page using a dedicated,
-    product-owned profile. The buyer logs into THEIR WealthCharts here once; the session
+    """Open the product's remote-debug Chrome on TopstepX using a dedicated,
+    product-owned profile. The buyer logs into THEIR TopstepX here once; the session
     persists in the product's own profile dir. Never raises."""
     import subprocess
+    chrome = resolve_chrome()
+    if not chrome:
+        write_chrome_prereq()
+        log.warning("capture: no Chromium browser installed — wrote prereq, cannot launch")
+        return False
     try:
         os.makedirs(CHROME_PROFILE, exist_ok=True)
         subprocess.Popen(
-            ["open", "-g", "-n", "-a", CHROME_APP, "--args",
-             f"--remote-debugging-port={CDP_PORT}", "--remote-allow-origins=*",
+            ["open", "-g", "-n", "-a", chrome, "--args",
+             f"--remote-debugging-port={CDP_PORT}", "--remote-debugging-address=127.0.0.1",
+             # SECURITY: pin the CDP listener to loopback (off-machine TCP can't reach it). The
+             # "*" origin is a known residual — tightening it needs a live Chrome handshake test
+             # (the capture WS client sends no Origin header), so it is NOT changed blind here.
+             "--remote-allow-origins=*",
              f"--user-data-dir={CHROME_PROFILE}", "--no-first-run",
              "--no-default-browser-check", *_NO_THROTTLE, *_WINDOW,
-             "https://app.wealthcharts.com/"],
+             "https://www.topstepx.com/"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return True
     except Exception as exc:  # noqa: BLE001
@@ -256,9 +344,9 @@ def launch_chrome() -> bool:
 
 
 def ensure_chrome(wait: float = 25.0) -> bool:
-    """Bring up a reachable, logged-in WC feed. If nothing answers on the CDP port, launch the
-    product's debug Chrome and wait for the buyer to have a live WC page. Returns True only when
-    a logged-in WC dashboard is reachable (gates honestly on a logged-out session)."""
+    """Bring up a reachable, logged-in TopstepX feed. If nothing answers on the CDP port, launch the
+    product's debug Chrome and wait for the buyer to have a live TopstepX page. Returns True only
+    when a logged-in TopstepX page is reachable (gates honestly on a logged-out session)."""
     if feed_available():
         return True
     if not cdp_reachable():
@@ -266,6 +354,108 @@ def ensure_chrome(wait: float = 25.0) -> bool:
     deadline = time.monotonic() + wait
     while time.monotonic() < deadline:
         if feed_available():
+            return True
+        time.sleep(1.5)
+    return False
+
+
+# TopstepX sign-in page the daemon auto-opens when it must launch Chrome cold.
+FEED_LOGIN_URLS = (
+    "https://www.topstepx.com/",
+)
+TOPSTEP_OPEN_DEBOUNCE_SECONDS = float(os.environ.get("BLTD_TOPSTEP_OPEN_DEBOUNCE_SECONDS", "90"))
+
+
+def _topstep_open_sentinel() -> str:
+    return os.path.join(_support_dir(), "topstep-opened.json")
+
+
+def _mark_topstep_opened() -> None:
+    try:
+        os.makedirs(_support_dir(), exist_ok=True)
+        with open(_topstep_open_sentinel(), "w") as fh:
+            json.dump({"ts": time.time()}, fh)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("capture: could not mark topstep open sentinel (%s)", exc)
+
+
+def _topstep_opened_recently(seconds: float = TOPSTEP_OPEN_DEBOUNCE_SECONDS) -> bool:
+    try:
+        with open(_topstep_open_sentinel()) as fh:
+            ts = float((json.load(fh) or {}).get("ts", 0))
+        return (time.time() - ts) < seconds
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def topstep_tab_present() -> bool:
+    """Any TopstepX tab in the product Chrome, including login/loading pages."""
+    for p in cdp_pages() or []:
+        url = (p.get("url") or "").lower()
+        if p.get("type") == "page" and p.get("webSocketDebuggerUrl") and "topstepx.com" in url:
+            return True
+    return False
+
+
+def _launch_chrome_multi() -> bool:
+    """Open the product's remote-debug Chrome to TopstepX. Only used when Chrome is cold —
+    never piles tabs onto a running Chrome. Never raises."""
+    import subprocess
+    chrome = resolve_chrome()
+    if not chrome:
+        write_chrome_prereq()
+        log.warning("capture: no Chromium browser installed — wrote prereq, cannot launch")
+        return False
+    try:
+        os.makedirs(CHROME_PROFILE, exist_ok=True)
+        subprocess.Popen(
+            ["open", "-g", "-n", "-a", chrome, "--args",
+             f"--remote-debugging-port={CDP_PORT}", "--remote-debugging-address=127.0.0.1",
+             # SECURITY: pin the CDP listener to loopback (off-machine TCP can't reach it). The
+             # "*" origin is a known residual — tightening it needs a live Chrome handshake test
+             # (the capture WS client sends no Origin header), so it is NOT changed blind here.
+             "--remote-allow-origins=*",
+             f"--user-data-dir={CHROME_PROFILE}", "--no-first-run",
+             "--no-default-browser-check", *_NO_THROTTLE, *FEED_LOGIN_URLS],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        _mark_topstep_opened()
+        return True
+    except Exception as exc:  # noqa: BLE001
+        log.warning("capture: chrome launch failed: %s", exc)
+        return False
+
+
+def open_feed_login_tabs() -> bool:
+    """Open the TopstepX browser-login tab in the product-owned debug Chrome.
+
+    If the debug Chrome is already reachable, use the DevTools /json/new endpoint so the tabs open
+    inside the same remote-debug profile the capture daemon reads. If Chrome is cold, launch it with
+    the full login set. Never raises."""
+    if topstep_tab_present() or _topstep_opened_recently():
+        return True
+    if cdp_reachable():
+        url = FEED_LOGIN_URLS[0]
+        try:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{CDP_PORT}/json/new?{quote(url, safe=':/?&=%')}",
+                method="PUT")
+            urllib.request.urlopen(req, timeout=2).read()
+            _mark_topstep_opened()
+            return True
+        except Exception as exc:  # noqa: BLE001
+            log.debug("capture: CDP open-tab failed for %s (%s)", url, exc)
+    return _launch_chrome_multi()
+
+
+def ensure_feeds(wait: float = 25.0) -> bool:
+    """Bring up Chrome + at least one logged-in TopstepX tab, NO manual scraper setup. Honest:
+    returns False (gated) while logged out — the debug Chrome sits open at the sign-in pages."""
+    if discover_feed_pages():
+        return True
+    open_feed_login_tabs()
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline:
+        if discover_feed_pages():
             return True
         time.sleep(1.5)
     return False
@@ -285,8 +475,19 @@ class Capture:
         self.lookback = lookback if lookback is not None else cfg.get("lookback", LOOKBACK)
         self.edge_gate = edge_gate if edge_gate is not None else cfg.get("edgeGate", EDGE_GATE)
         self.engines = tuple(cfg.get("engines", ENGINES)) or ENGINES
-        self.symbol_filter = {"ES"}          # hard product scope: ES only
+        self.symbol_filter = {"ES"}          # legacy attr (unused); scope now via S.in_scope
         self.alert_webhook = cfg.get("alertWebhook", "")
+        # Execution engine — DEFAULT is a DisarmedExecutor no-op (make_executor falls back to it on
+        # ANY construction error), so capture is byte-identical to signals-only unless the buyer has
+        # explicitly armed live execution. A LIVE order is then still impossible unless every gate in
+        # bltd_exec.precheck passes (arm+live+own-creds+firm-ToS+risk+edge+kill-clear+confirm).
+        try:
+            import bltd_exec
+            self.executor = bltd_exec.make_executor(store)
+        except Exception:  # noqa: BLE001 — no execution if the engine can't load (fail-safe)
+            class _Noop:
+                def on_fire(self, *a, **k): return None
+            self.executor = _Noop()
         self.buf = {}                      # symbol -> [(epoch, close), ...] still-forming
         self.last_key = {}                 # symbol -> last persisted bar_key
         self.last_sig = {}                 # (engine, symbol) -> last direction (fire on flip)
@@ -313,8 +514,8 @@ class Capture:
         now = time.time() if arrival is None else arrival
         ep = int(now) if cd.get("epoch") is None else S.normalize_epoch(cd["epoch"], now)
         sym = cd["symbol"]
-        if not S.is_es_symbol(sym):
-            return                                     # product scope: ES futures only
+        if not S.in_scope(sym):
+            return                                     # accept any in-scope instrument the buyer streams
         close = cd["close"]
         self.latest[sym] = (close, ep)                # in-memory latest tick (flusher persists it)
         self.buf.setdefault(sym, []).append((ep, close))
@@ -391,6 +592,18 @@ class Capture:
                                    rationale=sig.get("rationale"), synthetic=False)
             log.info("FIRE %s %s %s @ %.4f", eng, sym, sig["direction"], ohlc[-1][3])
             self._alert(eng, sym, sig, ohlc[-1][3])
+            self._execute(eng, sym, sig, ohlc[-1][3], len(ohlc))
+
+    def _execute(self, engine, symbol, sig, entry, bar_key):
+        """Hand a gate-passing fire to the EXECUTION engine. Best-effort, never raises into capture.
+        The executor defaults to a DisarmedExecutor no-op (and precheck fails closed) so this is a
+        pure signals-only no-op unless the buyer has explicitly armed live execution with their own
+        creds, their firm permits it, and every risk/edge/kill gate passes (see bltd_exec)."""
+        try:
+            self.executor.on_fire(symbol, sig["direction"], entry, sig.get("stop"),
+                                  sig.get("target"), engine, bar_key)
+        except Exception as exc:  # noqa: BLE001 — execution must NEVER stop capture
+            log.info("executor on_fire skipped: %s", exc)
 
     def _alert(self, engine, symbol, sig, entry):
         """Mirror a real fire out to the buyer's configured alert channel (webhook). Best-effort,
@@ -536,6 +749,85 @@ def _frame_candle(raw: str):
     return S.parse_candle(payload)
 
 
+def _frame_candle_reg(raw, candidates, parser_cache):
+    """CDP envelope -> normalized candle via the pluggable parser registry (bltd_parsers). Cheap
+    raw-bytes prefilter before json.loads (most frames are noise). Per-socket parser cache (keyed by
+    CDP requestId) so detect() runs once per WebSocket, not per frame. Returns None for
+    auth/telemetry/keepalive frames (never fabricates). This is the multi-platform sibling of
+    _frame_candle: the WealthCharts tab still routes to the proven parse_candle (via
+    WealthChartsParser), while TradingView/Tradovate/TopstepX and any platform the generic sniffer
+    recognizes are read by the SAME path."""
+    if "webSocketFrameReceived" not in raw:
+        return None
+    try:
+        m = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(m, dict) or m.get("method") != "Network.webSocketFrameReceived":
+        return None
+    params = m.get("params") or {}
+    payload = (params.get("response") or {}).get("payloadData")
+    if not isinstance(payload, str):
+        return None
+    rid = params.get("requestId")
+    parser = parser_cache.get(rid)
+    if parser is None:
+        parser = P.pick_parser(payload, candidates)
+        if parser is None:
+            return None
+        if rid is not None:
+            if len(parser_cache) > 500:
+                parser_cache.clear()             # bound — sockets churn over a long session
+            parser_cache[rid] = parser
+    return parser.parse(payload)
+
+
+def stream_tab(name, page, cap, *, idle_stall=45.0, _ws=None, _clock=time.monotonic) -> dict:
+    """ONE reader thread for ONE logged-in trading tab -> cap.on_candle (PURE MEMORY, no I/O). The
+    pluggable parser registry (bltd_parsers) handles the platform's frame format, so WealthCharts,
+    TradingView, Tradovate/TopstepX, and any platform the generic sniffer recognizes are read by the
+    SAME reader. Returns (so main() re-spawns a fresh attach) when a producing tab goes quiet, or a
+    non-producing tab (logged out / wrong page) yields nothing for *idle_stall*. The WealthCharts
+    tab routes to the proven parse_candle path — identical to stream_once.
+
+    Bars stay FIVE-FIELD and scope-filtered here (release default ES-family): candle ingestion
+    goes through Capture.on_candle unchanged. The runtime's quote-delta path (_frame_quote / cap.on_quote) is
+    DELIBERATELY NOT ported — that is PU-2, gated on Michael's schema/scope call. ``_ws`` / ``_clock``
+    are test injection seams (same contract as stream_once); production builds a real WSClient on the
+    monotonic clock. Never raises — a dropped hook just returns its counts."""
+    candidates = P.platforms_for_host(page.get("url") or "")
+    parser_cache = {}
+    ws = _ws
+    frames = candles = 0
+    t0 = _clock()
+    last_candle = t0
+    try:
+        if _ws is None:
+            ws = WSClient(page["webSocketDebuggerUrl"])
+            ws.send(json.dumps({"id": 1, "method": "Network.enable"}))
+        while True:
+            now = _clock()
+            if candles == 0 and now - t0 >= idle_stall:
+                break                            # non-producing tab -> stop, free the thread
+            if candles > 0 and now - last_candle >= idle_stall * 2:
+                break                            # was producing, went quiet -> recycle on a fresh attach
+            raw = ws.recv_text()
+            if not raw:
+                continue
+            frames += 1
+            cd = _frame_candle_reg(raw, candidates, parser_cache)
+            if cd:
+                candles += 1
+                last_candle = _clock()
+                cap.on_candle(cd)
+    except Exception as exc:  # noqa: BLE001 — dropped hook / chrome closed
+        log.info("capture[%s]: hook ended (%s)", name, exc)
+    finally:
+        if ws:
+            ws.close()
+    return {"source": name, "frames": frames, "candles": candles}
+
+
 # ===========================================================================
 # Reliability threads — keep ALL SQLite I/O and the heavy edge-gate evaluation OFF the frame read
 # loop, and self-heal a silently-wedged daemon. Ported from the live runtime against the generic
@@ -552,14 +844,51 @@ def _store_is_wedged(prev_seen, prev_progress, cur, now, *, stale_after):
     return prev_seen, prev_progress, (now - prev_progress > stale_after)
 
 
+# --- market-hours gate for the freshness watchdog ---------------------------
+# CME equity-index futures (ES/NQ) trade on Globex Sun 17:00 -> Fri 16:00 CT,
+# with a daily maintenance halt 16:00-17:00 CT Mon-Thu. A closed market leaves
+# the store nothing to advance, so the freshness watchdog must NOT respawn-loop
+# on a weekend/overnight idle — that is normal, not a wedge. PURE so it is
+# unit-tested in isolation. Holidays/early-closes are deliberately NOT modeled:
+# the gate only ever SUPPRESSES a respawn inside a known-closed window, never
+# forces one, so an unmodeled holiday degrades to the prior always-respawn
+# behavior — never worse, never masks a real in-session wedge.
+from datetime import datetime as _datetime
+try:
+    from zoneinfo import ZoneInfo as _ZoneInfo
+    _CENTRAL = _ZoneInfo("America/Chicago")
+except Exception:  # noqa: BLE001 — zoneinfo/tzdata missing: fall back to host-local clock
+    _CENTRAL = None
+
+
+def _central_now(now_epoch=None):
+    """Current (or given-epoch) wall time as a Central-time datetime — the tz CME quotes in."""
+    ts = time.time() if now_epoch is None else now_epoch
+    return _datetime.fromtimestamp(ts, _CENTRAL) if _CENTRAL else _datetime.fromtimestamp(ts)
+
+
+def _market_is_open(dt_central) -> bool:
+    """True when CME equity-index futures are trading at *dt_central* (a Central-time datetime)."""
+    weekday = dt_central.weekday()                  # Mon=0 .. Sun=6
+    minutes = dt_central.hour * 60 + dt_central.minute
+    if weekday == 5:                                # Saturday: closed all day
+        return False
+    if weekday == 6:                                # Sunday: reopens 17:00 CT
+        return minutes >= 17 * 60
+    if weekday == 4:                                # Friday: weekly close at 16:00 CT
+        return minutes < 16 * 60
+    return not (16 * 60 <= minutes < 17 * 60)       # Mon-Thu: closed only for the 16:00-17:00 halt
+
+
 def _freshness_watchdog(store_path, *, stale_after=300.0, check_every=15.0):
     """Self-heal a wedged capture. The in-loop stall watchdog only fires if stream_once's loop is
     actually iterating — it can't see a blocked recv, a silently-failing store write, or a hook that
     parses frames but persists nothing. This thread watches GROUND TRUTH instead: the store's newest
-    tick timestamp. If it stops advancing for *stale_after* seconds WHILE the WC feed is reachable,
+    tick timestamp. If it stops advancing for *stale_after* seconds WHILE a trading feed is reachable,
     capture is wedged — force-exit so launchd (KeepAlive) respawns a fresh daemon that re-attaches
-    and resumes. Gated on feed_available() so a merely logged-out WC (nothing to wedge) never drives
-    a respawn loop; the first observation seeds the baseline so a fresh start gets grace."""
+    and resumes. Gated on watchdog_feed_available() so a merely logged-out browser (nothing to
+    wedge) never drives a respawn loop; the first observation seeds the baseline so a fresh start
+    gets grace."""
     import sqlite3 as _sq
     last_seen, last_progress = -1, time.time()
     while True:
@@ -573,25 +902,46 @@ def _freshness_watchdog(store_path, *, stale_after=300.0, check_every=15.0):
             continue
         last_seen, last_progress, wedged = _store_is_wedged(
             last_seen, last_progress, cur, time.time(), stale_after=stale_after)
-        if wedged and feed_available():
+        if wedged and watchdog_feed_available() and _market_is_open(_central_now()):
             # os._exit fires even when the main thread is hard-blocked; launchd KeepAlive respawns
-            # a fresh daemon that re-attaches. Only trips when the feed IS reachable but the store
-            # stopped advancing — i.e. a real wedge, not a logged-out session.
-            log.warning("capture: store not advancing for %.0fs while feed reachable — exiting so "
-                        "launchd respawns a fresh capture", time.time() - last_progress)
+            # a fresh daemon that re-attaches. Only trips when the feed IS reachable AND the market
+            # is open but the store stopped advancing — a real wedge, not a logged-out session and
+            # not a closed market (weekend/overnight idle leaves nothing to advance).
+            log.warning("capture: store not advancing for %.0fs while feed reachable and market "
+                        "open — exiting so launchd respawns a fresh capture",
+                        time.time() - last_progress)
             os._exit(1)
+
+
+def evaluator_heartbeat_path(store_path: str) -> str:
+    """Liveness file the evaluator touches each cycle, next to the store. The API process (a
+    SEPARATE process, bridged to this daemon ONLY by the shared store) reads its mtime to tell an
+    honest 'evaluator offline — signals paused' state instead of letting an API-feed buyer silently
+    get bars-but-no-fires when this daemon dies."""
+    return os.path.join(os.path.dirname(store_path) or ".", "evaluator.heartbeat")
+
+
+def _touch_heartbeat(store_path: str):
+    try:
+        with open(evaluator_heartbeat_path(store_path), "w") as f:
+            f.write(str(int(time.time())))
+    except OSError as exc:
+        log.info("evaluator heartbeat: %s", exc)
 
 
 def _evaluator_loop(cap, *, every=8.0):
     """Run the signal engines off the capture read loop, every *every* seconds. Decoupling the
     edge-gate evaluation from frame ingestion is what lets a single WS attach stream indefinitely
-    instead of wedging after ~75s under the old design that ran the engines inline in _roll."""
+    instead of wedging after ~75s under the old design that ran the engines inline in _roll.
+    Touches the heartbeat each cycle so the API process can prove this evaluator is alive."""
+    _touch_heartbeat(cap.store.path)             # immediate liveness at start
     while True:
         time.sleep(every)
         try:
             cap.evaluate_all()
         except Exception as exc:  # noqa: BLE001
             log.info("evaluator loop: %s", exc)
+        _touch_heartbeat(cap.store.path)         # alive even on a quiet (no-fire) cycle
 
 
 def _flusher_loop(cap, *, every=0.3):
@@ -621,15 +971,38 @@ def main():
     # runs by default; set BLTD_CAPTURE_ENGINES=0 to capture data only without firing.
     if os.environ.get("BLTD_CAPTURE_ENGINES", "1") != "0":
         threading.Thread(target=_evaluator_loop, args=(cap,), daemon=True).start()
+    if os.environ.get("BLTD_CAPTURE_BROWSER", "1") == "0":
+        log.info("capture: browser readers disabled; flusher + evaluator heartbeat only")
+        while True:
+            time.sleep(60)
+    # AUTO-INJECT TOPSTEPX: discover logged-in TopstepX tabs and run one reader thread per tab into
+    # the shared store. A TopstepX tab the buyer logs into mid-session is picked up on rediscovery.
+    # BLTD_AUTO_BROWSER=0 -> never auto-open Chrome here (the in-app "Open browser capture" button
+    # opens it on demand via /api/connect). The flusher + evaluator threads above run regardless,
+    # so bars captured from browser platform sessions are evaluated without blocking frame reads.
+    auto_browser = os.environ.get("BLTD_AUTO_BROWSER", "1") != "0"
+    readers = {}     # webSocketDebuggerUrl -> (name, Thread)
     while True:
-        if not ensure_chrome():
-            log.info("capture: WC not reachable on CDP :%d — the product's debug Chrome is "
-                     "open; sign into YOUR WealthCharts there (gated, never faked)", CDP_PORT)
+        present = bool(discover_feed_pages())
+        if not present and auto_browser:
+            present = ensure_feeds()
+        if not present:
+            log.info("capture: no logged-in trading feed on CDP :%d (auto_browser=%s) — flusher + "
+                     "evaluator running; open browser capture and sign into a trading platform",
+                     CDP_PORT, auto_browser)
             time.sleep(5)
             continue
-        r = stream_once(store, shared_cap=cap)
-        log.info("capture: %s", r)
-        time.sleep(2)
+        for name, page in discover_feed_pages():
+            url = page["webSocketDebuggerUrl"]
+            cur = readers.get(url)
+            if cur is None or not cur[1].is_alive():
+                t = threading.Thread(target=stream_tab, args=(name, page, cap), daemon=True)
+                t.start()
+                readers[url] = (name, t)
+                log.info("capture[%s]: reader attached -> %s", name, (page.get("url") or "")[:60])
+        for url in [u for u, (n, t) in readers.items() if not t.is_alive()]:
+            readers.pop(url, None)     # let a re-logged-in tab re-attach on the next rediscovery
+        time.sleep(3)    # rediscover so a newly-logged-in platform is auto-attached, no restart
 
 
 if __name__ == "__main__":

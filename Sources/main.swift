@@ -2,7 +2,9 @@ import SwiftUI
 import AppKit
 
 enum Section: String, CaseIterable, Identifiable {
+    case feeds = "Connect"
     case signals = "Signals", chart = "Chart", grid = "Grid", watchlists = "Watchlists", screener = "Screener", alerts = "Alerts"
+    case execution = "Execution"
     case backtest = "Backtest", builder = "Strategy Builder", patterns = "Patterns", replay = "Replay", paper = "Paper Trade"
     case journal = "Journal", analytics = "Analytics"
     case calculators = "Calculators", firms = "Prop Firms", settings = "Settings"
@@ -15,6 +17,7 @@ enum Section: String, CaseIterable, Identifiable {
         case .watchlists:  return "star.fill"
         case .screener:    return "line.3.horizontal.decrease.circle.fill"
         case .alerts:      return "bell.badge.fill"
+        case .execution:   return "bolt.shield.fill"
         case .backtest:    return "clock.arrow.circlepath"
         case .builder:     return "wand.and.stars"
         case .patterns:    return "waveform.path.ecg.rectangle.fill"
@@ -22,6 +25,7 @@ enum Section: String, CaseIterable, Identifiable {
         case .paper:       return "doc.text.magnifyingglass"
         case .journal:     return "list.bullet.rectangle.fill"
         case .analytics:   return "chart.bar.xaxis"
+        case .feeds:       return "antenna.radiowaves.left.and.right"
         case .calculators: return "function"
         case .firms:       return "building.columns.fill"
         case .settings:    return "gearshape.fill"
@@ -30,9 +34,9 @@ enum Section: String, CaseIterable, Identifiable {
     // Sidebar grouping for a cleaner information architecture.
     var group: String {
         switch self {
-        case .signals, .chart, .grid, .watchlists, .screener, .alerts:  return "Markets"
+        case .feeds, .signals, .chart, .grid, .watchlists, .screener, .alerts, .execution:  return "Markets"
         case .backtest, .builder, .patterns, .replay, .paper, .journal, .analytics: return "Research"
-        case .calculators, .firms, .settings:                           return "Tools"
+        case .calculators, .firms, .settings:                   return "Tools"
         }
     }
     static let groups = ["Markets", "Research", "Tools"]
@@ -73,7 +77,8 @@ struct SidebarRow: View {
 
 // App-wide navigation state so the command palette + deep actions can switch screens.
 final class Nav: ObservableObject {
-    @Published var section: Section = .signals
+    // Land a brand-new buyer on Connect first — the one thing they must do (sign into their platform).
+    @Published var section: Section = .feeds
     @Published var showPalette = false
 }
 
@@ -135,6 +140,7 @@ struct MainView: View {
                     case .watchlists:  WatchlistsScreen()
                     case .screener:    ScreenerScreen()
                     case .alerts:      AlertsScreen()
+                    case .execution:   ExecutionScreen()
                     case .backtest:    BacktestScreen()
                     case .builder:     StrategyBuilderScreen()
                     case .patterns:    PatternsScreen()
@@ -142,6 +148,7 @@ struct MainView: View {
                     case .paper:       PaperTradeScreen()
                     case .journal:     JournalScreen()
                     case .analytics:   AnalyticsScreen()
+                    case .feeds:       ConnectFeedScreen()
                     case .calculators: CalculatorsScreen()
                     case .firms:       FirmsScreen()
                     case .settings:    SettingsScreen()
@@ -188,9 +195,16 @@ struct RootView: View {
             .preferredColorScheme(.dark)
             .onAppear { NotificationCenterBridge.configure(alerts) }
             // On sign-in, hand the buyer's session email to the own backend so the live feed
-            // banner reflects REAL capture state (never a fabricated "connected").
+            // banner reflects REAL webhook state (never a fabricated "connected").
             .onChange(of: session.signedIn) { signedIn in
-                if signedIn { Task { await feed.connect(email: session.email) } }
+                // On sign-in: hand the session email to the own backend, then refresh the no-creds
+                // webhook state. The sender posts data; no broker API key is replayed.
+                if signedIn {
+                    Task {
+                        await feed.connect(email: session.email)
+                        await FeedReconnect.reconnectSaved(feed)
+                    }
+                }
             }
     }
 }
@@ -236,8 +250,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         NSApp.setActivationPolicy(.regular); NSApp.activate(ignoringOtherApps: true)
+        installMainMenu()   // App + Edit menu: "Check for Updates…" + Cut/Copy/Paste/Select-All
+        // Auto-update: silent daily check on the Dev-ID build (no-ops on adhoc — the manifest just
+        // describes a build the user already has). Only surfaces UI if an update is actually
+        // available. App-shell only — never touches engines, the feed, the edge-gate, or signals.
+        MainActor.assumeIsolated { UpdaterUI.checkInBackgroundIfDue() }
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ s: NSApplication) -> Bool { true }
+
+    /// "Check for Updates…" menu action — always reports something (prompt / up-to-date / error).
+    @objc func checkForUpdatesAction(_ sender: Any?) { MainActor.assumeIsolated { UpdaterUI.checkInteractively() } }
+
+    /// A bare NSApplication has NO main menu, so the standard text shortcuts (⌘V paste, ⌘C copy,
+    /// ⌘X cut, ⌘A select-all, ⌘Z undo) route nowhere and silently fail in every text field, and
+    /// there is no home for "Check for Updates…". Install a minimal App + Edit menu whose items
+    /// target the first responder (the focused field) plus the updater action.
+    private func installMainMenu() {
+        let main = NSMenu()
+        let appItem = NSMenuItem(); main.addItem(appItem)
+        let appMenu = NSMenu()
+        let upd = appMenu.addItem(withTitle: "Check for Updates…", action: #selector(checkForUpdatesAction(_:)), keyEquivalent: "")
+        upd.target = self
+        appMenu.addItem(NSMenuItem.separator())
+        appMenu.addItem(withTitle: "Hide \(window.title)", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
+        appMenu.addItem(NSMenuItem.separator())
+        appMenu.addItem(withTitle: "Quit \(window.title)", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        appItem.submenu = appMenu
+        let editItem = NSMenuItem(); main.addItem(editItem)
+        let edit = NSMenu(title: "Edit")
+        edit.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+        let redo = edit.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "z"); redo.keyEquivalentModifierMask = [.command, .shift]
+        edit.addItem(NSMenuItem.separator())
+        edit.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        edit.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        edit.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        edit.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editItem.submenu = edit
+        NSApp.mainMenu = main
+    }
 }
 
 let app = NSApplication.shared

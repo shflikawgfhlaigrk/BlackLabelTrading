@@ -234,7 +234,7 @@ struct StrategyBuilderScreen: View {
                     Text("Rules that map onto live-snapshot metrics (price / RSI vs a constant) can become an alert you’ll get notified on. Indicator-vs-indicator rules (e.g. SMA cross) stay backtest-only — we tell you which, never silently drop logic.")
                         .font(.system(size: 11, design: .rounded)).foregroundColor(BLTheme.sub).fixedSize(horizontal: false, vertical: true)
                     HStack(spacing: 10) {
-                        bltTextField("ES contract", $alertSymbol, placeholder: "ES or CM.ESU6")
+                        bltTextField("Symbol", $alertSymbol, placeholder: "e.g. ES, NQ, CL, EURUSD")
                         GoldButton(label: "Create alert", icon: "bell.fill") { exportAlert() }
                             .disabled(alertSymbol.trimmingCharacters(in: .whitespaces).isEmpty)
                             .opacity(alertSymbol.trimmingCharacters(in: .whitespaces).isEmpty ? 0.5 : 1)
@@ -313,8 +313,8 @@ struct StrategyBuilderScreen: View {
 
     private func exportAlert() {
         let s = alertSymbol.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
-        guard TradingSymbolScope.isES(s) else {
-            exportNote = "Alerts are ES-only. Use ES or a captured ES contract."
+        guard TradingSymbolScope.inScope(s) else {
+            exportNote = "Enter a valid symbol (e.g. ES, NQ, CL, EURUSD)."
             return
         }
         let (alert, unmappable) = VisualStrategyEngine.toAlert(strat, symbol: s)

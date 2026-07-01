@@ -152,7 +152,7 @@ struct WatchlistsScreen: View {
 
             if watch.lists.isEmpty {
                 EmptyState(icon: "star", title: "No watchlists yet",
-                           hint: "Create a list, then add the ES contracts you trade. Enter each contract's latest snapshot (price, % change, RSI, relative volume) and the Screener and Alerts run on exactly those values.")
+                           hint: "Create a list, then add the instruments you trade. Enter each symbol's latest snapshot (price, % change, RSI, relative volume) and the Screener and Alerts run on exactly those values.")
                     .padding(.top, 24)
                 Spacer()
             } else {
@@ -167,16 +167,16 @@ struct WatchlistsScreen: View {
                         if let list = list {
                             // Add-symbol row.
                             HStack(spacing: 10) {
-                                Field(title: "Add ES contract", text: $newSymbol, prompt: "ES or CM.ESU6")
+                                Field(title: "Add symbol", text: $newSymbol, prompt: "e.g. ES, NQ, CL, EURUSD")
                                 GoldButton(label: "Add", icon: "plus") {
                                     let s = newSymbol.trimmingCharacters(in: .whitespacesAndNewlines)
-                                    guard TradingSymbolScope.isES(s) else { return }
+                                    guard TradingSymbolScope.inScope(s) else { return }
                                     watch.addSymbol(s, to: list.id); newSymbol = ""
                                 }.padding(.top, 18)
                             }
                             if list.symbols.isEmpty {
                                 EmptyState(icon: "plus.magnifyingglass", title: "No symbols in “\(list.name)”",
-                                           hint: "Add an ES contract above, then tap it to enter its latest snapshot — those values power the Screener and Alerts.")
+                                           hint: "Add a symbol above, then tap it to enter its latest snapshot — those values power the Screener and Alerts.")
                             } else {
                                 // Header row.
                                 watchHeader
@@ -336,7 +336,13 @@ struct ScreenerScreen: View {
     @State private var addA = ""
     @State private var addB = ""
 
-    private var universe: [WatchSymbol] { watch.allSymbols }
+    // Dedup by display symbol (keep first): a ticker held in multiple watchlists must count ONCE,
+    // else results.count / universe.count inflate and the screener shows duplicate rows + CSV lines.
+    // (Set(allSymbols) won't collapse them — WatchSymbol hashes by its unique id.)
+    private var universe: [WatchSymbol] {
+        var seen = Set<String>()
+        return watch.allSymbols.filter { seen.insert($0.display).inserted }
+    }
     private var results: [WatchSymbol] { Screener.run(effectiveQuery, over: universe) }
     private var effectiveQuery: ScreenQuery { var q = query; q.symbolContains = symbolText; return q }
 
@@ -514,9 +520,9 @@ struct AlertsScreen: View {
                     GoldButton(label: "New alert", icon: "plus") { showNew = true }
                 }
 
-                // Evaluate panel — honest: no live feed, so the user updates snapshots then runs a check.
+                // Evaluate panel — honest: alerts run on entered snapshots, not the live feed.
                 Panel(title: "Run a check", icon: "play.circle.fill") {
-                    Text("This build has no live feed. Update a symbol's snapshot in Watchlists, then run a check — any alert whose condition is newly met fires a macOS notification. “Crosses” compares against the snapshot from the previous check.")
+                    Text("Watchlist alerts run on the snapshots you enter, not the live feed. Update a symbol's snapshot in Watchlists, then run a check — any alert whose condition is newly met fires a macOS notification. “Crosses” compares against the snapshot from the previous check.")
                         .font(.system(size: 11.5, design: .rounded)).foregroundColor(BLTheme.sub).fixedSize(horizontal: false, vertical: true)
                     HStack(spacing: 10) {
                         GoldButton(label: "Check now against watchlists", icon: "bolt.fill") {
@@ -608,7 +614,7 @@ struct AlertEditor: View {
                         .frame(width: 30, height: 30).background(BLTheme.goldGrad).clipShape(RoundedRectangle(cornerRadius: 9))
                     Text("New alert").font(.system(size: 20, weight: .heavy, design: .rounded)).foregroundColor(BLTheme.text)
                 }
-                Field(title: "ES contract", text: $symbol, prompt: "ES or CM.ESU6")
+                Field(title: "Symbol", text: $symbol, prompt: "e.g. ES, NQ, CL, EURUSD")
                 if !knownSymbols.isEmpty {
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: 6) {
@@ -650,7 +656,7 @@ struct AlertEditor: View {
                     GhostButton(label: "Cancel") { dismiss() }
                     GoldButton(label: "Create alert", icon: "checkmark") {
                         let s = symbol.trimmingCharacters(in: .whitespacesAndNewlines)
-                        guard TradingSymbolScope.isES(s), !conditions.isEmpty else { return }
+                        guard TradingSymbolScope.inScope(s), !conditions.isEmpty else { return }
                         alerts.add(TradeAlert(symbol: s.uppercased(), conditions: conditions, combine: combine, enabled: true, repeats: repeats))
                         dismiss()
                     }

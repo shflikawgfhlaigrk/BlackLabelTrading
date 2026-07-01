@@ -118,8 +118,12 @@ final class BLChartNSView: NSView {
     private func priceAtY(_ py: CGFloat) -> Double {
         let r = plotRect(); guard r.height > 0 else { return 0 }
         let d = visibleDomain()
-        let t = Double((py - r.minY) / r.height)
-        return d.lo + t * (d.hi - d.lo)
+        // Exact inverse of the renderer's price->y, with the SAME log predicate (ChartRender uses
+        // ind.logScale && dom.lo > 0, mapping topY: r.maxY / bottomY: r.minY). A linear-only inverse
+        // commits drawings at the wrong price on a log-scaled chart.
+        let useLog = indicators.logScale && d.lo > 0
+        return ChartScale.priceAtY(Double(py), lo: d.lo, hi: d.hi,
+                                   topY: Double(r.maxY), bottomY: Double(r.minY), log: useLog)
     }
 
     private func clampWindow() {
@@ -268,8 +272,16 @@ final class BLChartNSView: NSView {
         case .rect:
             ctx.stroke(CGRect(x: min(s.x, c.x), y: min(s.y, c.y), width: abs(c.x - s.x), height: abs(c.y - s.y)))
         case .fib:
+            // Interpolate fib levels in PRICE space (then map back through yPixel) so the preview
+            // matches the committed render — on a log chart, equal price fractions are not equal
+            // pixel fractions, so a pixel-space preview would drift from where the level commits.
+            let d = visibleDomain()
+            let useLog = indicators.logScale && d.lo > 0
+            let p1 = priceAtY(s.y), p2 = priceAtY(c.y)
             for ratio in [0.0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0] {
-                let y = s.y + (c.y - s.y) * CGFloat(ratio)
+                let levelPrice = p1 + (p2 - p1) * ratio
+                let y = CGFloat(ChartScale.yPixel(levelPrice, lo: d.lo, hi: d.hi,
+                                                  topY: Double(r.maxY), bottomY: Double(r.minY), log: useLog))
                 ctx.move(to: CGPoint(x: r.minX, y: y)); ctx.addLine(to: CGPoint(x: r.maxX, y: y))
             }
             ctx.strokePath()

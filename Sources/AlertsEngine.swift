@@ -153,8 +153,12 @@ final class AlertStore: ObservableObject {
                 onFire?(alerts[idx], cur)
             }
         }
-        // Record current as previous for next pass.
-        for s in symbols { lastSeen[s.symbol.uppercased()] = s }
+        // Record current as previous for next pass — using the SAME canonical keep-first snapshot
+        // the evaluation read (byTicker), NOT a last-write-wins pass over raw `symbols`. If a ticker
+        // sits in two watchlists with different snapshots, mismatched maps would synthesize a phantom
+        // cross next pass (eval reads keep-first, prev stored last-write). Iterating byTicker keeps
+        // 'previous' consistent with 'current', so no value change => no fire.
+        for (key, s) in byTicker { lastSeen[key] = s }
         if !fired.isEmpty { fireLog.insert(contentsOf: fired, at: 0); if fireLog.count > 200 { fireLog = Array(fireLog.prefix(200)) } }
         return fired
     }

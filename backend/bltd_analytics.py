@@ -33,14 +33,22 @@ def _trades_for(engine: str, ohlc, cfg):
     return S.engine_trades(engine, ohlc[split:], lookback, cfg), split
 
 
+# Headline ratio stats (win-rate / profit-factor / expectancy / risk ratios / payoff) are only
+# meaningful on a real sample. Below this many trades they would over-state from 1-2 lucky trades,
+# so we keep the descriptive COUNTS but zero the ratios and flag sufficientSample=False (honest).
+MIN_STATS_N = 10
+
+
 def _stats(trades):
-    """Headline stats over a trade list. Pure. Returns explicit zeros (not None) on empty."""
+    """Headline stats over a trade list. Pure. Returns explicit zeros (not None) on empty, and
+    zeroes the ratio stats (with sufficientSample=False) on a sub-threshold sample so a single
+    lucky trade never renders as a 100% win-rate / huge profit-factor headline."""
     n = len(trades)
     if n == 0:
         return {"trades": 0, "wins": 0, "losses": 0, "winRate": 0.0, "expectancyR": 0.0,
                 "netPts": 0.0, "totalR": 0.0, "profitFactor": 0.0, "maxDrawdownR": 0.0,
                 "sharpe": 0.0, "sortino": 0.0, "avgWinR": 0.0, "avgLossR": 0.0, "payoff": 0.0,
-                "longestWin": 0, "longestLoss": 0}
+                "longestWin": 0, "longestLoss": 0, "sufficientSample": False}
     rs = [t["r"] for t in trades]
     wins_r = [r for r in rs if r > 0]
     loss_r = [r for r in rs if r < 0]
@@ -49,7 +57,9 @@ def _stats(trades):
     expectancy = total_r / n
     gross_win = sum(wins_r)
     gross_loss = -sum(loss_r)
-    pf = (gross_win / gross_loss) if gross_loss > 0 else gross_win
+    # Profit factor is gross_win/gross_loss. With zero losing trades it is mathematically
+    # UNDEFINED (not "sum of R") — report None so a client renders "—", never an inflated number.
+    pf = (gross_win / gross_loss) if gross_loss > 0 else None
     net_pts = sum((t["exit"] - t["entry"]) if t["dir"] == "long" else (t["entry"] - t["exit"]) for t in trades)
     # equity-curve drawdown in R
     peak = cum = 0.0
@@ -58,15 +68,16 @@ def _stats(trades):
         cum += r
         peak = max(peak, cum)
         mdd = min(mdd, cum - peak)
-    # Sharpe / Sortino on per-trade R (annualization is meaningless here; trade-level ratio)
+    # Sharpe / Sortino on per-trade R — a plain per-trade mean/sd ratio. NO sqrt(n) factor (that is
+    # the System Quality Number, a different statistic; multiplying by sqrt(n) inflated both here).
     mean = expectancy
     var = sum((r - mean) ** 2 for r in rs) / n
     sd = math.sqrt(var) if var > 0 else 0.0
-    sharpe = (mean / sd * math.sqrt(n)) if sd > 0 else 0.0
+    sharpe = (mean / sd) if sd > 0 else 0.0
     downside = [min(0.0, r - 0.0) for r in rs]
     dvar = sum(d * d for d in downside) / n
     dsd = math.sqrt(dvar) if dvar > 0 else 0.0
-    sortino = (mean / dsd * math.sqrt(n)) if dsd > 0 else 0.0
+    sortino = (mean / dsd) if dsd > 0 else 0.0
     avg_win = (gross_win / wins) if wins else 0.0
     avg_loss = (-gross_loss / losses) if losses else 0.0
     payoff = (avg_win / abs(avg_loss)) if avg_loss != 0 else 0.0
@@ -83,12 +94,18 @@ def _stats(trades):
             cw = cl = 0
         lw = max(lw, cw)
         ll = max(ll, cl)
-    return {"trades": n, "wins": wins, "losses": losses, "winRate": round(wins / n, 4),
-            "expectancyR": round(expectancy, 4), "netPts": round(net_pts, 4),
-            "totalR": round(total_r, 4), "profitFactor": round(pf, 4),
-            "maxDrawdownR": round(mdd, 4), "sharpe": round(sharpe, 4), "sortino": round(sortino, 4),
-            "avgWinR": round(avg_win, 4), "avgLossR": round(avg_loss, 4), "payoff": round(payoff, 4),
-            "longestWin": lw, "longestLoss": ll}
+    enough = n >= MIN_STATS_N
+    out = {"trades": n, "wins": wins, "losses": losses, "winRate": round(wins / n, 4),
+           "expectancyR": round(expectancy, 4), "netPts": round(net_pts, 4),
+           "totalR": round(total_r, 4), "profitFactor": (round(pf, 4) if pf is not None else None),
+           "maxDrawdownR": round(mdd, 4), "sharpe": round(sharpe, 4), "sortino": round(sortino, 4),
+           "avgWinR": round(avg_win, 4), "avgLossR": round(avg_loss, 4), "payoff": round(payoff, 4),
+           "longestWin": lw, "longestLoss": ll, "sufficientSample": enough}
+    if not enough:
+        # too few trades for honest ratios — keep counts, suppress the headline ratios
+        for k in ("winRate", "expectancyR", "profitFactor", "sharpe", "sortino", "payoff"):
+            out[k] = 0.0 if k != "profitFactor" else None
+    return out
 
 
 def _equity_curve(trades):
@@ -127,14 +144,39 @@ def full_backtest(engine: str, ohlc, cfg=None) -> dict:
 # ===========================================================================
 # screener — run engines across symbols, rank by edge
 # ===========================================================================
+def _benjamini_hochberg(pvals, q) -> set:
+    """Indices (into pvals) that survive a Benjamini–Hochberg FDR correction at level q. Controls the
+    EXPECTED false-discovery rate across the whole family of tests, so screening many engine×symbol
+    cells doesn't inflate the candidate count by ~alpha×grid-size. Returns the indices of the
+    rejected nulls (the genuine candidates)."""
+    m = len(pvals)
+    if m == 0:
+        return set()
+    order = sorted(range(m), key=lambda i: pvals[i])      # ascending p
+    k_max = -1
+    for rank, idx in enumerate(order, start=1):           # rank 1..m
+        if pvals[idx] <= (rank / m) * q:
+            k_max = rank
+    if k_max < 0:
+        return set()
+    return set(order[:k_max])                             # all cells up to the largest passing rank
+
+
 def screen(store, symbols, engines, cfg=None) -> list[dict]:
     """For every (engine, symbol), run the gate and return a ranked row list. Proven edges first,
     then by net points. Pure read over the store. Honest: rows with too-few bars are flagged
-    'warming' rather than dropped, so the screener never lies by omission."""
+    'warming' rather than dropped, so the screener never lies by omission.
+
+    A cell is a candidate ONLY if it passes BOTH (a) the per-test significance gate AND (b) a
+    grid-wide Benjamini–Hochberg FDR correction across every testable cell — so a 20-instrument ×
+    9-engine screen can't surface ~5%×180 spurious 'candidates' just from grid size. A cell that is
+    per-test significant but rejected by the family-wide correction is shown honestly as such."""
     cfg = cfg or store.config()
     lookback = cfg.get("lookback", S.LOOKBACK)
+    q = cfg.get("fdrQ", 0.10)
     rows = []
-    for sym in S.es_symbols(symbols):
+    testable = []                                         # (row_index, pEdge) for the BH family
+    for sym in S.scoped_symbols(symbols):
         ohlc = store.ohlc(sym)
         bars = len(ohlc)
         for eng in engines:
@@ -143,13 +185,25 @@ def screen(store, symbols, engines, cfg=None) -> list[dict]:
             if bars < lookback + 2:
                 rows.append({"engine": eng, "symbol": sym, "edge": False, "warming": True,
                              "bars": bars, "winRate": 0.0, "netPts": 0.0, "expectancyR": 0.0,
-                             "trades": 0, "reason": f"warming ({bars} bars, arms at {lookback + 2})"})
+                             "trades": 0, "pEdge": 1.0, "reason": f"warming ({bars} bars, arms at {lookback + 2})"})
                 continue
             v = S.PROVERS[eng](ohlc, cfg)
-            rows.append({"engine": eng, "symbol": sym, "edge": bool(v.get("ok")), "warming": False,
-                         "bars": bars, "winRate": v.get("winRate", 0.0), "netPts": v.get("netPts", 0.0),
-                         "expectancyR": v.get("expectancyR", 0.0), "trades": v.get("trades", 0),
-                         "reason": v.get("reason", "")})
+            row = {"engine": eng, "symbol": sym, "edge": bool(v.get("ok")), "warming": False,
+                   "bars": bars, "winRate": v.get("winRate", 0.0), "netPts": v.get("netPts", 0.0),
+                   "expectancyR": v.get("expectancyR", 0.0), "trades": v.get("trades", 0),
+                   "pEdge": v.get("pEdge", 1.0), "reason": v.get("reason", "")}
+            rows.append(row)
+            if v.get("trades", 0) > 0:
+                testable.append((len(rows) - 1, v.get("pEdge", 1.0)))
+    # Grid-wide FDR control: among per-test-significant cells, keep only those that also survive BH.
+    survivors = _benjamini_hochberg([p for (_, p) in testable], q)
+    kept = {testable[i][0] for i in survivors}
+    m = len(testable)
+    for ri, row in enumerate(rows):
+        if row["edge"] and ri not in kept:               # per-test sig but rejected family-wide
+            row["edge"] = False
+            row["reason"] = (f"per-test significant (p={row.get('pEdge', 1.0):.3f}) but rejected by "
+                             f"grid-wide FDR control across {m} tests (q={q:.2f})")
     rows.sort(key=lambda r: (not r["edge"], r["warming"], -r["netPts"]))
     return rows
 
@@ -233,12 +287,14 @@ def studies(ohlc, cfg=None) -> dict:
     cfg = cfg or S.CONFIG_DEFAULTS
     closes = [b[3] for b in ohlc]
     if not closes:
-        return {"emaFast": [], "emaSlow": [], "vwap": [], "rsi": [],
+        return {"emaFast": [], "emaSlow": [], "typicalAvg": [], "rsi": [],
                 "bbMid": [], "bbUpper": [], "bbLower": []}
     mid, upper, lower = bollinger(closes, 20, 2.0)
     return {"emaFast": [round(x, 6) for x in ema(closes, 8)],
             "emaSlow": [round(x, 6) for x in ema(closes, 21)],
-            "vwap": [round(x, 6) for x in vwap(ohlc)],
+            # NOT volume-weighted (WC bars carry no volume) — a running typical-price average. Named
+            # honestly so a client never renders it as a real VWAP. Real VWAP awaits captured volume.
+            "typicalAvg": [round(x, 6) for x in vwap(ohlc)],
             "rsi": [None if x is None else round(x, 3) for x in rsi(closes, 14)],
             "bbMid": [None if x is None else round(x, 6) for x in mid],
             "bbUpper": [None if x is None else round(x, 6) for x in upper],

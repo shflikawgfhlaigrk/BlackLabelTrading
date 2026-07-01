@@ -1,5 +1,5 @@
 #!/bin/bash
-# Black Label Trading — notarize + staple the Developer-ID build (FOUNDER ONLY — needs Apple creds).
+# Black Label Trading — guarded notarization wrapper (FOUNDER ONLY — needs Apple creds).
 #
 # The bundle in ./build is already FULLY Developer-ID-signed (hardened runtime + secure timestamp,
 # real "Developer ID Application: 745ZPGFRA5" cert, no app-sandbox). The ONLY remaining step is
@@ -8,39 +8,40 @@
 #
 # ONE-TIME credential setup (pick ONE), then this script reuses the stored profile:
 #   A) App-specific password (appleid.apple.com -> Sign-In & Security -> App-Specific Passwords):
-#        xcrun notarytool store-credentials blacklabel-notary \
+#        xcrun notarytool store-credentials BL_NOTARY \
 #          --apple-id "you@appleid" --team-id 745ZPGFRA5 --password "abcd-efgh-ijkl-mnop"
 #   B) App Store Connect API key (.p8):
-#        xcrun notarytool store-credentials blacklabel-notary \
+#        xcrun notarytool store-credentials BL_NOTARY \
 #          --key AuthKey_XXXX.p8 --key-id XXXX --issuer <issuer-uuid>
 #
-# Then:  ./notarize.command
+# Then, after Michael explicitly approves Apple contact:
+#        ./notarize.command --submit
 set -euo pipefail
 cd "$(dirname "$0")"
-APP="build/Black Label Trading.app"
-ZIP="build/Black-Label-Trading-DeveloperID.zip"
-PROFILE="${NOTARY_PROFILE:-blacklabel-notary}"
+NOTARY_PROFILE="${NOTARY_PROFILE:-BL_NOTARY}"
+export NOTARY_PROFILE
 
-[ -d "$APP" ] || { echo "FAIL: $APP not found — run ./build-developer-id.sh first." >&2; exit 1; }
-
-echo "==> Pre-flight: signature must be valid Developer-ID + hardened runtime before submitting"
-codesign --verify --deep --strict --verbose=2 "$APP"
-codesign -dvvv "$APP" 2>&1 | grep -q "flags=0x10000(runtime)" || { echo "FAIL: hardened runtime missing" >&2; exit 1; }
-
-echo "==> (Re)packing notarization zip (ditto preserves the signature)"
-rm -f "$ZIP"; /usr/bin/ditto -c -k --keepParent "$APP" "$ZIP"
-
-echo "==> Submitting to Apple notary (profile: $PROFILE) — waits for the verdict"
-xcrun notarytool submit "$ZIP" --keychain-profile "$PROFILE" --wait
-
-echo "==> Stapling the notarization ticket onto the .app"
-xcrun stapler staple "$APP"
-
-echo "==> Re-packing the STAPLED, distributable zip"
-rm -f "$ZIP"; /usr/bin/ditto -c -k --keepParent "$APP" "$ZIP"
-
-echo "==> Final Gatekeeper assessment (should now ACCEPT):"
-spctl -a -t exec -vv "$APP"
-xcrun stapler validate "$APP"
-echo ""
-echo "==> NOTARIZED + STAPLED. Distributable: $ZIP"
+case "${1:-}" in
+  --submit)
+    shift
+    exec ./build-developer-id.sh --submit "$@"
+    ;;
+  -h|--help)
+    echo "Usage: ./notarize.command --submit"
+    echo "  Delegates to ./build-developer-id.sh --submit using NOTARY_PROFILE=$NOTARY_PROFILE."
+    echo "  Default execution intentionally makes no Apple contact."
+    exit 0
+    ;;
+  "")
+    echo "==> NOTARIZATION HELD: no Apple contact made."
+    echo "    This wrapper no longer submits directly; it delegates to the gated build script."
+    echo "    After Michael's explicit approval, run: ./notarize.command --submit"
+    echo "    Notary profile: $NOTARY_PROFILE"
+    exit 0
+    ;;
+  *)
+    echo "Unknown argument: $1" >&2
+    echo "Usage: ./notarize.command --submit" >&2
+    exit 2
+    ;;
+esac

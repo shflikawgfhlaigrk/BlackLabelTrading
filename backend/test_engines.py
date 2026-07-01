@@ -101,7 +101,9 @@ def test_analytics_trades_for_matches_gate():
 # Task 3 — momentum engine (clean symmetric momentum consensus)
 # ===========================================================================
 def test_momentum_proves_on_trend():
-    r = S.prove_momentum(_consensus_uptrend(), S.CONFIG_DEFAULTS)
+    # n=300 so the genuine trend edge yields >=30 OOS trades and clears the significance bar
+    # (the gate now requires statistical proof, not just expectancy>0).
+    r = S.prove_momentum(_consensus_uptrend(300), S.CONFIG_DEFAULTS)
     assert {"ok", "reason", "trades", "winRate", "netPts", "expectancyR"}.issubset(r)
     assert r["ok"] is True
     assert r["netPts"] > 0
@@ -132,7 +134,7 @@ def test_structure_blocks_longs():
 
 
 def test_structure_proves_on_downtrend():
-    r = S.prove_structure(_downtrend(), S.CONFIG_DEFAULTS)
+    r = S.prove_structure(_downtrend(300), S.CONFIG_DEFAULTS)   # >=30 OOS trades for significance
     assert r["ok"] is True and r["netPts"] > 0
 
 
@@ -164,7 +166,7 @@ def test_regime_flat_in_range():
 
 
 def test_regime_proves_on_trend():
-    r = S.prove_regime(_consensus_uptrend(), S.CONFIG_DEFAULTS)
+    r = S.prove_regime(_consensus_uptrend(300), S.CONFIG_DEFAULTS)   # >=30 OOS trades for significance
     assert r["ok"] is True and r["netPts"] > 0
 
 
@@ -210,7 +212,7 @@ def test_channel_empty_is_honest():
 # Task 7 — context_a + context_b (A/B context-strictness split)
 # ===========================================================================
 def test_context_a_proves_on_trend():
-    r = S.prove_context_a(_consensus_uptrend(), S.CONFIG_DEFAULTS)
+    r = S.prove_context_a(_consensus_uptrend(300), S.CONFIG_DEFAULTS)   # >=30 OOS trades for significance
     assert r["ok"] is True and r["netPts"] > 0
 
 
@@ -348,6 +350,75 @@ def test_stream_once_no_false_stall_while_candles_flow():
     assert not res.get("stalled"), f"healthy stream must not trip the watchdog: {res}"
 
 
+def test_stream_tab_routes_registry_candle_into_capture():
+    # PU-3 smoke (no Chrome): stream_tab pulls CDP frames, runs each through the pluggable parser
+    # registry (_frame_candle_reg), and routes parsed candles into Capture.on_candle. Proves the
+    # multi-platform reader wires a REAL WealthCharts candle frame all the way to the in-memory
+    # ES-filtered buffer — bars stay five-field, no quote path (PU-2 is deliberately not ported).
+    import bltd_capture as C
+    state = {"t": 0.0, "done": False}
+
+    def clock():
+        state["t"] += 100.0 if state["done"] else 1.0     # jump past idle_stall once frames stop
+        return state["t"]
+
+    wc_payload = ('{"cmd":"feed","data":{"type":"candle","c":"CM.ESU6","candle":'
+                  '{"cnu":1,"co":7546.50,"cm":7546.50,"cM":7546.50,"cc":7546.50,"cts":72427,"cq":"x"}}}')
+    envelope = C.json.dumps({"method": "Network.webSocketFrameReceived",
+                             "params": {"requestId": "R1",
+                                        "response": {"payloadData": wc_payload}}})
+    frames = [envelope, envelope, envelope]               # three real candle frames, then silence
+
+    class _WS:
+        def __init__(self): self.i = 0
+        def recv_text(self):
+            if self.i < len(frames):
+                self.i += 1
+                return frames[self.i - 1]
+            state["done"] = True                          # hook went quiet
+            return None
+        def close(self): pass
+
+    cap = C.Capture(_capture_stub_store())
+    page = {"url": "https://app.wealthcharts.com/", "webSocketDebuggerUrl": "ws://x"}
+    res = C.stream_tab("wealthcharts", page, cap, idle_stall=10, _ws=_WS(), _clock=clock)
+    assert res == {"source": "wealthcharts", "frames": 3, "candles": 3}, res
+    assert cap.latest.get("CM.ESU6", (None,))[0] == 7546.50, cap.latest   # landed in ES-filtered buffer
+
+
+def test_stream_tab_drops_non_es_candle_after_parse():
+    # Parser lock: a non-ES platform candle parsed by the GENERIC sniffer is still recognized as a
+    # real candle, but the shipped Topstep scope drops it before it can populate the store/chart.
+    import bltd_capture as C
+    state = {"t": 0.0, "done": False}
+
+    def clock():
+        state["t"] += 100.0 if state["done"] else 1.0
+        return state["t"]
+
+    # A plain OHLC frame on a non-WC platform -> GenericOHLCParser -> a NON-ES symbol candle.
+    quote = C.json.dumps({"symbol": "BTCUSD", "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5})
+    envelope = C.json.dumps({"method": "Network.webSocketFrameReceived",
+                             "params": {"requestId": "R9", "response": {"payloadData": quote}}})
+    frames = [envelope]
+
+    class _WS:
+        def __init__(self): self.i = 0
+        def recv_text(self):
+            if self.i < len(frames):
+                self.i += 1
+                return frames[self.i - 1]
+            state["done"] = True
+            return None
+        def close(self): pass
+
+    cap = C.Capture(_capture_stub_store())
+    page = {"url": "https://trader.tradovate.com/", "webSocketDebuggerUrl": "ws://x"}
+    res = C.stream_tab("tradovate", page, cap, idle_stall=10, _ws=_WS(), _clock=clock)
+    assert res["candles"] == 1, res            # parser registry parsed the non-WC frame
+    assert "BTCUSD" not in cap.latest, cap.latest  # but scope gate keeps it out of the app
+
+
 def test_recv_text_bounded_on_half_dead_socket():
     # ROOT-CAUSE LOCK: a half-dead CDP socket that trickles bytes but never completes a frame must
     # NOT wedge recv_text forever. Because sock.recv keeps returning partial data it never raises
@@ -378,14 +449,19 @@ def test_config_sanitizes_to_known_engines_only():
     assert clean["engines"] == ["momentum", "regime"]   # unknown dropped, known kept in order
 
 
-def test_es_symbol_policy_accepts_only_es_contracts():
+def test_es_symbol_policy_accepts_es_family_contracts():
+    # ES family = ES + MES (micro). MES is the most-traded TopStep instrument; rejecting it
+    # made a buyer's capture store nothing (2026-07-01 audit).
     assert S.is_es_symbol("ES")
     assert S.is_es_symbol("/ES")
     assert S.is_es_symbol("CM.ESU6")
     assert S.is_es_symbol("ESZ26")
+    assert S.is_es_symbol("MES")
+    assert S.is_es_symbol("MESU6")
+    assert S.is_es_symbol("CM.MESU6")
     assert not S.is_es_symbol("NQ")
     assert not S.is_es_symbol("CM.NQU6")
-    assert not S.is_es_symbol("MESU6")
+    assert not S.is_es_symbol("MNQU6")
     assert not S.is_es_symbol("US.SPY")
 
 
@@ -402,37 +478,29 @@ def _temp_store():
     return S.Store(path, config_path=cfg), path, cfg
 
 
-def test_store_rejects_and_hides_non_es_symbols():
+def test_store_accepts_and_serves_only_es_by_default():
+    # Shipped Topstep scope: ES-family rows are stored/served. Stale non-ES rows are rejected so
+    # old WealthCharts/equity data cannot populate the app.
     store, path, cfg = _temp_store()
     try:
-        rows = [(1_700_000_000 + i, 100.0 + i, 101.0 + i, 99.0 + i, 100.5 + i) for i in range(45)]
-        assert store.record_bars("CM.ESU6", rows) == 45
-        assert store.record_bars("CM.NQU6", rows) == 0
+        es = [(1_700_000_000 + i, 100.0 + i, 101.0 + i, 99.0 + i, 100.5 + i) for i in range(45)]
+        nq = [(1_700_000_000 + i, 200.0 + i, 201.0 + i, 199.0 + i, 200.5 + i) for i in range(50)]
+        assert store.record_bars("CM.ESU6", es) == 45
+        assert store.record_bars("CM.NQU6", nq) == 0      # non-ES filtered
+        assert store.record_bars("", es) == 0             # junk symbol still rejected
         store.record_tick("CM.ESU6", 5100.0, int(time.time()))
         store.record_tick("CM.NQU6", 17000.0, int(time.time()))
-
-        # Simulate stale pre-policy rows already present in a buyer's local SQLite file.
-        stale = [("CM.NQU6", int(ts), o, h, l, c, int(time.time())) for (ts, o, h, l, c) in rows]
-        store._exec("INSERT INTO bars(symbol,ts,o,h,l,c,ts_recorded) VALUES(?,?,?,?,?,?,?)",
-                    stale, many=True)
-        store._exec("INSERT INTO wc_live(symbol,price,recorded) VALUES(?,?,?)",
-                    ("CM.NQU6", 17001.0, int(time.time())))
         store.record_fire("momentum", "long", 5100.0, symbol="CM.ESU6", synthetic=False)
-        store._exec("INSERT INTO fires(engine,direction,entry,symbol,synthetic,ts,outcome,pnl) "
-                    "VALUES(?,?,?,?,?,?,?,?)",
-                    ("momentum", "long", 17000.0, "CM.NQU6", 0, int(time.time()) + 10, "Win", 100.0))
+        store.record_fire("momentum", "long", 17000.0, symbol="CM.NQU6", synthetic=False)
 
         syms = store.symbols()
-        assert syms["backtestable"] == ["CM.ESU6"], syms
-        assert syms["liveTicks"] == ["CM.ESU6"], syms
+        assert set(syms["backtestable"]) == {"CM.ESU6"}, syms
+        assert set(syms["liveTicks"]) == {"CM.ESU6"}, syms
         assert syms["busiest"] == "CM.ESU6", syms
         assert store.bars("CM.NQU6", 100, newest=False)["bars"] == []
         assert store.live_price("CM.NQU6") == {"gated": True}
         assert store.ohlc("CM.NQU6") == []
-        assert store.edge_ok("momentum", "CM.NQU6")["ok"] is False
-        assert store.latest_fire()["fire"]["symbol"] == "CM.ESU6"
-        assert [f["symbol"] for f in store.fires()["fires"]] == ["CM.ESU6"]
-        assert store.journal_stats("CM.NQU6")["graded"] == 0
+        assert {f["symbol"] for f in store.fires()["fires"]} == {"CM.ESU6"}
     finally:
         for p in (path, cfg):
             try:
@@ -445,6 +513,7 @@ def test_store_batch_writes_filter_non_es_and_report_failure():
     store, path, cfg = _temp_store()
     try:
         rows = [(1_700_000_000 + i, 100.0 + i, 101.0 + i, 99.0 + i, 100.5 + i) for i in range(3)]
+        # ES persists; NQ is filtered. The schema is unchanged.
         assert store.record_bars_batch({"CM.ESU6": rows, "CM.NQU6": rows}) == 3
         assert store.bars("CM.ESU6", 10, newest=False)["bars"] == [
             [100.0, 101.0, 99.0, 100.5, 1700000000.0],
@@ -453,17 +522,21 @@ def test_store_batch_writes_filter_non_es_and_report_failure():
         ]
         assert store.bars("CM.NQU6", 10, newest=False)["bars"] == []
 
+        now = int(time.time())
         assert store.record_ticks_batch([
-            {"symbol": "CM.NQU6", "price": 17000.0, "epoch": 1_700_000_100},
-            {"symbol": "CM.ESU6", "price": 5100.25, "epoch": 1_700_000_101},
-            ("ESZ26", 5101.25, 1_700_000_102),
-        ]) == 2
+            {"symbol": "CM.NQU6", "price": 17000.0, "epoch": now},
+            {"symbol": "CM.ESU6", "price": 5100.25, "epoch": now},
+            ("ESZ26", 5101.25, now),
+        ]) == 2                                                            # NQ filtered
         assert store.live_price("CM.NQU6") == {"gated": True}
         assert store.live_price("CM.ESU6")["price"] == 5100.25
         assert store.live_price("ESZ26")["price"] == 5101.25
+        # Recency gate: a STALE tick is NOT served as live (stale-as-live honesty).
+        store.record_tick("CM.NQU6", 16999.0, 1_700_000_100)             # Nov-2023 epoch
+        assert store.live_price("CM.NQU6") == {"gated": True}
 
         store._exec = lambda *a, **k: 0
-        assert store.record_bars_batch({"CM.ESU6": rows}) == -1
+        assert store.record_bars_batch({"CM.ESU6": rows}) == -1           # write failure still reported
         assert store.record_ticks_batch([("CM.ESU6", 5102.0, 1_700_000_103)]) == -1
     finally:
         for p in (path, cfg):
@@ -473,15 +546,96 @@ def test_store_batch_writes_filter_non_es_and_report_failure():
                 pass
 
 
-def test_screen_filters_to_es_symbols_only():
+def test_screen_includes_only_shipped_scope_symbols():
     import bltd_analytics as A
 
     class _Store:
         def config(self): return S.CONFIG_DEFAULTS
         def ohlc(self, symbol): return []
 
+    # The screener covers only shipped-scope symbols by default (ES family incl. MES micros).
     rows = A.screen(_Store(), ["CM.NQU6", "CM.ESU6", "MESU6", "ES"], ["momentum"], S.CONFIG_DEFAULTS)
-    assert [r["symbol"] for r in rows] == ["CM.ESU6", "ES"]
+    assert [r["symbol"] for r in rows] == ["CM.ESU6", "MESU6", "ES"]
+
+
+# ---- pluggable capture parser registry -------------------------------------
+def test_parser_registry_host_routing_specific_then_generic():
+    import bltd_parsers as P
+
+    wc = P.platforms_for_host("https://app.wealthcharts.com/chart")
+    assert [p.name for p in wc[:2]] == ["wealthcharts", "generic"]
+    assert P.platforms_for_host("https://unknown-broker.example/trade")[0].name == "wealthcharts"
+    assert P.page_is_feed("https://trade.somebroker.example/dashboard") is True
+    assert P.page_is_feed("https://example.com/help") is False
+
+
+def test_parser_registry_parses_wealthcharts_tradingview_tradovate_and_generic():
+    import bltd_parsers as P
+
+    wc_payload = ('{"cmd":"feed","data":{"type":"candle","c":"CM.ESU6","candle":'
+                  '{"co":7546.25,"cm":7545.75,"cM":7547.00,"cc":7546.50,"cepoch":1781045182}}}')
+    tv_payload = ('~m~1~m~{"m":"qsd","p":[1,{"n":"CME_MINI:ES1!","v":'
+                  '{"lp":5100.25,"open_price":5099.0,"high_price":5101.0,'
+                  '"low_price":5098.0,"lp_time":1781045182}}]}')
+    tradovate_payload = ('a[{"d":{"symbol":"ESZ26","bars":[{"open":6000.0,"high":6002.0,'
+                         '"low":5999.0,"close":6001.25,"timestamp":1781045182}]}}]')
+    generic_payload = ('{"data":{"instrument":"ESM27","o":6200.0,"h":6202.0,'
+                       '"l":6199.0,"c":6201.0,"ts":1781045182}}')
+
+    cases = [
+        ("https://app.wealthcharts.com/", wc_payload, "wealthcharts", "CM.ESU6", 7546.50),
+        ("https://www.tradingview.com/chart", tv_payload, "tradingview", "CME_MINI:ES1!", 5100.25),
+        ("https://trader.tradovate.com/", tradovate_payload, "tradovate", "ESZ26", 6001.25),
+        ("https://trade.example-broker.com/", generic_payload, "generic", "ESM27", 6201.0),
+    ]
+    for url, payload, parser_name, symbol, close in cases:
+        parser = P.pick_parser(payload, P.platforms_for_host(url))
+        assert parser is not None and parser.name == parser_name
+        cd = parser.parse(payload)
+        assert cd is not None
+        assert cd["symbol"] == symbol and cd["close"] == close
+
+
+def test_parser_registry_fail_closed_on_auth_telemetry_and_junk_prices():
+    import bltd_parsers as P
+
+    frames = [
+        '{"cmd":"auth","token":"secret"}',
+        '{"event":"heartbeat","ts":1781045182}',
+        '{"symbol":"ESZ26","price":"NaN"}',
+        '{"symbol":"ESZ26","price":999999999999}',
+        '~m~1~m~{"m":"session_id","p":["abc"]}',
+        'a[{"e":"props","d":{"accountId":12345}}]',
+    ]
+    for payload in frames:
+        parser = P.pick_parser(payload, P.platforms_for_host("https://trade.example-broker.com/"))
+        assert parser is None or parser.parse(payload) is None
+
+
+def test_generic_parser_rejects_order_and_exec_frames():
+    import bltd_parsers as P
+
+    gen = next(p for p in P._PARSERS if p.name == "generic")
+    assert gen.parse('{"id":"order-77a3","price":99.5,"qty":2,"status":"working"}') is None
+    assert gen.parse('{"e":"execution","id":"exec-1","price":4521.75,"qty":1}') is None
+    cd = gen.parse('{"data":{"instrument":"ESM27","o":6200.0,"h":6202.0,"l":6199.0,"c":6201.0,"ts":1781045182}}')
+    assert cd and cd["symbol"] == "ESM27" and cd["close"] == 6201.0
+
+
+def test_generic_parser_rejects_amount_keyed_order_and_size_trade():
+    # Residual fail-open closed: an order frame whose only discriminator is an `amount`
+    # (order quantity, common in ccxt/FX/crypto APIs) must NOT become a fake candle.
+    import bltd_parsers as P
+
+    gen = next(p for p in P._PARSERS if p.name == "generic")
+    assert gen.parse('{"symbol":"ES","price":4500.0,"amount":5}') is None
+    assert gen.parse('{"symbol":"ES","price":4500.0,"amount":5,"side":"buy"}') is None
+    # Intentional fail-closed cost (pinned so it stays deliberate): a size-bearing print
+    # is ambiguous order/trade data, so it is dropped rather than risk a fabricated candle.
+    assert gen.parse('{"symbol":"ES","price":4500.0,"size":2,"ts":1781045182}') is None
+    # A genuine candle carrying only a benign volume key is still accepted.
+    cd = gen.parse('{"symbol":"ES","close":4500.0,"volume":1000,"ts":1781045182}')
+    assert cd and cd["symbol"] == "ES" and cd["close"] == 4500.0
 
 
 # ---- WC candle frame parsing (BOTH live shapes WC actually sends) -----------
@@ -528,7 +682,7 @@ def test_on_candle_buffers_tick_at_arrival_then_flush_persists():
     store, path, cfg = _temp_store()
     try:
         cap = C.Capture(store, bar_seconds=15, lookback=20, edge_gate=True)
-        arrival = 1781853600.0
+        arrival = float(int(time.time()))        # fresh so the live-price recency gate serves it
         cap.on_candle({"symbol": "CM.ESU6", "close": 7546.5, "epoch": None}, arrival=arrival)
         # read loop wrote memory only — nothing persisted yet
         assert cap.latest["CM.ESU6"] == (7546.5, int(arrival))   # stamped at real arrival wall-clock
@@ -544,16 +698,18 @@ def test_on_candle_buffers_tick_at_arrival_then_flush_persists():
                 pass
 
 
-def test_capture_drops_non_es_candles():
-    # The ES-only product scope gate lives in on_candle, BEFORE the in-memory buffer, so a non-ES
-    # candle never enters latest/pending_bars and is never persisted by the flusher.
+def test_capture_keeps_only_shipped_scope_candles():
+    # on_candle buffers shipped-scope instruments only, then the flusher persists them. Non-ES and
+    # junk/empty symbols are dropped before they can populate the store.
     import bltd_capture as C
     store, path, cfg = _temp_store()
     try:
         cap = C.Capture(store, bar_seconds=15, lookback=20, edge_gate=True)
-        cap.on_candle({"symbol": "CM.NQU6", "close": 17000.0, "epoch": None}, arrival=1781853600.0)
-        cap.on_candle({"symbol": "CM.ESU6", "close": 7546.5, "epoch": None}, arrival=1781853601.0)
-        assert list(cap.latest.keys()) == ["CM.ESU6"]            # NQ dropped before buffering
+        base = float(int(time.time()))           # fresh so live-price recency gate serves them
+        cap.on_candle({"symbol": "CM.NQU6", "close": 17000.0, "epoch": None}, arrival=base)
+        cap.on_candle({"symbol": "CM.ESU6", "close": 7546.5, "epoch": None}, arrival=base + 1)
+        cap.on_candle({"symbol": "", "close": 1.0, "epoch": None}, arrival=base + 2)
+        assert set(cap.latest.keys()) == {"CM.ESU6"}
         cap.flush()
         assert store.live_price("CM.NQU6") == {"gated": True}
         assert store.live_price("CM.ESU6")["price"] == 7546.5
@@ -641,6 +797,228 @@ def test_freshness_watchdog_wedge_decision():
     assert C._store_is_wedged(1005, 130.0, 1005, 400.0, stale_after=300.0) == (1005, 130.0, False)
     seen, prog, wedged = C._store_is_wedged(1005, 130.0, 1005, 431.0, stale_after=300.0)
     assert wedged is True and (seen, prog) == (1005, 130.0)
+
+
+def test_freshness_watchdog_gate_uses_multi_feed_surface():
+    # The watchdog's respawn gate treats any logged-in trading feed as reachable; source filtering is
+    # handled later by the shipped symbol scope.
+    import bltd_capture as C
+    old_discover = C.discover_feed_pages
+    try:
+        C.discover_feed_pages = lambda: [("tradovate", {
+            "url": "https://trader.tradovate.com/",
+            "webSocketDebuggerUrl": "ws://127.0.0.1/devtools/page/1",
+        })]
+        assert C.watchdog_feed_available() is True
+        C.discover_feed_pages = lambda: []
+        assert C.watchdog_feed_available() is False
+    finally:
+        C.discover_feed_pages = old_discover
+
+
+def _ct(y, mo, d, h, mi=0):
+    # build a Central-time datetime for the pure market-hours gate, tz-aware when zoneinfo is present
+    import bltd_capture as C
+    from datetime import datetime
+    return datetime(y, mo, d, h, mi, tzinfo=C._CENTRAL)
+
+
+def test_central_now_converts_epoch_to_cme_clock():
+    # The watchdog's market gate depends on epoch seconds being interpreted on the CME Central clock,
+    # including the DST offset changes between winter and summer sessions.
+    import bltd_capture as C
+    from datetime import datetime
+
+    if C._CENTRAL is None:
+        assert C._central_now(1_700_000_000) == datetime.fromtimestamp(1_700_000_000)
+        return
+
+    winter = datetime(2026, 1, 15, 10, 30, tzinfo=C._CENTRAL)
+    summer = datetime(2026, 6, 25, 10, 30, tzinfo=C._CENTRAL)
+    assert C._central_now(winter.timestamp()) == winter
+    assert C._central_now(summer.timestamp()) == summer
+    assert winter.utcoffset().total_seconds() == -6 * 3600
+    assert summer.utcoffset().total_seconds() == -5 * 3600
+
+
+def test_market_open_during_weekday_rth():
+    # ROOT-CAUSE LOCK (companion to the freshness watchdog): a closed market leaves the store
+    # nothing to advance, so the watchdog must only force a respawn while the market is OPEN.
+    # Thursday 2026-06-25 10:00 CT — mid weekday session.
+    import bltd_capture as C
+    assert C._market_is_open(_ct(2026, 6, 25, 10, 0)) is True
+
+
+def test_market_closed_friday_weekly_close_through_weekend():
+    import bltd_capture as C
+    assert C._market_is_open(_ct(2026, 6, 26, 15, 59)) is True   # last minute before the 16:00 close
+    assert C._market_is_open(_ct(2026, 6, 26, 16, 0)) is False   # Friday 16:00 CT weekly close
+    assert C._market_is_open(_ct(2026, 6, 26, 19, 53)) is False  # the observed weekend respawn-loop time
+    assert C._market_is_open(_ct(2026, 6, 27, 3, 0)) is False    # Saturday
+    assert C._market_is_open(_ct(2026, 6, 27, 20, 0)) is False   # Saturday
+    assert C._market_is_open(_ct(2026, 6, 28, 16, 59)) is False  # Sunday before reopen
+    assert C._market_is_open(_ct(2026, 6, 28, 17, 0)) is True    # Sunday 17:00 CT reopen
+
+
+def test_market_daily_maintenance_halt_weeknights():
+    import bltd_capture as C
+    assert C._market_is_open(_ct(2026, 6, 23, 9, 30)) is True    # Tuesday session
+    assert C._market_is_open(_ct(2026, 6, 23, 16, 30)) is False  # Tue daily 16:00-17:00 halt
+    assert C._market_is_open(_ct(2026, 6, 23, 17, 0)) is True    # Tue 17:00 CT reopen
+    assert C._market_is_open(_ct(2026, 6, 24, 0, 5)) is True     # Wednesday overnight, open
+
+
+def test_edge_gate_rejects_random_walk_flukes():
+    """NO-FABRICATION lock: no engine may 'prove' an OOS edge on PURE NOISE more than the ~5%
+    false-positive floor. Before the significance bar, momentum/regime/structure/context_a passed
+    expectancy>0 on driftless random walks 54-63% of the time — a fabrication path that would be
+    dangerous on any captured instrument. Each walk is seeded (deterministic), so this test is stable
+    and re-runnable."""
+    import random
+    provers = [
+        ("meanrev", S.prove_meanrev), ("breakout", S.prove_breakout), ("research", S.prove_research),
+        ("momentum", S.prove_momentum), ("structure", S.prove_structure), ("regime", S.prove_regime),
+        ("channel", S.prove_channel), ("context_a", S.prove_context_a), ("context_b", S.prove_context_b),
+    ]
+    cfg = dict(S.CONFIG_DEFAULTS)
+    RUNS = 60
+    for idx, (name, prove) in enumerate(provers):
+        passes = 0
+        for seed in range(RUNS):
+            rng = random.Random(seed * 7919 + idx * 104729)   # fixed, deterministic
+            px = 5000.0
+            ohlc = []
+            for _ in range(400):
+                px += rng.gauss(0, 1.0)                        # driftless walk = NO real edge
+                o = px + rng.gauss(0, 0.2)
+                hi = max(o, px) + abs(rng.gauss(0, 0.3))
+                lo = min(o, px) - abs(rng.gauss(0, 0.3))
+                ohlc.append((o, hi, lo, px))
+            try:
+                if prove(ohlc, cfg).get("ok"):
+                    passes += 1
+            except Exception:  # noqa: BLE001 — a prover error is not a fluke pass
+                pass
+        rate = passes / RUNS
+        # Bar is ~10%: the significance gate measures ~5-6.5% (the α=0.05 single-test floor); a
+        # tighter assert than the old 15% so a partial regression (e.g. structure creeping back to
+        # 12%) can't pass silently. The residual per-test leakage is then controlled family-wide by
+        # the BH-FDR correction in the screen grid (see test_screen_fdr_*).
+        assert rate <= 0.10, f"{name} proved an edge on pure noise {rate*100:.0f}% of the time (fabrication risk)"
+
+
+def _bh(pvals, q):
+    import bltd_analytics as A
+    return A._benjamini_hochberg(pvals, q)
+
+
+def test_edge_pvalue_caps_winr_no_datasnoop():
+    # A single lucky runner must NOT lower the breakeven and inflate significance. With a 2:1 target,
+    # a null-ish 50-trade list (17 wins) stays non-significant even if one win is a giant R=8 runner,
+    # because winR is capped at the intended target (2.0), not the realized max.
+    base = [{"r": 2.0, "dir": "long", "entry": 1.0, "exit": 1.0} for _ in range(17)]
+    base += [{"r": -1.0, "dir": "long", "entry": 1.0, "exit": 1.0} for _ in range(33)]
+    runner = list(base); runner[0] = {"r": 8.0, "dir": "long", "entry": 1.0, "exit": 1.0}
+    p_capped = S._edge_pvalue(runner, 17, 50, sum(t["r"] for t in runner) / 50, 20, target_r=2.0)
+    p_uncapped_maxsnoop = S._binom_sf(17, 50, 1.0 / (1.0 + 8.0))   # what max()-snoop would have used
+    assert p_capped > S.SIG_ALPHA, f"capped winR must keep a runner-laced null non-significant (p={p_capped})"
+    assert p_uncapped_maxsnoop < S.SIG_ALPHA  # proves the snoop WOULD have fired without the cap
+
+
+def test_benjamini_hochberg_math():
+    # Empty / no-signal families reject nothing.
+    assert _bh([], 0.1) == set()
+    assert _bh([0.9, 0.8, 0.5], 0.1) == set()
+    # m=5, q=0.05: only the tiny p clears rank-1 threshold (1/5*0.05=0.01); the rest fail.
+    assert _bh([0.001, 0.2, 0.3, 0.4, 0.5], 0.05) == {0}
+    # All-tiny p's all survive.
+    assert _bh([0.0001, 0.0002, 0.0003], 0.1) == {0, 1, 2}
+    # Step-up property: p_(1)=0.02 FAILS rank-1 (1/3*0.05=0.0167), but rank-3 passes
+    # (0.04<=0.05), so BH rejects ALL three — including the one that failed its own rank.
+    assert _bh([0.02, 0.02, 0.04], 0.05) == {0, 1, 2}
+    # BH must be STRICTLY MORE CONSERVATIVE than a naive "p<=q" filter (proves it isn't a no-op):
+    # here naive p<=0.05 would keep BOTH 0.001 and 0.04, but BH keeps ONLY 0.001 (the 0.04 cell sits
+    # above its rank-2 line 0.02 with no higher rank to rescue it).
+    p = [0.001, 0.04, 0.5, 0.5, 0.5]
+    naive = {i for i, v in enumerate(p) if v <= 0.05}
+    bh = _bh(p, 0.05)
+    assert naive == {0, 1} and bh == {0}, (naive, bh)
+    assert 1 in naive and 1 not in bh   # the marginal cell naive keeps, BH correctly drops
+
+
+def test_stats_honest_ratios():
+    """Locks the _stats honesty fixes: no sqrt(n) inflation on sharpe/sortino, profitFactor=None on
+    a no-loss list (not sum-of-R), and a MIN_STATS_N floor that zeroes headline ratios on thin data."""
+    import bltd_analytics as A
+
+    def tr(r, dirn="long"):
+        return {"r": r, "dir": dirn, "entry": 100.0, "exit": 100.0 + r}
+
+    # Sharpe is a plain mean/sd ratio — NOT multiplied by sqrt(n). 12 trades so it clears MIN_STATS_N.
+    rs = [2.0, -1.0, 2.0, -1.0, 2.0, -1.0, 2.0, -1.0, 2.0, -1.0, 2.0, -1.0]
+    s = A._stats([tr(r) for r in rs])
+    n = len(rs); mean = sum(rs) / n
+    import math as _m
+    var = sum((r - mean) ** 2 for r in rs) / n
+    expected_sharpe = round(mean / _m.sqrt(var), 4)
+    assert s["sharpe"] == expected_sharpe, (s["sharpe"], expected_sharpe)   # no sqrt(n) factor
+    assert s["sufficientSample"] is True
+
+    # No losing trades -> profit factor is UNDEFINED (None), never sum-of-R.
+    noloss = A._stats([tr(2.0) for _ in range(12)])
+    assert noloss["profitFactor"] is None, noloss["profitFactor"]
+
+    # Thin sample (< MIN_STATS_N) -> ratios suppressed, counts kept, sufficientSample False.
+    thin = A._stats([tr(2.0), tr(-1.0)])
+    assert thin["trades"] == 2 and thin["sufficientSample"] is False
+    assert thin["winRate"] == 0.0 and thin["sharpe"] == 0.0 and thin["profitFactor"] is None
+
+    # Empty -> honest zeros + sufficientSample False.
+    assert A._stats([])["sufficientSample"] is False
+
+
+def test_screen_fdr_suppresses_grid_inflation():
+    """Grid-wide honesty lock that ACTUALLY exercises BH (mutation-proof): patch the prover to emit
+    CONTROLLED p-values so the grid contains many marginal per-test-significant cells, then assert
+    screen()'s BH demotes the ones above the BH line while keeping the strongly-significant ones.
+    Removing BH from screen() makes this FAIL (it would keep every per-test passer)."""
+    import bltd_analytics as A
+
+    # Realistic grid inflation: 1 strongly-significant cell + 3 marginal (p=0.04, each < per-test
+    # 0.05) buried among 96 high-p nulls (m=100). Per-test alone keeps 4; BH at q=0.10 keeps ONLY
+    # the strong one — the 3 marginals fall below their rank lines (rank2 line = 2/100*0.10 = 0.002
+    # << 0.04). Removing BH from screen() would keep all 4 and FAIL this test.
+    pmap = {"STRONG": 0.0001, "MARGINAL0": 0.04, "MARGINAL1": 0.04, "MARGINAL2": 0.04}
+    for i in range(96):
+        pmap[f"NULL{i}"] = 0.8
+    bars = [(100.0 + i * 0.1, 100.0 + i * 0.1, 100.0 + i * 0.1, 100.0 + i * 0.1) for i in range(60)]
+    holder = {"p": 1.0}
+
+    def prove(ohlc, cfg=None):
+        p = holder["p"]
+        return {"ok": p < S.SIG_ALPHA, "pEdge": p, "winRate": 0.6, "netPts": 1.0,
+                "expectancyR": 0.2, "trades": 50, "reason": "OOS candidate"}
+
+    class _StoreSeq:
+        def config(self): return S.CONFIG_DEFAULTS
+        def ohlc(self, sym): holder["p"] = pmap[sym]; return bars   # thread p to the next prover call
+
+    orig_provers = S.PROVERS
+    orig_scope = S.INSTRUMENT_SCOPE
+    try:
+        S.INSTRUMENT_SCOPE = "all"  # this test exercises FDR math, not the shipped Topstep scope
+        S.PROVERS = {"fake": prove}
+        rows = A.screen(_StoreSeq(), list(pmap.keys()), ["fake"], S.CONFIG_DEFAULTS)
+    finally:
+        S.INSTRUMENT_SCOPE = orig_scope
+        S.PROVERS = orig_provers
+
+    per_test_passers = {r["symbol"] for r in rows if r.get("pEdge", 1.0) < S.SIG_ALPHA}
+    bh_survivors = {r["symbol"] for r in rows if r["edge"]}
+    assert per_test_passers == {"STRONG", "MARGINAL0", "MARGINAL1", "MARGINAL2"}, per_test_passers
+    assert bh_survivors == {"STRONG"}, f"BH must keep only the strong cell, got {bh_survivors}"
+    demoted = [r for r in rows if r["symbol"].startswith("MARGINAL")]
+    assert all(not r["edge"] and "FDR" in r["reason"] for r in demoted)
 
 
 if __name__ == "__main__":

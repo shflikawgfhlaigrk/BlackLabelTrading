@@ -16,7 +16,26 @@ targets:
   BlackLabelTrading:
     type: application
     platform: macOS
-    sources: [ { path: Sources } ]
+    sources:
+      - path: Sources
+      - path: backend
+        type: folder
+        buildPhase: resources
+    postBuildScripts:
+      - name: Normalize Bundled Backend
+        script: |
+          set -euo pipefail
+          BACKEND="$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/backend"
+          [ -d "$BACKEND" ] || exit 0
+          find "$BACKEND" -type d \( -name __pycache__ -o -name .pytest_cache \) -prune -exec rm -rf {} +
+          find "$BACKEND" -type f \( -name 'test_*.py' -o -name 'run-tests.sh' \) -delete
+          chmod +x "$BACKEND/launch-backend.sh"
+          STRAY="$(find "$BACKEND" -type f \( -name '*.sqlite3' -o -name '*.db' -o -name '*.sqlite' -o -name 'bars_log.csv' -o -name 'fires*.json' \) 2>/dev/null || true)"
+          if [ -n "$STRAY" ]; then
+            echo "FAIL: data files in bundled backend (must ship EMPTY):" >&2
+            echo "$STRAY" >&2
+            exit 1
+          fi
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.blacklabel.trading

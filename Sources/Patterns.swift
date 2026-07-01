@@ -195,7 +195,8 @@ enum StructureScan {
 
     // Double top/bottom: two swing highs (lows) at a similar price separated by a meaningful
     // pullback. Reports a hit at the second peak/trough.
-    static func doubleTopsBottoms(_ bars: [Bar], lookback: Int = 3, tolFrac: Double = 0.01) -> [PatternHit] {
+    static func doubleTopsBottoms(_ bars: [Bar], lookback: Int = 3, tolFrac: Double = 0.01,
+                                  minBarGap: Int = 3, minPullbackFrac: Double = 0.03) -> [PatternHit] {
         let pv = pivots(bars, lookback: lookback)
         var hits: [PatternHit] = []
         let highs = pv.filter { $0.isHigh }, lows = pv.filter { !$0.isHigh }
@@ -203,10 +204,19 @@ enum StructureScan {
             guard pts.count >= 2 else { return }
             for k in 1..<pts.count {
                 let a = pts[k-1], b = pts[k]
-                if abs(a.price - b.price) <= tolFrac * a.price {
-                    let cp: ChartPattern = top ? .doubleTop : .doubleBottom
-                    hits.append(PatternHit(index: b.index, date: bars[b.index].date, candle: nil, chart: cp, label: cp.rawValue, bias: cp.bias))
-                }
+                guard abs(a.price - b.price) <= tolFrac * a.price else { continue }   // similar price
+                guard b.index - a.index >= minBarGap else { continue }                 // separated peaks
+                // Require a MEANINGFUL counter-move between the two peaks (the documented pullback),
+                // not just two similar prices — else any flat drift fabricates a double top/bottom.
+                let lo = a.index, hi = b.index
+                guard hi > lo, hi < bars.count else { continue }
+                let between = bars[lo...hi]
+                let pullback: Double = top
+                    ? (a.price - (between.map { $0.low }.min() ?? a.price)) / a.price    // deepest dip
+                    : ((between.map { $0.high }.max() ?? a.price) - a.price) / a.price    // tallest bounce
+                guard pullback >= minPullbackFrac else { continue }
+                let cp: ChartPattern = top ? .doubleTop : .doubleBottom
+                hits.append(PatternHit(index: b.index, date: bars[b.index].date, candle: nil, chart: cp, label: cp.rawValue, bias: cp.bias))
             }
         }
         pairs(highs, top: true); pairs(lows, top: false)

@@ -16,6 +16,9 @@ mkdir -p "$ROOT/build"
 SOURCES=(
   "$ROOT/Tests/TestSupport.swift"
   "$ROOT/Sources/HoloTheme.swift"
+  "$ROOT/Sources/Updater.swift"
+  "$ROOT/Sources/TradeMath.swift"
+  "$ROOT/Sources/SignalCore.swift"
   "$ROOT/Sources/Analytics.swift"
   "$ROOT/Sources/Backtest.swift"
   "$ROOT/Sources/BacktestDepth.swift"
@@ -38,7 +41,7 @@ xcrun --sdk macosx swiftc \
   -O \
   -sdk "$SDK" \
   -target arm64-apple-macosx13.0 \
-  -framework Foundation -framework CoreGraphics -framework ImageIO -framework CoreText -framework UniformTypeIdentifiers \
+  -framework Foundation -framework CoreGraphics -framework ImageIO -framework CoreText -framework UniformTypeIdentifiers -framework CryptoKit -framework Security \
   -o "$OUT" \
   "${SOURCES[@]}"
 

@@ -22,19 +22,21 @@
 		90707A44A07E7B9AFDB19C9A /* WatchlistModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7CF7A460CCFFAE3CB33459EB /* WatchlistModel.swift */; };
 		990B5D35F132390ABD3D239E /* ChartRender.swift in Sources */ = {isa = PBXBuildFile; fileRef = 827AF4899FFC1715688443FC /* ChartRender.swift */; };
 		994EAB02CA9EBD40DCB91BCB /* Charting.swift in Sources */ = {isa = PBXBuildFile; fileRef = 46AAF0E56B1CCCACF1020C9D /* Charting.swift */; };
-		C0D3A11E0000000000000002 /* LiveChart.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D3A11E0000000000000001 /* LiveChart.swift */; };
 		99C1D0E083569E20A2795B08 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 5FBF9178ADF66A2A2A0BCCD6 /* Assets.xcassets */; };
 		A8CB129546FCF3F06250A9E2 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = E11C506535021004EA73DFCF /* PrivacyInfo.xcprivacy */; };
 		ADDA9FA65998E23C0E6C9679 /* FeedTypes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2331344C8E29E9A66C4E38BE /* FeedTypes.swift */; };
 		AEBDD9CF301FBF8E35FF2CA4 /* Auth.swift in Sources */ = {isa = PBXBuildFile; fileRef = E15B1B8D78A6C53363EB2F28 /* Auth.swift */; };
+		BD215E84FB15364ABAFACFDF /* backend in Resources */ = {isa = PBXBuildFile; fileRef = CEEBEB32A0FD46E9CD85A42B /* backend */; };
 		D07AC20EEDF81A57B6FBF4B7 /* Patterns.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5A76BA203F382BCF9C40A8FA /* Patterns.swift */; };
 		D13F8830C47BEB7AF96F0501 /* Screens3.swift in Sources */ = {isa = PBXBuildFile; fileRef = D46141BBA2686F96A5394950 /* Screens3.swift */; };
 		D6CBC04439A2E01ECF5AE0C5 /* JournalImport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7D2D31F2F75B736703304B55 /* JournalImport.swift */; };
+		E3CA5F329149EE550F6B8911 /* Feeds.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2FC6755E2B86EF357E50DF7F /* Feeds.swift */; };
 		E4B31266AA00FBAE5A21B1FE /* Analytics.swift in Sources */ = {isa = PBXBuildFile; fileRef = D899AA187943542A6C3AE823 /* Analytics.swift */; };
 		E8D23A7EB063EA80C28BD83B /* Holographic.swift in Sources */ = {isa = PBXBuildFile; fileRef = 42C984DB418C58676DF85246 /* Holographic.swift */; };
 		EBF30CE6E21CC174E5A2AD07 /* HoloTheme.swift in Sources */ = {isa = PBXBuildFile; fileRef = B72865605B27F1EFFCCC954F /* HoloTheme.swift */; };
 		EC908E8D891C25C26393C731 /* FeedClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 718382BE5082225565ACABFD /* FeedClient.swift */; };
 		EC9F5F8086315E4E79B2D297 /* BacktestDepth.swift in Sources */ = {isa = PBXBuildFile; fileRef = 703D257329BFEBC3BB61D473 /* BacktestDepth.swift */; };
+		F71D57F7D2434FFEC8372CAC /* LiveChart.swift in Sources */ = {isa = PBXBuildFile; fileRef = 439A60B58FF3E821CB8395F9 /* LiveChart.swift */; };
 		F8804438B07CBA80083D47E2 /* Theme.swift in Sources */ = {isa = PBXBuildFile; fileRef = AE8B21C4218C00C783C412CA /* Theme.swift */; };
 /* End PBXBuildFile section */
 
@@ -42,7 +44,9 @@
 		1C4F8D00BD91FC0CBA27FE00 /* PaperTrade.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PaperTrade.swift; sourceTree = "<group>"; };
 		2174BC633E3F78544B746A3A /* Screener.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Screener.swift; sourceTree = "<group>"; };
 		2331344C8E29E9A66C4E38BE /* FeedTypes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FeedTypes.swift; sourceTree = "<group>"; };
+		2FC6755E2B86EF357E50DF7F /* Feeds.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Feeds.swift; sourceTree = "<group>"; };
 		42C984DB418C58676DF85246 /* Holographic.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Holographic.swift; sourceTree = "<group>"; };
+		439A60B58FF3E821CB8395F9 /* LiveChart.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveChart.swift; sourceTree = "<group>"; };
 		46AAF0E56B1CCCACF1020C9D /* Charting.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Charting.swift; sourceTree = "<group>"; };
 		5A76BA203F382BCF9C40A8FA /* Patterns.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Patterns.swift; sourceTree = "<group>"; };
 		5FBF9178ADF66A2A2A0BCCD6 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
@@ -65,6 +69,7 @@
 		AE8B21C4218C00C783C412CA /* Theme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Theme.swift; sourceTree = "<group>"; };
 		B385E78DF0DFBBE2B4088F2C /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		B72865605B27F1EFFCCC954F /* HoloTheme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HoloTheme.swift; sourceTree = "<group>"; };
+		CEEBEB32A0FD46E9CD85A42B /* backend */ = {isa = PBXFileReference; lastKnownFileType = folder; path = backend; sourceTree = SOURCE_ROOT; };
 		D043843E6C05E878ADBB5CD4 /* AlertsEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AlertsEngine.swift; sourceTree = "<group>"; };
 		D46141BBA2686F96A5394950 /* Screens3.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Screens3.swift; sourceTree = "<group>"; };
 		D899AA187943542A6C3AE823 /* Analytics.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Analytics.swift; sourceTree = "<group>"; };
@@ -72,13 +77,13 @@
 		E15B1B8D78A6C53363EB2F28 /* Auth.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Auth.swift; sourceTree = "<group>"; };
 		F02460415B3ABA838EAC8E45 /* Model.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Model.swift; sourceTree = "<group>"; };
 		FCAB20BE28B9A7AD4C47ED8C /* StrategyBuilder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StrategyBuilder.swift; sourceTree = "<group>"; };
-		C0D3A11E0000000000000001 /* LiveChart.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveChart.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXGroup section */
 		1F57DFBE64826E46A7E0F8E6 = {
 			isa = PBXGroup;
 			children = (
+				CEEBEB32A0FD46E9CD85A42B /* backend */,
 				B0AAB866F21D78AEA19021F9 /* Sources */,
 				523D3229256FBAF6145FED93 /* Products */,
 			);
@@ -108,12 +113,13 @@
 				827AF4899FFC1715688443FC /* ChartRender.swift */,
 				7D512CC7165368D316467D73 /* ChartScreen.swift */,
 				718382BE5082225565ACABFD /* FeedClient.swift */,
+				2FC6755E2B86EF357E50DF7F /* Feeds.swift */,
 				2331344C8E29E9A66C4E38BE /* FeedTypes.swift */,
 				42C984DB418C58676DF85246 /* Holographic.swift */,
 				B72865605B27F1EFFCCC954F /* HoloTheme.swift */,
 				B385E78DF0DFBBE2B4088F2C /* Info.plist */,
 				7D2D31F2F75B736703304B55 /* JournalImport.swift */,
-				C0D3A11E0000000000000001 /* LiveChart.swift */,
+				439A60B58FF3E821CB8395F9 /* LiveChart.swift */,
 				96F6578A4722D5D85DD68C4F /* main.swift */,
 				F02460415B3ABA838EAC8E45 /* Model.swift */,
 				1C4F8D00BD91FC0CBA27FE00 /* PaperTrade.swift */,
@@ -141,6 +147,7 @@
 			buildPhases = (
 				5AF3F41D3CAD89979819BA77 /* Sources */,
 				8D5D8FE004A89974638CADE7 /* Resources */,
+				41E711163EE5C081AE0C6922 /* Normalize Bundled Backend */,
 			);
 			buildRules = (
 			);
@@ -194,10 +201,32 @@
 			files = (
 				99C1D0E083569E20A2795B08 /* Assets.xcassets in Resources */,
 				A8CB129546FCF3F06250A9E2 /* PrivacyInfo.xcprivacy in Resources */,
+				BD215E84FB15364ABAFACFDF /* backend in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		41E711163EE5C081AE0C6922 /* Normalize Bundled Backend */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Normalize Bundled Backend";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -euo pipefail\nBACKEND=\"$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/backend\"\n[ -d \"$BACKEND\" ] || exit 0\nfind \"$BACKEND\" -type d \\( -name __pycache__ -o -name .pytest_cache \\) -prune -exec rm -rf {} +\nfind \"$BACKEND\" -type f \\( -name 'test_*.py' -o -name 'run-tests.sh' \\) -delete\nchmod +x \"$BACKEND/launch-backend.sh\"\nSTRAY=\"$(find \"$BACKEND\" -type f \\( -name '*.sqlite3' -o -name '*.db' -o -name '*.sqlite' -o -name 'bars_log.csv' -o -name 'fires*.json' \\) 2>/dev/null || true)\"\nif [ -n \"$STRAY\" ]; then\n  echo \"FAIL: data files in bundled backend (must ship EMPTY):\" >&2\n  echo \"$STRAY\" >&2\n  exit 1\nfi\n";
+		};
+/* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		5AF3F41D3CAD89979819BA77 /* Sources */ = {
@@ -214,10 +243,11 @@
 				994EAB02CA9EBD40DCB91BCB /* Charting.swift in Sources */,
 				EC908E8D891C25C26393C731 /* FeedClient.swift in Sources */,
 				ADDA9FA65998E23C0E6C9679 /* FeedTypes.swift in Sources */,
+				E3CA5F329149EE550F6B8911 /* Feeds.swift in Sources */,
 				EBF30CE6E21CC174E5A2AD07 /* HoloTheme.swift in Sources */,
 				E8D23A7EB063EA80C28BD83B /* Holographic.swift in Sources */,
 				D6CBC04439A2E01ECF5AE0C5 /* JournalImport.swift in Sources */,
-				C0D3A11E0000000000000002 /* LiveChart.swift in Sources */,
+				F71D57F7D2434FFEC8372CAC /* LiveChart.swift in Sources */,
 				18FD43254FF7C98367BD4297 /* Model.swift in Sources */,
 				033F9B5D335A39C5261BAECB /* PaperTrade.swift in Sources */,
 				D07AC20EEDF81A57B6FBF4B7 /* Patterns.swift in Sources */,

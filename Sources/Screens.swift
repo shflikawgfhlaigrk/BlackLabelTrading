@@ -94,6 +94,10 @@ struct SignalsScreen: View {
     @State private var fleet: [EngineRow] = []
     @State private var backendFires: [FireRow] = []
     @State private var fleetLoading = false
+    @State private var dailyLogPath: String? = nil   // path shown after "Export daily logs"
+    @State private var tAccount = "50000"             // order-ticket sizing inputs (your own values)
+    @State private var tRiskPct = "1"
+    @State private var ticketCopied = false
 
     private var result: SignalResult { SignalEngine.evaluate(inp) }
     private var gates: [GateCheck] { GateEngine.evaluate(inp, result) }
@@ -105,41 +109,52 @@ struct SignalsScreen: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
                 HStack(alignment: .top) {
-                    ScreenTitle(title: "Signals", subtitle: "Live factor scoring from your own captured ES bars · 12 modules · 13 risk gates · 2-of-8 multi-TF consensus · direction lock.", icon: "dot.radiowaves.left.and.right")
+                    ScreenTitle(title: "Signals", subtitle: "Live factor scoring from your own captured bars · 16 modules · 13 risk gates · 2-of-8 multi-TF consensus · direction lock · 6-tier trailing-stop plan. Instrument-specific modules (Session, SMT) apply to ES only and stay absent on other instruments.", icon: "dot.radiowaves.left.and.right")
                     Spacer()
                     StatusPill(text: live.hasData ? "Live" : "Awaiting feed", tint: live.hasData ? BLTheme.green : BLTheme.gold)
                 }
 
-                // Reachable WealthCharts entry point from the main dashboard (also in Settings).
+                // Reachable local account-reference entry point from the main dashboard.
                 wealthChartsBanner
 
                 // The real edge-gated engine fleet (backend /api/screen + /api/fires) — every
                 // engine's honest OOS verdict on the buyer's OWN captured bars.
                 engineFleet
 
-                // Hero signal card + composite.
-                signalCard
+                // Hero signal card + composite + consensus + gates. ALL of this is computed from the
+                // live factor inputs, so it renders ONLY when real captured data exists — otherwise a
+                // cold-start buyer would see a fabricated default plan (ES @ 5000, $50/pt). Honest
+                // empty state until the buyer's own feed produces bars.
+                if live.hasData {
+                    signalCard
 
-                // Multi-timeframe consensus strip + 13-gate risk checklist.
-                HStack(alignment: .top, spacing: 16) {
-                    Panel(title: "Multi-timeframe consensus", icon: "rectangle.3.group.fill") {
-                        Text("Direction-lock requires \(ConsensusEngine.requiredAgree) of 8 timeframes to agree.")
-                            .font(.system(size: 11, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
-                        HStack(spacing: 6) {
-                            ForEach(tfVotes) { v in tfChip(v) }
-                        }
-                        Stat(label: "Agreeing with \(result.direction.rawValue)", value: "\(tfAgree) / 8",
-                             tint: tfAgree >= ConsensusEngine.requiredAgree ? BLTheme.green : BLTheme.red)
-                    }.frame(maxWidth: .infinity)
-                    Panel(title: "Risk gates", icon: "checklist", accent: gatesOK ? BLTheme.green : BLTheme.red) {
-                        HStack {
-                            Text(gatesOK ? "All gates passed — signal valid" : "Blocked by failed gate(s)")
-                                .font(.system(size: 12, weight: .bold, design: .rounded)).foregroundColor(gatesOK ? BLTheme.green : BLTheme.red)
-                            Spacer()
-                            StatusPill(text: "\(GateEngine.passedCount(gates)) / 13", tint: gatesOK ? BLTheme.green : BLTheme.gold)
-                        }
-                        VStack(spacing: 6) { ForEach(gates) { gateRow($0) } }
-                    }.frame(maxWidth: .infinity)
+                    // Multi-timeframe consensus strip + 13-gate risk checklist.
+                    HStack(alignment: .top, spacing: 16) {
+                        Panel(title: "Multi-timeframe consensus", icon: "rectangle.3.group.fill") {
+                            Text("Direction-lock requires \(ConsensusEngine.requiredAgree) of 8 timeframes to agree.")
+                                .font(.system(size: 11, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+                            HStack(spacing: 6) {
+                                ForEach(tfVotes) { v in tfChip(v) }
+                            }
+                            Stat(label: "Agreeing with \(result.direction.rawValue)", value: "\(tfAgree) / 8",
+                                 tint: tfAgree >= ConsensusEngine.requiredAgree ? BLTheme.green : BLTheme.red)
+                        }.frame(maxWidth: .infinity)
+                        Panel(title: "Risk gates", icon: "checklist", accent: gatesOK ? BLTheme.green : BLTheme.red) {
+                            HStack {
+                                Text(gatesOK ? "All gates passed — signal valid" : "Blocked by failed gate(s)")
+                                    .font(.system(size: 12, weight: .bold, design: .rounded)).foregroundColor(gatesOK ? BLTheme.green : BLTheme.red)
+                                Spacer()
+                                StatusPill(text: "\(GateEngine.passedCount(gates)) / 13", tint: gatesOK ? BLTheme.green : BLTheme.gold)
+                            }
+                            VStack(spacing: 6) { ForEach(gates) { gateRow($0) } }
+                        }.frame(maxWidth: .infinity)
+                    }
+                } else {
+                    Panel(title: "Signal", icon: "dot.radiowaves.left.and.right", accent: BLTheme.gold) {
+                        EmptyState(icon: "antenna.radiowaves.left.and.right",
+                                   title: "Awaiting your live feed",
+                                   hint: "The signal, multi-timeframe consensus, and 13 risk gates compute from your own captured bars. Connect your feed under ‘Connect a feed’ and let bars accumulate — nothing is shown until it's real.")
+                    }
                 }
 
                 // Two-column: factor controls | factor breakdown.
@@ -148,7 +163,7 @@ struct SignalsScreen: View {
                           accent: live.hasData ? BLTheme.green : BLTheme.gold) {
                         if live.hasData {
                             HStack(spacing: 10) {
-                                Stat(label: "Symbol", value: "ES")
+                                Stat(label: "Symbol", value: TradingSymbolScope.displaySymbol(inp.symbol))
                                 Stat(label: "Price", value: TradeMath.num(live.price ?? 0))
                                 Stat(label: "ATR", value: TradeMath.num(live.atr ?? 0))
                             }
@@ -159,25 +174,68 @@ struct SignalsScreen: View {
                             ForEach(SignalFactor.allCases) { f in liveFactorRow(f) }
                         } else {
                             EmptyState(icon: "antenna.radiowaves.left.and.right",
-                                       title: factorsLoading ? "Reading your live bars…" : "Awaiting your WealthCharts feed",
-                                       hint: "Factors compute automatically once your own captured ES bars are available (≥\(LiveFactorEngine.minBars) bars). Read-only by design — nothing is shown until it's real.")
+                                       title: factorsLoading ? "Reading your live bars…" : "Awaiting webhook data",
+                                       hint: "Factors compute automatically once your own captured bars are available (≥\(LiveFactorEngine.minBars) bars). Read-only by design — nothing is shown until it's real.")
                         }
                     }
                     .frame(maxWidth: .infinity)
 
                     VStack(spacing: 16) {
-                        Panel(title: "Factor breakdown", icon: "list.bullet.indent") {
-                            ForEach(SignalFactor.allCases) { f in factorRow(f) }
-                            Divider().background(BLTheme.stroke).padding(.vertical, 2)
-                            Stat(label: "Composite score", value: String(format: "%+.0f", result.score), big: true)
-                        }
-                        Panel(title: "Trade plan", icon: "scope") {
-                            Stat(label: "Direction", value: result.direction.rawValue, tint: result.direction.tint)
-                            Stat(label: "Entry", value: TradeMath.num(result.entry))
-                            Stat(label: "Stop", value: TradeMath.num(result.stop), tint: BLTheme.red)
-                            Stat(label: "Target", value: TradeMath.num(result.target), tint: BLTheme.green)
-                            Stat(label: "Risk", value: "\(TradeMath.num(result.riskPoints)) pts · \(TradeMath.money(result.riskDollars))")
-                            Stat(label: "Reward : Risk", value: "\(TradeMath.num(result.rr))R", big: true)
+                        // Factor breakdown + Trade plan are computed from `inp`/`result`, which on a
+                        // cold start are the SignalInputs() ES defaults (price 5000, $50/pt). Render
+                        // them ONLY with real captured data, else an honest await state — never a
+                        // fabricated default ES plan.
+                        if live.hasData {
+                            Panel(title: "Factor breakdown", icon: "list.bullet.indent") {
+                                ForEach(SignalFactor.allCases) { f in factorRow(f) }
+                                Divider().background(BLTheme.stroke).padding(.vertical, 2)
+                                Stat(label: "Composite score", value: String(format: "%+.0f", result.score), big: true)
+                            }
+                            Panel(title: "Trade plan", icon: "scope") {
+                                Stat(label: "Direction", value: result.direction.rawValue, tint: result.direction.tint)
+                                Stat(label: "Entry", value: TradeMath.num(result.entry))
+                                Stat(label: "Stop", value: TradeMath.num(result.stop), tint: BLTheme.red)
+                                Stat(label: "Target", value: TradeMath.num(result.target), tint: BLTheme.green)
+                                Stat(label: "Risk", value: "\(TradeMath.num(result.riskPoints)) pts · \(result.riskDollarLabel)")
+                                Stat(label: "Reward : Risk", value: "\(TradeMath.num(result.rr))R", big: true)
+                                if !result.trailTiers.isEmpty {
+                                    Divider().background(BLTheme.stroke).padding(.vertical, 2)
+                                    Text("6-TIER TRAILING STOP — suggested management, execute on your own platform")
+                                        .font(.system(size: 9.5, weight: .bold, design: .rounded)).foregroundColor(BLTheme.sub).tracking(0.4)
+                                    ForEach(result.trailTiers) { t in
+                                        Stat(label: "Tier \(t.id) @ \(TradeMath.num(t.trigger))",
+                                             value: "stop → \(TradeMath.num(t.stop))\(t.id == 1 ? " (breakeven)" : "")",
+                                             tint: t.id == 1 ? BLTheme.gold : BLTheme.green)
+                                    }
+                                }
+                                // Manual order ticket — computes size from YOUR account/risk and
+                                // formats the full bracket to copy onto your own platform. The app
+                                // never sends, places, or routes an order (signals-only).
+                                if result.direction != .flat {
+                                    Divider().background(BLTheme.stroke).padding(.vertical, 2)
+                                    Text("ORDER TICKET — manual copy (for automated placement, use the Execution screen)")
+                                        .font(.system(size: 9.5, weight: .bold, design: .rounded)).foregroundColor(BLTheme.sub).tracking(0.4)
+                                    HStack(spacing: 8) {
+                                        Field(title: "Account $", text: $tAccount)
+                                        Field(title: "Risk %", text: $tRiskPct)
+                                    }
+                                    GhostButton(label: "Copy order ticket", icon: "doc.on.doc") {
+                                        let txt = OrderTicket.format(result, account: Double(tAccount) ?? 0, riskPct: Double(tRiskPct) ?? 0)
+                                        NSPasteboard.general.clearContents()
+                                        NSPasteboard.general.setString(txt, forType: .string)
+                                        ticketCopied = true
+                                    }
+                                    if ticketCopied {
+                                        Text("Copied — paste into your own platform (this is the manual path; Execution can place it for you).")
+                                            .font(.system(size: 10, design: .rounded)).foregroundColor(BLTheme.green)
+                                    }
+                                }
+                            }
+                        } else {
+                            Panel(title: "Trade plan", icon: "scope") {
+                                EmptyState(icon: "scope", title: "Awaiting your live feed",
+                                           hint: "The factor breakdown and trade plan compute from your own captured bars. Connect your feed and let bars accumulate — nothing is shown until it's real.")
+                            }
                         }
                     }
                     .frame(maxWidth: .infinity)
@@ -186,14 +244,14 @@ struct SignalsScreen: View {
                 // Honestly-graded session ledger (persisted): committed signals graded W/L + running P&L.
                 Panel(title: "Session ledger", icon: "tray.full.fill") {
                     HStack(spacing: 10) {
-                        Text("Honestly graded — you grade each committed signal Win or Loss.")
+                        Text("Honestly graded — you grade each committed signal Win or Loss. P&L is MODELED at the planned target / stop, not a broker-realized fill.")
                             .font(.system(size: 11, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
                         Spacer()
                     }
                     HStack(spacing: 12) {
                         ledgerStat("W / L", "\(model.signalWins) / \(model.signalLosses)", BLTheme.text)
                         ledgerStat("Win rate", model.gradedSignals.isEmpty ? "—" : TradeMath.pct(model.signalWinRate), BLTheme.gold)
-                        ledgerStat("Session P&L", (model.sessionPnL >= 0 ? "+" : "") + TradeMath.money(model.sessionPnL),
+                        ledgerStat("Session P&L (modeled)", (model.sessionPnL >= 0 ? "+" : "") + TradeMath.money(model.sessionPnL),
                                    model.sessionPnL >= 0 ? BLTheme.green : BLTheme.red)
                     }
                     Divider().background(BLTheme.stroke).padding(.vertical, 2)
@@ -201,6 +259,19 @@ struct SignalsScreen: View {
                         EmptyState(icon: "tray", title: "No committed signals", hint: "Commit a gate-passing signal above; grade it Win or Loss to build an honest session record on this Mac.")
                     } else {
                         ForEach(model.signals) { s in signalLogRow(s) }
+                        // Vault-backed daily logs — write the graded ledger, grouped by day, to a CSV
+                        // in your local vault. Signals-only, real data, modeled P&L labeled.
+                        if !model.gradedSignals.isEmpty {
+                            HStack(spacing: 8) {
+                                GhostButton(label: "Export daily logs", icon: "square.and.arrow.down") {
+                                    dailyLogPath = model.exportDailyLogs()
+                                }
+                                if let p = dailyLogPath {
+                                    Text("Saved to vault: \(p)").font(.system(size: 10, design: .rounded))
+                                        .foregroundColor(BLTheme.green).lineLimit(1).truncationMode(.middle)
+                                }
+                            }.padding(.top, 4)
+                        }
                     }
                 }
 
@@ -241,7 +312,7 @@ struct SignalsScreen: View {
         let provenCount = engines.filter { (byEngine[$0] ?? []).contains { $0.edge } }.count
         return Panel(title: "Engine fleet", icon: "cpu.fill", accent: BLTheme.gold) {
             HStack(spacing: 8) {
-                Text("Each engine shows ES-only OOS candidate math on YOUR captured bars. Signals remain research-only until live verification exists — nothing shows live without real data.")
+                Text("Each engine shows OOS candidate math on YOUR captured bars — for whatever instruments you stream. An edge counts only when it clears statistical significance out-of-sample; signals remain research-only until live verification exists, and nothing shows live without real data.")
                     .font(.system(size: 11, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
                     .fixedSize(horizontal: false, vertical: true)
                 Spacer()
@@ -251,7 +322,7 @@ struct SignalsScreen: View {
             }
             if fleet.isEmpty {
                 EmptyState(icon: "cpu", title: fleetLoading ? "Loading engine fleet…" : "Engine fleet idle",
-                           hint: "Connect your WealthCharts feed and let ES bars accumulate — each engine arms only after your own ES data produces an OOS candidate. Nothing is shown until it's real.")
+                           hint: "Connect your feed and let bars accumulate — each engine arms only after your own data produces a statistically significant OOS candidate. Nothing is shown until it's real.")
             } else {
                 VStack(spacing: 8) { ForEach(engines, id: \.self) { e in engineFleetRow(e, byEngine[e] ?? []) } }
             }
@@ -302,7 +373,7 @@ struct SignalsScreen: View {
         .padding(.vertical, 6).padding(.horizontal, 10).background(BLTheme.bg2).clipShape(RoundedRectangle(cornerRadius: 9))
     }
 
-    // Reachable WealthCharts connection banner — visible on the primary dashboard.
+    // Reachable local platform-account reference banner - visible on the primary dashboard.
     private var wealthChartsBanner: some View {
         let connected = wc.account.isConfigured
         return HStack(spacing: 14) {
@@ -313,11 +384,11 @@ struct SignalsScreen: View {
                 .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
                 .shadow(color: (connected ? BLTheme.green : BLTheme.gold).opacity(0.35), radius: 7, y: 2)
             VStack(alignment: .leading, spacing: 2) {
-                Text(connected ? "WealthCharts account connected" : "Connect your WealthCharts account")
+                Text(connected ? "Platform account saved" : "Save your platform account")
                     .font(.system(size: 14, weight: .bold, design: .rounded)).foregroundColor(BLTheme.text)
                 Text(connected
-                     ? "\(wc.account.username) · saved on this Mac. Signals-only, manual execution — no live feed wired."
-                     : "Add your WealthCharts account so it's on hand for the engine method. Saved on this Mac — signals-only, never auto-traded.")
+                     ? "\(wc.account.username) · saved on this Mac. Live data comes from your TopstepX session in the app-owned browser. Autonomous execution is OFF by default (see Execution)."
+                     : "Save your Topstep account label on this Mac. Live data comes from your TopstepX session in the app-owned browser.")
                     .font(.system(size: 11.5, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -378,7 +449,7 @@ struct SignalsScreen: View {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) { committed = false }
                 }
                 .opacity(gatesOK ? 1 : 0.55).disabled(!gatesOK)
-                Text(gatesOK ? TradeMath.money(r.riskDollars) + " at risk" : "Pass all 13 gates to commit").font(.system(size: 11, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+                Text(gatesOK ? (r.hasDollar ? TradeMath.money(r.riskDollars) + " at risk" : "\(TradeMath.num(r.riskPoints)) pts at risk · $/pt n/a") : "Pass all 13 gates to commit").font(.system(size: 11, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
             }
         }
         .padding(22)
@@ -482,25 +553,32 @@ struct SignalsScreen: View {
             return
         }
         if live.bars == 0 { factorsLoading = true }
-        var bars = await feed.recentBars(symbol: esSym)
+        let liveSym = esSym                       // the buyer's OWN live instrument (any, not just ES)
+        let esFamily = TradingSymbolScope.isES(liveSym)
+        var bars = await feed.recentBars(symbol: liveSym)
         // Fold the live last-price tick into the latest bar so price + price-relative factors update
         // every cycle, not only when a 15s bar closes. Real tick only (nil when gated) — never invented.
-        if let tick = await feed.liveTick(symbol: esSym) { bars = LiveFold.apply(tick, to: bars) }
-        let nqBars = await feed.recentBars(symbol: nqSymbol(for: esSym))   // SMT reference (NQ micro)
-        let snap = LiveFactorEngine.compute(bars: bars, nqBars: nqBars, fires: backendFires, now: Date())
+        if let tick = await feed.liveTick(symbol: liveSym) { bars = LiveFold.apply(tick, to: bars) }
+        // NQ reference is fetched ONLY for ES (SMT is an ES↔NQ factor); never compare an instrument
+        // to itself, which would fabricate a neutral SMT score on non-ES.
+        let nqBars = esFamily ? await feed.recentBars(symbol: nqSymbol(for: liveSym)) : []
+        let snap = LiveFactorEngine.compute(bars: bars, nqBars: nqBars, fires: backendFires,
+                                            now: Date(), esFamily: esFamily)
         await MainActor.run {
             live = snap
             factorsLoading = false
-            inp.symbol = "ES"
+            inp.symbol = liveSym                   // real instrument, never hardcoded "ES"
             if let p = snap.price { inp.price = p }
             if let a = snap.atr { inp.atr = a }
-            inp.pointValue = 50                 // ES = $50/pt (contract spec, not user input)
-            inp.factors = snap.factors          // unavailable factors absent → contribute 0
+            // Real contract spec for this instrument; 0 when unknown → dollar figures show "n/a"
+            // rather than a fabricated ES-multiplier dollar amount.
+            inp.pointValue = TradingSymbolScope.pointValue(for: liveSym) ?? 0
+            inp.factors = snap.factors             // unavailable factors absent → contribute 0
         }
     }
 
     // Map the live ES contract to its matching-expiry NQ micro for SMT (e.g. CM.ESU6 -> CM.MNQU6).
-    // NQ is a correlated REFERENCE only — the product stays ES-only for signals.
+    // NQ is a correlated REFERENCE only, used solely when the live instrument is ES-family.
     private func nqSymbol(for es: String) -> String {
         if let r = es.range(of: "ES") { return es.replacingCharacters(in: r, with: "MNQ") }
         return es
@@ -792,7 +870,7 @@ struct TradeEditor: View {
                     var t = computed()
                     let s = t.symbol.trimmingCharacters(in: .whitespacesAndNewlines)
                     t.symbol = s.isEmpty ? "ES" : s.uppercased()
-                    guard TradingSymbolScope.isES(t.symbol) else { return }
+                    guard TradingSymbolScope.inScope(t.symbol) else { return }
                     t.id = trade.id
                     model.upsert(t)
                     dismiss()
@@ -952,7 +1030,7 @@ struct SettingsScreen: View {
             // Theme / Appearance Studio — the buyer owns the holographic look (live preview + presets).
             ThemeStudioPanel()
 
-            // Headline ask: a real, reachable place to enter the WealthCharts account.
+            // Headline ask: a real, reachable place to store the local platform account label.
             WealthChartsPanel()
 
             // Live data feed — buyer-configurable backend that serves THEIR own captured bars.
@@ -964,7 +1042,7 @@ struct SettingsScreen: View {
                     Spacer()
                     GhostButton(label: "Test", icon: "arrow.clockwise") { Task { await feed.connect(email: session.email); await feed.refreshStatus() } }
                 }
-                Text("Black Label Trading captures YOUR WealthCharts feed into a private store on this Mac and serves it to the chart/screener/backtester over localhost. Nothing is fetched from us. Point this at your own backend host/port if you run it elsewhere on your machine or network.")
+            Text("Black Label Trading uses the bundled Topstep bridge to open TopstepX in a product-owned browser profile, then posts observed ES market data into the local webhook/store on this Mac. Nothing is fetched from us. Point this at your own backend host/port only if you run the local backend elsewhere on your machine or network.")
                     .font(.system(size: 11.5, design: .rounded)).foregroundColor(BLTheme.sub).fixedSize(horizontal: false, vertical: true)
                 Field(title: "Backend URL", text: $feedURLDraft, prompt: FeedClient.defaultURL)
                 HStack(spacing: 8) {
@@ -983,7 +1061,7 @@ struct SettingsScreen: View {
                     if feedSaved { Text("Saved.").font(.system(size: 11, weight: .semibold, design: .rounded)).foregroundColor(BLTheme.green) }
                 }
                 if !feed.symbols.pickerList.isEmpty {
-                    Text("Captured ES contracts: \(feed.symbols.pickerList.prefix(12).joined(separator: ", "))")
+                    Text("Captured instruments: \(feed.symbols.pickerList.prefix(12).joined(separator: ", "))")
                         .font(.system(size: 11, design: .rounded)).foregroundColor(BLTheme.sub).fixedSize(horizontal: false, vertical: true)
                 }
             }
@@ -1013,16 +1091,15 @@ struct SettingsScreen: View {
                 }
             }
             Panel(title: "Products & roadmap", icon: "shippingbox.fill") {
-                productRow("Trading Engine", "$499/mo · Pro", "16-module stack, 13 risk gates, multi-TF consensus, direction lock, session vault.", BLTheme.gold, "Available")
-                productRow("Signals", "$100/mo", "Engine-parity, direction-locked alerts — manual execution on your broker. Same modules & 13-gate validation.", BLTheme.gold, "Available")
-                productRow("Marketing", "$1,475/mo", "Six-platform content pipeline. Channels will post from credentials you own.", BLTheme.sub, "Coming soon")
-                productRow("Outbound", "$15 intro meet", "Lead gen and outreach — scoped intro before a monthly lane opens.", BLTheme.sub, "Intro")
-                Text("This app is a scenario-scoring dashboard for the engine method — it scores factors you set, runs the 13 gates, and keeps an honestly-graded session ledger on this Mac. It is NOT a live broker feed and not a track record.")
+                productRow("Trading", "see blacklabelbots.com", "9 edge-gated signal engines, 13 risk gates, multi-TF consensus, direction lock, and OPTIONAL autonomous execution (default OFF, paper-first) on your own broker where your firm permits automation.", BLTheme.gold, "Available")
+                productRow("Marketing", "see blacklabelbots.com", "Six-platform content pipeline. Channels post from credentials you own.", BLTheme.sub, "Coming soon")
+                productRow("Outbound", "see blacklabelbots.com", "Lead gen and outreach — scoped intro before a monthly lane opens.", BLTheme.sub, "Intro")
+                Text("Current pricing lives on blacklabelbots.com (kept there so it's never stale in the app). This app is a scenario-scoring dashboard for the engine method — it scores factors you set, runs the 13 gates, and keeps an honestly-graded session ledger on this Mac. It is not a broker execution record or track record.")
                     .font(.system(size: 11.5, design: .rounded)).foregroundColor(BLTheme.sub).fixedSize(horizontal: false, vertical: true).padding(.top, 4)
             }
             Panel(title: "About", icon: "info.circle") {
                 Text("Black Label Trading v1.0").font(.system(size: 13, weight: .bold, design: .rounded)).foregroundColor(BLTheme.text)
-                Text("A signal dashboard built on the Black Label engine method: a multi-module composite scoring engine, a 13-gate risk checklist, multi-timeframe consensus, a trade journal, risk calculators, and a prop-firm reference. Signals are user-driven scenarios, not a live broker feed. All data is stored privately on this Mac.")
+                Text("A signal dashboard built on the Black Label engine method: a multi-module composite scoring engine, a 13-gate risk checklist, multi-timeframe consensus, a trade journal, risk calculators, and a prop-firm reference. Live data comes from the TopstepX session you sign into in the app-owned browser, pushed into your local backend. All data is stored privately on this Mac.")
                     .font(.system(size: 12.5, design: .rounded)).foregroundColor(BLTheme.sub).fixedSize(horizontal: false, vertical: true)
             }
         }.padding(24) }
@@ -1055,26 +1132,26 @@ struct SettingsScreen: View {
     }
 }
 
-// MARK: - WealthCharts connection panel (reusable — shown in Settings)
-// HONEST FRAMING: stores the buyer's own WealthCharts account reference on THIS Mac only.
-// Not a live broker feed; does not auto-trade or move money. Username + note → UserDefaults,
-// password → macOS Keychain. The UI states plainly what is and isn't connected.
+// MARK: - Topstep account reference panel (reusable - shown in Settings)
+// HONEST FRAMING: stores the buyer's own platform account reference on THIS Mac only.
+// Not a login flow; does not auto-trade or move money. Username + note -> UserDefaults,
+// password -> macOS Keychain. The UI states plainly what is and isn't connected.
 struct WealthChartsPanel: View {
     @EnvironmentObject var wc: WealthChartsStore
     @State private var showConnect = false
 
     var body: some View {
-        Panel(title: "WealthCharts account", icon: "link", accent: wc.account.isConfigured ? BLTheme.green : BLTheme.gold) {
+        Panel(title: "Topstep account reference", icon: "link", accent: wc.account.isConfigured ? BLTheme.green : BLTheme.gold) {
             HStack(spacing: 10) {
                 Image(systemName: wc.account.isConfigured ? "checkmark.seal.fill" : "link.badge.plus")
                     .font(.system(size: 13, weight: .bold))
                     .foregroundColor(wc.account.isConfigured ? BLTheme.green : BLTheme.gold)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(wc.account.isConfigured ? "Account saved on this Mac" : "No WealthCharts account connected")
+                    Text(wc.account.isConfigured ? "Account saved on this Mac" : "No Topstep account saved")
                         .font(.system(size: 13, weight: .bold, design: .rounded)).foregroundColor(BLTheme.text)
                     Text(wc.account.isConfigured
-                         ? "Stored locally — signals-only, manual execution. No live feed wired."
-                         : "Add your WealthCharts account to keep it on hand for the engine method.")
+                         ? "Stored locally - signals-only. Live data comes from the platform you sign into in the capture browser."
+                         : "Add your Topstep account label to keep it on hand for the engine method.")
                         .font(.system(size: 11, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -1094,14 +1171,14 @@ struct WealthChartsPanel: View {
             }
 
             HStack(spacing: 8) {
-                GoldButton(label: wc.account.isConfigured ? "Update connection" : "Connect WealthCharts",
+                GoldButton(label: wc.account.isConfigured ? "Update account" : "Save account",
                            icon: wc.account.isConfigured ? "pencil" : "link") { showConnect = true }
                 if wc.account.isConfigured {
                     GhostButton(label: "Disconnect", icon: "xmark.circle", tint: BLTheme.red) { wc.disconnect() }
                 }
             }.padding(.top, 2)
 
-            Text("Your WealthCharts details stay on this Mac (username & label saved locally, password saved in the macOS Keychain). This app is signals-only — it does not log in for you, auto-trade, move money, or stream a live broker feed. A real WealthCharts data feed is not wired in this build; this saves your account so it's ready for the engine method and manual execution on your own platform.")
+            Text("These details stay on this Mac (username and label saved locally, password saved in the macOS Keychain). This panel does not log in for you. The app opens your trading platform in the capture browser and reads the live data feeding your charts. No platform login or broker key is stored in the app.")
                 .font(.system(size: 11, design: .rounded)).foregroundColor(BLTheme.sub)
                 .fixedSize(horizontal: false, vertical: true).padding(.top, 2)
         }
@@ -1109,7 +1186,7 @@ struct WealthChartsPanel: View {
     }
 }
 
-// Sheet to enter / update the WealthCharts account.
+// Sheet to enter / update the local platform account reference.
 struct ConnectWealthChartsSheet: View {
     @EnvironmentObject var wc: WealthChartsStore
     @Environment(\.dismiss) var dismiss
@@ -1123,13 +1200,13 @@ struct ConnectWealthChartsSheet: View {
                 HStack(spacing: 10) {
                     Image(systemName: "link").font(.system(size: 15, weight: .bold)).foregroundColor(Color(hex: 0x1A1305))
                         .frame(width: 30, height: 30).background(BLTheme.goldGrad).clipShape(RoundedRectangle(cornerRadius: 9))
-                    Text("Connect WealthCharts").font(.system(size: 18, weight: .heavy, design: .rounded)).foregroundColor(BLTheme.text)
+                Text("Save Topstep account").font(.system(size: 18, weight: .heavy, design: .rounded)).foregroundColor(BLTheme.text)
                 }
-                Text("Saved on this Mac only. Signals-only — this does not auto-trade, move money, or stream a live broker feed. The password is stored in the macOS Keychain.")
+                Text("Saved on this Mac only. This panel just stores your account label — it does not log in, trade, or move money. The password is stored in the macOS Keychain. Autonomous execution is OFF by default (Execution screen).")
                     .font(.system(size: 12, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
                     .fixedSize(horizontal: false, vertical: true)
 
-                Field(title: "WealthCharts username / email", text: $username, prompt: "you@wealthcharts.com")
+                Field(title: "Topstep username / email", text: $username, prompt: "you@example.com")
                 VStack(alignment: .leading, spacing: 5) {
                     Text("PASSWORD (OPTIONAL)").font(.system(size: 10, weight: .bold, design: .rounded)).foregroundColor(BLTheme.sub).tracking(0.6)
                     SecureField("••••••••", text: $password)

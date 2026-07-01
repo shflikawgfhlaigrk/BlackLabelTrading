@@ -227,6 +227,19 @@ enum ChartScale {
         return bottomY - t * h
     }
 
+    // EXACT inverse of yPixel — the price under a pixel y, honoring the SAME log predicate the
+    // renderer used. Drawing tools MUST use this (not a linear-only inverse) or a level committed on
+    // a log-scaled chart lands at the wrong price.
+    static func priceAtY(_ y: Double, lo: Double, hi: Double, topY: Double, bottomY: Double, log: Bool) -> Double {
+        let h = bottomY - topY
+        guard hi > lo, h != 0 else { return lo }
+        let t = (bottomY - y) / h
+        if log && lo > 0 && hi > 0 {
+            return Foundation.exp(Foundation.log(lo) + t * (Foundation.log(hi) - Foundation.log(lo)))
+        }
+        return lo + t * (hi - lo)
+    }
+
     // Decimal places to render a price label at, inferred from the tick step magnitude so a
     // $30,000 future shows whole numbers while a $1.2345 FX pair shows 4 decimals.
     static func priceDecimals(step: Double) -> Int {
@@ -236,11 +249,12 @@ enum ChartScale {
         return max(0, min(6, Int(ceil(-log10(step))) + 1))
     }
 
-    // Robust auto-fit domain. Like priceDomain but resistant to a single session-gap candle
-    // blowing out the vertical scale (the "one giant bar squashes everything" defect): fit to
-    // the 1st/99th percentile of the lows/highs, then expand back JUST enough to still contain
-    // every real wick — never clipping real data — but capped so one outlier can't triple the
-    // range. Honest: derived ONLY from the supplied candles, never widened to hide a move.
+    // Auto-fit domain that ALWAYS contains every real wick — it never clips real price data (a
+    // clipped wick would misrepresent the buyer's own data). It starts from the 1st/99th percentile
+    // of lows/highs for sensible padding on the typical range, then guarantees the absolute min/max
+    // are inside the domain. Honest: derived ONLY from the supplied candles, never widened to hide a
+    // move, never narrowed to hide one. (A single session-gap spike will expand the scale — that is
+    // honest; the real range is the real range.)
     static func robustDomain(_ candles: [Candle], padFrac: Double = 0.08) -> (lo: Double, hi: Double) {
         let lows = candles.map(\.low).sorted()
         let highs = candles.map(\.high).sorted()
@@ -253,11 +267,9 @@ enum ChartScale {
         }
         let p1 = pct(lows, 0.01), p99 = pct(highs, 0.99)
         let core = max(p99 - p1, (absMax - absMin) * 0.001)
-        var lo = p1 - core * padFrac
-        var hi = p99 + core * padFrac
-        let maxStretch = core * 1.5    // cap how far one outlier wick may stretch the scale
-        lo = max(min(lo, absMin), p1 - maxStretch)
-        hi = min(max(hi, absMax), p99 + maxStretch)
+        // Pad around the core percentile band, then EXPAND to contain every real extreme (no clip).
+        let lo = min(p1 - core * padFrac, absMin)
+        let hi = max(p99 + core * padFrac, absMax)
         return niceBounds(lo: lo, hi: hi)
     }
 

@@ -10,16 +10,16 @@
 # This script writes NOTHING and restarts NOTHING. Safe to run in the ledger any time.
 set -euo pipefail
 
-BUNDLE="$HOME/BlackLabelTrading/backend"
-LIVE="$HOME/.blacklabel"
-APP="/Applications/Black Label Trading.app/Contents/Resources/backend"
+BUNDLE="${BUNDLE:-$HOME/BlackLabelTrading/backend}"
+LIVE="${LIVE:-$HOME/.blacklabel}"
+APP="${APP:-/Applications/Black Label Trading.app/Contents/Resources/backend}"
 
 # The backend files that SHIP (the canonical roster a buyer gets).
-SHIP_FILES=(bltd_api.py bltd_analytics.py bltd_capture.py bltd_pg.py bltd_store.py)
+SHIP_FILES=(bltd_api.py bltd_analytics.py bltd_capture.py bltd_parsers.py bltd_pg.py bltd_store.py)
 
 # Live-only files that prove the live daemon is running a DIFFERENT (Utah-era / split-process)
 # architecture than what ships. Their presence is a divergence.
-FORBIDDEN_LIVE_EXTRAS=(bltd_engine.py bltd_parsers.py api_watch.py feed_watchdog.py harvest_parcels.py)
+FORBIDDEN_LIVE_EXTRAS=(bltd_engine.py api_watch.py feed_watchdog.py harvest_parcels.py)
 
 rc=0
 echo "== blacklabel trading: deployed-vs-bundle divergence =="

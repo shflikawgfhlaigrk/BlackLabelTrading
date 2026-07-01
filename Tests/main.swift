@@ -491,6 +491,52 @@ func testBrokerCSVDerivedPnL() {
     eq(rows[1].pnl, 50, "short derived pnl = (200-190)*5")
 }
 
+func testBrokerCSVFuturesPointValue() {
+    // FUTURES derived P&L must multiply by the contract $/point (a point is NOT $1). ES = $50/pt.
+    let csv = """
+    ticker,direction,quantity,entryprice,exitprice
+    ESU6,long,2,5000,5010
+    """
+    let (rows, _, _) = BrokerCSV.parse(csv)
+    eqi(rows.count, 1, "ES row derived")
+    eq(rows[0].pnl, 1000, "ES derived pnl = (5010-5000) pts * $50 * 2 = 1000 (not 20)")
+}
+
+func testBrokerCSVUnknownFuturesSkipped() {
+    // A DATED futures contract with an unknown $/point can't be honestly dollarized -> skipped,
+    // never rendered as points-as-dollars.
+    let csv = """
+    ticker,direction,quantity,entryprice,exitprice
+    XYZZ6,long,1,100,110
+    """
+    let (rows, skipped, _) = BrokerCSV.parse(csv)
+    ok(rows.isEmpty, "unknown dated future not dollarized")
+    eqi(skipped, 1, "skipped counted")
+}
+
+func testParseSideShortTokens() {
+    // IB tokens: SLD/Sold/short must be SHORT (false); BOT/Bought/buy default long (true).
+    ok(BrokerCSV.parseSide("SLD") == false, "IB SLD -> short")
+    ok(BrokerCSV.parseSide("Sold") == false, "Sold -> short")
+    ok(BrokerCSV.parseSide("SL") == false, "SL -> short")
+    ok(BrokerCSV.parseSide("BOT") == true, "IB BOT -> long")
+    ok(BrokerCSV.parseSide("Bought") == true, "Bought -> long")
+    ok(BrokerCSV.parseSide("buy") == true, "buy -> long")
+}
+
+func testParseDateDisambiguation() {
+    // A field > 12 forces the order: 13/06 must be 13 June; 06/13 must be 13 June too (MM/dd).
+    let cal = Calendar(identifier: .gregorian)
+    func md(_ s: String) -> (Int, Int)? {
+        guard let d = BrokerCSV.parseDate(s) else { return nil }
+        var c = cal; c.timeZone = TimeZone(identifier: "UTC")!
+        let comps = c.dateComponents([.month, .day], from: d)
+        return (comps.month ?? 0, comps.day ?? 0)
+    }
+    if let r = md("13/06/2026") { ok(r.0 == 6 && r.1 == 13, "13/06 -> 13 June (dd/MM forced)") } else { ok(false, "13/06 parsed") }
+    if let r = md("06/13/2026") { ok(r.0 == 6 && r.1 == 13, "06/13 -> 13 June (MM/dd forced)") } else { ok(false, "06/13 parsed") }
+}
+
 func testBrokerCSVNoMappableColumns() {
     let csv = "foo,bar,baz\n1,2,3"
     let (rows, skipped, _) = BrokerCSV.parse(csv)
@@ -551,6 +597,136 @@ func testCorrelationMatrix() {
     eq(m.values[0][0], 1.0, "diagonal is 1")
     let i = m.symbols.firstIndex(of: "ES")!, j = m.symbols.firstIndex(of: "NQ")!
     eq(m.values[i][j], 1.0, "ES/NQ perfectly correlated daily P&L", tol: 1e-9)
+}
+
+func testCorrelationMatrixGatesFewSharedDays() {
+    // HONESTY LOCK: on only 2 shared days, Pearson is ALWAYS exactly ±1 (two points are collinear),
+    // a spurious "concentration risk". The matrix must suppress it to 0 below minSharedDays (3).
+    var cal = Calendar(identifier: .gregorian); cal.timeZone = TimeZone(identifier: "UTC")!
+    let d0 = Date(timeIntervalSince1970: 1_767_225_600)
+    let stats = [
+        TradeStat(symbol: "ES", pnl: 100, date: d0), TradeStat(symbol: "NQ", pnl: 50, date: d0),
+        TradeStat(symbol: "ES", pnl: 200, date: d0.addingTimeInterval(86400)), TradeStat(symbol: "NQ", pnl: 100, date: d0.addingTimeInterval(86400)),
+    ]
+    let m = Correlation.symbolDailyMatrix(stats, calendar: cal)
+    let i = m.symbols.firstIndex(of: "ES")!, j = m.symbols.firstIndex(of: "NQ")!
+    eq(m.values[i][j], 0.0, "2 shared days -> no spurious ±1.00 (suppressed to 0)", tol: 1e-9)
+}
+
+func testSignalFactorRosterAndWeights() {
+    // LOCK the "16 signal modules" claim + the composite weight invariant.
+    eqi(SignalFactor.allCases.count, 16, "16 signal modules (matches storefront + docs)")
+    let sum = SignalFactor.allCases.reduce(0.0) { $0 + $1.weight }
+    eq(sum, 1.0, "factor weights sum to exactly 1.0", tol: 1e-9)
+    for f in SignalFactor.allCases { ok(f.weight > 0, "every factor has a positive weight (\(f.rawValue))") }
+}
+
+func testTrailTiersGeometry() {
+    // LOCK the 6-tier trailing-stop PLAN geometry (signals-only — pure numbers).
+    let long = SignalResult(direction: .long, score: 60, confidence: 90,
+                            entry: 5000, stop: 4990, target: 5060, symbol: "ES", pointValue: 50)
+    let t = long.trailTiers
+    eqi(t.count, 6, "6 tiers")
+    eq(t[0].stop, 5000, "tier 1 stop = breakeven (entry)", tol: 1e-9)
+    eq(t[5].trigger, 5060, "tier 6 trigger = target", tol: 1e-9)
+    eq(t[5].stop, 5050, "tier 6 locks 5/6 of the 60-pt reward", tol: 1e-9)
+    ok(t[0].trigger < t[5].trigger, "triggers ascend toward target (long)")
+    // Short mirrors.
+    let short = SignalResult(direction: .short, score: -60, confidence: 90,
+                             entry: 5000, stop: 5010, target: 4940, symbol: "ES", pointValue: 50)
+    let s = short.trailTiers
+    eq(s[0].stop, 5000, "short tier 1 = breakeven", tol: 1e-9)
+    eq(s[5].trigger, 4940, "short tier 6 trigger = target", tol: 1e-9)
+    // Flat -> no trail (honest, nothing to manage).
+    let flat = SignalResult(direction: .flat, score: 0, confidence: 0,
+                            entry: 5000, stop: 4990, target: 5010, symbol: "ES", pointValue: 50)
+    ok(flat.trailTiers.isEmpty, "flat -> no trail tiers")
+}
+
+func testLiveFactorHonestAbsenceAndDirection() {
+    // LOCK: the new factors compute from REAL bars and stay ABSENT (never fabricated) without data.
+    func bars(_ closes: [Double]) -> [Bar] {
+        closes.enumerated().map { (i, c) in
+            Bar(date: Date(timeIntervalSince1970: 1_700_000_000 + Double(i) * 15),
+                open: c, high: c + 0.5, low: c - 0.5, close: c)
+        }
+    }
+    let km = SignalFactor.kalmanTrend.rawValue, bo = SignalFactor.breakout.rawValue,
+        kl = SignalFactor.keyLevels.rawValue, st = SignalFactor.structure.rawValue
+
+    // Empty + thin -> the whole snapshot is honestly empty (below minBars); no factor fabricated.
+    let empty = LiveFactorEngine.compute(bars: [], nqBars: [], fires: [], now: Date())
+    ok(empty.available.isEmpty && empty.bars == 0, "empty bars -> nothing available (no fabrication)")
+    let thin = LiveFactorEngine.compute(bars: bars((0..<10).map { 5000 + Double($0) }),
+                                        nqBars: [], fires: [], now: Date())
+    ok(!thin.available.contains(km) && !thin.available.contains(bo),
+       "below the data guards -> kalman/breakout ABSENT (not fabricated)")
+
+    // Clean uptrend (60 bars) -> kalman present & positive, breakout present.
+    let up = LiveFactorEngine.compute(bars: bars((0..<60).map { 5000 + Double($0) * 0.7 }),
+                                      nqBars: [], fires: [], now: Date())
+    ok(up.available.contains(km), "uptrend -> kalmanTrend available")
+    ok((up.factors[km] ?? 0) > 0, "uptrend -> kalmanTrend velocity positive")
+    ok(up.available.contains(bo), "uptrend -> breakout available")
+    // Clean downtrend -> kalman negative.
+    let dn = LiveFactorEngine.compute(bars: bars((0..<60).map { 5000 - Double($0) * 0.7 }),
+                                      nqBars: [], fires: [], now: Date())
+    ok((dn.factors[km] ?? 0) < 0, "downtrend -> kalmanTrend velocity negative")
+    // Every present factor value is finite and in [-1,1] (no NaN/inf/out-of-range fabrication).
+    for (k, v) in up.factors { ok(v.isFinite && v >= -1.0001 && v <= 1.0001, "factor \(k) in [-1,1] & finite") }
+    _ = (kl, st)   // keyLevels/structure are pivot-gated; covered by honest-absence on thin data above
+}
+
+func testOrderTicketSignalsOnly() {
+    // LOCK the manual order ticket: computes size from account/risk on a KNOWN $/pt, says "—" when
+    // $/pt is unknown (no fabricated size), includes the bracket + trail, and is explicitly manual.
+    let es = SignalResult(direction: .long, score: 60, confidence: 90,
+                          entry: 5000, stop: 4990, target: 5020, symbol: "ES", pointValue: 50)
+    // risk = 10 pts * $50 = $500/contract; 1% of $50k = $500 -> size 1.
+    eqi(OrderTicket.size(es, account: 50000, riskPct: 1)!, 1, "ES size = 1 contract at 1% of $50k")
+    eqi(OrderTicket.size(es, account: 100000, riskPct: 2)!, 4, "scales with account & risk")
+    let txt = OrderTicket.format(es, account: 50000, riskPct: 1)
+    ok(txt.contains("SIZE 1"), "ticket shows computed size")
+    ok(txt.contains("ENTRY 5000.00") && txt.contains("STOP 4990.00") && txt.contains("TARGET 5020.00"), "bracket present")
+    ok(txt.lowercased().contains("never sends") || txt.lowercased().contains("manual"), "ticket is explicitly manual/signals-only")
+    // Unknown $/pt -> no fabricated size.
+    let fx = SignalResult(direction: .long, score: 60, confidence: 90,
+                          entry: 1.08, stop: 1.075, target: 1.09, symbol: "EURUSD", pointValue: 0)
+    ok(OrderTicket.size(fx, account: 50000, riskPct: 1) == nil, "unknown $/pt -> nil size (no fabrication)")
+    ok(OrderTicket.format(fx, account: 50000, riskPct: 1).contains("enter your own"), "ticket prompts for size when $/pt unknown")
+    // Flat -> nothing to place.
+    let flat = SignalResult(direction: .flat, score: 0, confidence: 0, entry: 5000, stop: 4990, target: 5010, symbol: "ES", pointValue: 50)
+    ok(OrderTicket.format(flat, account: 50000, riskPct: 1).contains("FLAT"), "flat -> no ticket")
+}
+
+func testSessionDailyLogCSV() {
+    // LOCK the vault daily-logs builder: grouped by day (first-seen order), each day followed by a
+    // DAY TOTAL line with W/L + net modeled P&L; header present; pure + deterministic.
+    let e = [
+        SessionLedger.Entry(day: "2026-06-27", symbol: "ES", direction: "LONG", grade: "win", pnl: 1000),
+        SessionLedger.Entry(day: "2026-06-27", symbol: "ES", direction: "SHORT", grade: "loss", pnl: -500),
+        SessionLedger.Entry(day: "2026-06-28", symbol: "NQ", direction: "LONG", grade: "win", pnl: 800),
+    ]
+    let csv = SessionLedger.dailyCSV(e)
+    let lines = csv.split(separator: "\n").map(String.init)
+    ok(lines[0] == "day,symbol,direction,grade,modeled_pnl", "header present")
+    ok(lines.contains("2026-06-27,ES,LONG,win,1000.00"), "day-1 win row")
+    ok(lines.contains("2026-06-27,,DAY TOTAL,1W/1L,500.00"), "day-1 total: 1W/1L net +500")
+    ok(lines.contains("2026-06-28,,DAY TOTAL,1W/0L,800.00"), "day-2 total: 1W/0L net +800")
+    ok(SessionLedger.dailyCSV([]).contains("day,symbol"), "empty -> header only, no fabricated rows")
+}
+
+func testChartScalePriceAtYInvertsYPixel() {
+    // LOCK the drawing-price fix: priceAtY must be the EXACT inverse of yPixel in BOTH scales, so a
+    // level drawn on screen commits at the price it visually sits on (esp. on a log axis).
+    let lo = 4000.0, hi = 5000.0, topY = 10.0, bottomY = 410.0   // matches renderer topY=maxY,bottomY=minY
+    for log in [false, true] {
+        for price in [4000.0, 4250.0, 4500.0, 4990.0] {
+            let y = ChartScale.yPixel(price, lo: lo, hi: hi, topY: topY, bottomY: bottomY, log: log)
+            let back = ChartScale.priceAtY(y, lo: lo, hi: hi, topY: topY, bottomY: bottomY, log: log)
+            eq(back, price, "priceAtY∘yPixel == identity (log=\(log), price=\(price))", tol: 1e-6)
+        }
+    }
 }
 
 // ===== Run =====
@@ -618,6 +794,16 @@ func testDoubleTopDetection() {
     for (i, p) in prices.enumerated() { bars.append(obar(p, p + 0.2, p - 0.2, p, i)) }
     let hits = StructureScan.doubleTopsBottoms(bars, lookback: 2, tolFrac: 0.05)
     ok(hits.contains { $0.chart == .doubleTop }, "double top detected")
+}
+
+func testDoubleTopRequiresPullback() {
+    // HONESTY LOCK: two similar-priced peaks with only a TINY dip between them is NOT a double top
+    // (the documented "meaningful pullback" must be real) — flat drift must not fabricate a pattern.
+    var bars: [Bar] = []
+    let prices = [15.0, 15.05, 14.98, 15.02, 14.99, 15.03, 15.0, 14.97, 15.01]  // ~flat, <1% moves
+    for (i, p) in prices.enumerated() { bars.append(obar(p, p + 0.02, p - 0.02, p, i)) }
+    let hits = StructureScan.doubleTopsBottoms(bars, lookback: 2, tolFrac: 0.05)
+    ok(!hits.contains { $0.chart == .doubleTop }, "no double top without a meaningful pullback")
 }
 
 func testTriangleSlopeMath() {
@@ -1031,6 +1217,10 @@ testMonteCarloRiskOfRuin()
 // Broker CSV import
 testBrokerCSVPnL()
 testBrokerCSVDerivedPnL()
+testBrokerCSVFuturesPointValue()
+testBrokerCSVUnknownFuturesSkipped()
+testParseSideShortTokens()
+testParseDateDisambiguation()
 testBrokerCSVNoMappableColumns()
 testCSVQuotedFields()
 // Seasonality + correlations
@@ -1038,12 +1228,20 @@ testSeasonalityByMonth()
 testSeasonalityHoldTime()
 testCorrelationPearson()
 testCorrelationMatrix()
+testCorrelationMatrixGatesFewSharedDays()
+testSignalFactorRosterAndWeights()
+testTrailTiersGeometry()
+testLiveFactorHonestAbsenceAndDirection()
+testOrderTicketSignalsOnly()
+testSessionDailyLogCSV()
+testChartScalePriceAtYInvertsYPixel()
 // Pattern detection
 testCandlePatternGeometry()
 testEngulfingAndInside()
 testPatternScannerEmptyAndCounts()
 testPivotsAndLevels()
 testDoubleTopDetection()
+testDoubleTopRequiresPullback()
 testTriangleSlopeMath()
 // Visual strategy builder
 testVisualStrategyCrossMatchesBuiltin()
@@ -1098,8 +1296,10 @@ func testFeedBarsGeometryDefensive() {
 func testLiveTickDecode() {
     ok(LiveTick.decode(["gated": true]) == nil, "gated tick -> nil")
     ok(LiveTick.decode(["symbol": "ES"]) == nil, "incomplete tick -> nil")
-    ok(LiveTick.decode(["symbol": "CM.NQU6", "price": 17000.0, "ts": 1_700_000_000.0]) == nil,
-       "non-ES tick is rejected")
+    let nq = LiveTick.decode(["symbol": "CM.NQU6", "price": 17000.0, "ts": 1_700_000_000.0])
+    ok(nq == nil, "non-ES tick is filtered from shipped Topstep scope")
+    ok(LiveTick.decode(["symbol": "", "price": 1.0, "ts": 1_700_000_000.0]) == nil,
+       "empty-symbol tick still rejected")
     let t = LiveTick.decode(["symbol": "ES", "price": 4500.25, "ts": 1_700_000_000.0])
     ok(t != nil, "valid tick decodes")
     eq(t!.price, 4500.25, "tick price")
@@ -1125,26 +1325,52 @@ func testCaptureStatusState() {
     ok(CaptureStatus(cdpReachable: true, feedAvailable: true, liveTicks: ["ES"]).state(signedIn: true) == .live, "state live")
 }
 func testFeedSymbolsPicker() {
+    // Shipped Topstep scope: only ES-family symbols are kept, deduped; stale non-ES rows are dropped.
     let s = FeedSymbols.decode([
-        "backtestable": ["AAA", "CM.ESU6", "ESZ26"], "live": ["ESZ26", "CM.NQU6"],
-        "liveTicks": ["CM.ESU6", "NQ"], "busiest": "AAA",
+        "backtestable": ["CM.ESU6", "ESZ26"], "live": ["ESZ26", "CM.NQU6"],
+        "liveTicks": ["CM.ESU6", "NQ"], "busiest": "CM.NQU6",
     ])
     let p = s.pickerList
-    eqi(p.count, 2, "picker de-duplicates ES-only union")
-    ok(p.first == "CM.ESU6", "picker leads with ES live tick")
+    ok(p.contains("CM.ESU6") && p.contains("ESZ26"), "picker keeps ES-family instruments")
+    ok(!p.contains("CM.NQU6") && !p.contains("NQ"), "picker drops stale non-ES instruments")
     ok(Set(p).count == p.count, "picker has no dupes")
-    ok(s.busiest == nil, "non-ES busiest symbol is rejected")
+    ok(s.busiest == nil, "non-ES busiest symbol is filtered")
 }
 
 func testTradingSymbolScope() {
+    // isES stays an HONEST ES-family predicate (used where ES is genuinely special).
     ok(TradingSymbolScope.isES("ES"), "ES root accepted")
     ok(TradingSymbolScope.isES("/ES"), "/ES accepted")
-    ok(TradingSymbolScope.isES("CM.ESU6"), "WealthCharts ES contract accepted")
+    ok(TradingSymbolScope.isES("CM.ESU6"), "vendor-prefixed ES contract accepted")
     ok(TradingSymbolScope.isES("ESZ26"), "two-digit ES contract accepted")
-    ok(!TradingSymbolScope.isES("NQ"), "NQ rejected")
-    ok(!TradingSymbolScope.isES("CM.NQU6"), "NQ contract rejected")
-    ok(!TradingSymbolScope.isES("MESU6"), "MES rejected")
-    ok(!TradingSymbolScope.isES("US.SPY"), "equity symbol rejected")
+    ok(!TradingSymbolScope.isES("NQ"), "NQ is not ES-family")
+    ok(!TradingSymbolScope.isES("CM.NQU6"), "NQ contract is not ES-family")
+    ok(!TradingSymbolScope.isES("MESU6"), "MES is not ES-family")
+    ok(!TradingSymbolScope.isES("US.SPY"), "equity symbol is not ES-family")
+
+    // Shipped scope is Topstep ES-family only.
+    ok(!TradingSymbolScope.inScope("NQ") && !TradingSymbolScope.inScope("CM.NQU6"), "NQ out of shipped scope")
+    ok(!TradingSymbolScope.inScope("EURUSD") && !TradingSymbolScope.inScope("US.SPY"), "FX/equity out of shipped scope")
+    ok(!TradingSymbolScope.inScope("") && !TradingSymbolScope.inScope("  "), "junk symbol out of scope")
+
+    // futuresRoot strips the contract suffix; passes non-futures through.
+    ok(TradingSymbolScope.futuresRoot("CM.ESU6") == "ES", "root ESU6 -> ES")
+    ok(TradingSymbolScope.futuresRoot("MNQU6") == "MNQ", "root MNQU6 -> MNQ")
+    ok(TradingSymbolScope.futuresRoot("CLF26") == "CL", "root CLF26 -> CL")
+    ok(TradingSymbolScope.futuresRoot("EURUSD") == "EURUSD", "non-futures passes through")
+
+    // BLOCKER-2 LOCK: per-instrument point value is the REAL contract spec, never a hardcoded $50.
+    // A future edit that re-hardcodes ES/$50 or mis-maps a root fails here.
+    eq(TradingSymbolScope.pointValue(for: "CM.ESU6") ?? -1, 50, "ES = $50/pt")
+    eq(TradingSymbolScope.pointValue(for: "MESU6") ?? -1, 5, "MES = $5/pt")
+    eq(TradingSymbolScope.pointValue(for: "CM.NQU6") ?? -1, 20, "NQ = $20/pt (not $50)")
+    eq(TradingSymbolScope.pointValue(for: "MNQU6") ?? -1, 2, "MNQ = $2/pt")
+    eq(TradingSymbolScope.pointValue(for: "CLF26") ?? -1, 1000, "CL = $1000/pt")
+    ok(TradingSymbolScope.pointValue(for: "EURUSD") == nil, "unknown instrument -> nil $/pt (no fabricated $50)")
+    ok(TradingSymbolScope.pointValue(for: "US.AAPL") == nil, "equity -> nil $/pt")
+
+    // displaySymbol strips the venue prefix for an honest label.
+    ok(TradingSymbolScope.displaySymbol("CM.NQU6") == "NQU6", "display strips venue prefix")
 }
 
 func source(_ rel: String) -> String {
@@ -1152,16 +1378,80 @@ func source(_ rel: String) -> String {
     return (try? String(contentsOf: url, encoding: .utf8)) ?? ""
 }
 
-func testProductSurfaceESOnlyContract() {
+func testProductSurfaceTopstepScopeContract() {
+    // The product surface must stay honest inside the shipped Topstep ES-family scope. This locks
+    // two things a future edit must not regress: (1) the live Signals path must derive symbol and
+    // point value from the feed instead of hardcoding display defaults; (2) entry guards use the
+    // shared in-scope predicate so stale non-ES rows are filtered consistently.
     let files = ["Sources/Model.swift", "Sources/Screens.swift", "Sources/Screens2.swift", "Sources/Screens3.swift"]
     let text = files.map { source($0) }.joined(separator: "\n")
     ok(!text.isEmpty, "product-surface source loaded")
-    for phrase in ["ES, NQ", "ES, AAPL", "NQ=15500", "placeholder: \"AAPL\"", "i.symbol = \"NQ\"", "i.symbol = \"CL\""] {
-        ok(!text.contains(phrase), "product surface excludes non-ES phrase: \(phrase)")
+    // No fabricated-default SAMPLE DATA leaks to the buyer (seeded prices/quotes, not honest
+    // placeholder hints like "e.g. ES, NQ, …" which legitimately name instruments).
+    for phrase in ["NQ=15500", "placeholder: \"AAPL\"", "i.symbol = \"NQ\"", "i.symbol = \"CL\""] {
+        ok(!text.contains(phrase), "product surface excludes seeded-sample phrase: \(phrase)")
     }
-    ok(text.contains("TradingSymbolScope.isES(t.symbol)"), "trade save is ES-guarded")
-    ok(text.contains("TradingSymbolScope.isES(s), !conditions.isEmpty"), "alert creation is ES-guarded")
-    ok(text.contains("Alerts are ES-only"), "visual strategy alert explains ES-only guard")
+    // The live Signals path must derive symbol + point value from the real instrument.
+    ok(text.contains("inp.symbol = liveSym"), "live signal uses the real resolved symbol")
+    ok(text.contains("TradingSymbolScope.pointValue(for: liveSym)"), "live signal uses real per-instrument $/pt")
+    ok(!text.contains("inp.pointValue = 50"), "live signal does NOT hardcode ES $50/pt")
+    ok(text.contains("riskDollarLabel") || text.contains("$/pt n/a"), "dollar figures honest when $/pt unknown")
+    // Entry guards use the shared shipped-scope predicate.
+    ok(text.contains("TradingSymbolScope.inScope(t.symbol)"), "trade save uses in-scope guard")
+    ok(text.contains("TradingSymbolScope.inScope(s), !conditions.isEmpty"), "alert creation uses in-scope guard")
+    ok(!text.contains("Alerts are ES-only"), "no stale ES-only alert copy")
+}
+
+func testNoAPIWebhookIngestionContract() {
+    let ui = source("Sources/Feeds.swift")
+    let chart = source("Sources/ChartScreen.swift")
+    let feedTypes = source("Sources/FeedTypes.swift")
+    let feedClient = source("Sources/FeedClient.swift")
+    let settings = source("Sources/Screens.swift")
+    let api = source("backend/bltd_api.py")
+    let cap = source("backend/bltd_capture.py")
+    let feeds = source("backend/bltd_feeds.py")
+    let topstepBridge = source("backend/bltd_topstep_bridge.py")
+    let launcher = source("backend/launch-backend.sh")
+    let entitlements = source("Sources/app-developerid.entitlements")
+    ok(!ui.isEmpty && !chart.isEmpty && !feedTypes.isEmpty && !feedClient.isEmpty && !settings.isEmpty &&
+       !api.isEmpty && !cap.isEmpty && !feeds.isEmpty && !topstepBridge.isEmpty &&
+       !launcher.isEmpty && !entitlements.isEmpty,
+       "no-api webhook-ingestion source loaded")
+
+    ok(ui.contains("bundled Topstep bridge") && ui.contains("webhook URL"),
+       "feed UI explicitly says bundled Topstep bridge/webhook")
+    ok(ui.contains("FeedCredStore.lastSource ?? \"webhook\""), "feed UI defaults to webhook receiver")
+    ok(ui.contains("Copy curl") && ui.contains("webhookInfo()"),
+       "feed UI exposes copyable webhook setup")
+    ok(chart.contains("Waiting for Topstep data") && chart.contains("Refresh webhook"),
+       "chart waits for Topstep bridge data instead of asking for broker credentials")
+    ok(!chart.contains("Connect WealthCharts") && !chart.contains("Open browser capture"),
+       "chart does not route prop users to WealthCharts/browser credential flows")
+    ok(feedTypes.contains("No webhook data") && feedTypes.contains("your Topstep webhook feed"),
+       "feed status labels are webhook based")
+    ok(settings.contains("bundled Topstep bridge") && !settings.contains("prop-firm API"),
+       "settings copy describes no-creds Topstep bridge ingestion")
+    ok(feedClient.contains("/api/webhook/info"), "feed client fetches webhook receiver details")
+    ok(api.contains("_webhook_ingest") && api.contains("\"/webhook/feed\""),
+       "backend exposes webhook ingestion route")
+    ok(api.contains("cap.on_candle") && api.contains("STORE.record_bars_batch"),
+       "webhook writes through capture/store ingestion")
+    ok(api.contains("API feed posts rejected"), "/api/feed/connect documents API feed rejection")
+    ok(feeds.contains("\"key\": \"webhook\"") && !feeds.contains("\"key\": \"projectx\""),
+       "feed catalogue exposes webhook receiver, not API sources")
+    ok(feeds.contains("webhook ingestion only; no broker/API feed is accepted"),
+       "feed manager rejects direct API feed source posts")
+    ok(topstepBridge.contains("class WebhookSink") && topstepBridge.contains("topstepx.com") &&
+       topstepBridge.contains("/webhook/feed"),
+       "bundled Topstep bridge posts parsed TopstepX data to webhook")
+    ok(launcher.contains("supervise_topstep_bridge") && launcher.contains("BLTD_TOKEN") &&
+       launcher.contains("BLTD_CAPTURE_BROWSER=\"0\"") && !launcher.contains("prop-firm API feed"),
+       "launcher auto-starts Topstep bridge with shared webhook token and disables direct browser writes")
+    ok(entitlements.contains("Topstep bridge/webhook feed") && !entitlements.contains("WealthCharts feed"),
+       "Developer ID entitlement rationale names Topstep bridge/webhook ingestion")
+    ok(!ui.contains("API Key") && !ui.contains("ProjectX/TopstepX"),
+       "feed UI does not ask for prop-account API credentials")
 }
 
 // ===== ChartRender — headless chart + engine-trade overlay (edge-gate transparency) =====
@@ -1261,7 +1551,7 @@ func testEngineRosterDecode() {
          "winRate": 0.0, "netPts": 0.0, "expectancyR": 0.0, "trades": 0, "bars": 12, "reason": "warming"],
     ]]
     let rows = EngineRoster.decode(obj)
-    eqi(rows.count, 1, "roster keeps only ES rows")
+    eqi(rows.count, 1, "roster filters stale non-ES instruments")
     ok(rows[0].engine == "momentum" && rows[0].edge && !rows[0].warming, "roster row 0 fields")
     eq(rows[0].netPts, 12.5, "roster row 0 netPts")
     eqi(rows[0].trades, 30, "roster row 0 trades")
@@ -1294,11 +1584,57 @@ func testFireFeedDecode() {
          "stop": 16900.0, "target": 17200.0, "rationale": "r", "ts": "2026-06-18 12:01:00"],
     ]]
     let fires = FireFeed.decode(obj)
-    eqi(fires.count, 1, "fire decode keeps only ES rows")
+    eqi(fires.count, 1, "fire decode filters stale non-ES instruments")
     ok(fires[0].engine == "structure" && fires[0].direction == "short", "fire fields")
     eq(fires[0].entry, 5100.0, "fire entry")
     ok(fires[0].outcome == nil && fires[0].pnl == nil, "ungraded fire -> nil outcome/pnl (honest)")
     eqi(FireFeed.decode(["fires": []]).count, 0, "empty fires honest")
+}
+
+// ===== In-app auto-updater (pure core: version compare, sha256, manifest decode, check window) =====
+// Mirrors the proven Black Label Real Estate testUpdater(). App-shell updater only — it never
+// touches the engines, the feed, the edge-gate, or any signal; these are the headless-verifiable
+// pure functions the Install/daily-check path depends on.
+func testUpdater() {
+    // Version compare — strictly newer only.
+    ok(Updater.isNewer(latestBuild: 13, currentBuild: 12), "updater: 13>12 is newer")
+    ok(!Updater.isNewer(latestBuild: 12, currentBuild: 12), "updater: equal is not newer")
+    ok(!Updater.isNewer(latestBuild: 11, currentBuild: 12), "updater: older is not newer")
+    // sha256 known vectors (integrity-check correctness).
+    ok(Updater.sha256Hex(Data("abc".utf8)) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "updater: sha256(abc)")
+    ok(Updater.sha256Hex(Data()) == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "updater: sha256(empty)")
+    // Manifest decode — snake_case keys, extra fields ignored.
+    let json = "{\"product\":\"trading\",\"latest_build\":13,\"latest_version\":\"1.0\",\"download_url\":\"https://x/13.zip\",\"sha256\":\"deadbeef\",\"notarized\":true,\"team_id\":\"745ZPGFRA5\",\"release_notes\":\"Fix\",\"mandatory\":false,\"unknown\":\"ignored\"}"
+    let m = try? Updater.decodeManifest(Data(json.utf8))
+    ok(m != nil, "updater: manifest decodes")
+    eqi(m?.latestBuild ?? -1, 13, "updater: manifest build = 13")
+    ok(m?.downloadURL == "https://x/13.zip", "updater: manifest download_url")
+    ok(m?.teamID == "745ZPGFRA5", "updater: manifest team_id")
+    ok(m?.sha256 == "deadbeef", "updater: manifest sha256")
+    ok(m?.product == "trading", "updater: manifest product = trading")
+    // Minimal manifest — only required fields present; optionals default nil.
+    let minimal = "{\"product\":\"trading\",\"latest_build\":5,\"download_url\":\"https://x/5.zip\"}"
+    let m2 = try? Updater.decodeManifest(Data(minimal.utf8))
+    ok(m2 != nil, "updater: minimal manifest decodes")
+    ok(m2?.sha256 == nil, "updater: minimal sha256 is nil")
+    eqi(m2?.latestBuild ?? -1, 5, "updater: minimal build = 5")
+    // Malformed JSON throws cleanly (never crashes).
+    var threw = false
+    do { _ = try Updater.decodeManifest(Data("{not json".utf8)) } catch { threw = true }
+    ok(threw, "updater: malformed manifest throws")
+    // Default manifest URL targets THIS product's slug (trading), not realestate.
+    let savedURL = UserDefaults.standard.string(forKey: Updater.manifestOverrideKey)
+    UserDefaults.standard.removeObject(forKey: Updater.manifestOverrideKey)
+    ok(Updater.manifestURL.absoluteString == "https://blacklabelbots.com/api/version/trading", "updater: default manifest URL = trading slug")
+    if let savedURL { UserDefaults.standard.set(savedURL, forKey: Updater.manifestOverrideKey) }
+    // Daily-check window.
+    UserDefaults.standard.removeObject(forKey: Updater.lastCheckKey)
+    ok(Updater.dueForBackgroundCheck(now: 1_000_000), "updater: due when never checked")
+    UserDefaults.standard.set(1_000_000.0 - 3600, forKey: Updater.lastCheckKey)
+    ok(!Updater.dueForBackgroundCheck(now: 1_000_000), "updater: not due 1h after a check")
+    UserDefaults.standard.set(1_000_000.0 - 25*3600, forKey: Updater.lastCheckKey)
+    ok(Updater.dueForBackgroundCheck(now: 1_000_000), "updater: due 25h after a check")
+    UserDefaults.standard.removeObject(forKey: Updater.lastCheckKey)
 }
 
 // ===== LIVE backend integration test (opt-in via BLT_LIVE_BACKEND=1) =====
@@ -1388,12 +1724,16 @@ testLiveFold()
 testCaptureStatusState()
 testFeedSymbolsPicker()
 testTradingSymbolScope()
-testProductSurfaceESOnlyContract()
+testProductSurfaceTopstepScopeContract()
+testNoAPIWebhookIngestionContract()
 
 // Engine roster + fire feed decode (the /api/screen + /api/fires wire contract)
 testEngineRosterDecode()
 testEngineLabels()
 testFireFeedDecode()
+
+// In-app auto-updater pure core (version compare, sha256, manifest decode, daily-check window)
+testUpdater()
 
 // Opt-in live backend integration (locks the end-to-end wire contract on real captured data).
 if ProcessInfo.processInfo.environment["BLT_LIVE_BACKEND"] == "1" {

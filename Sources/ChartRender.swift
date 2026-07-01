@@ -35,6 +35,9 @@ enum RenderPalette {
     static let red      = CGColor(red: 0.941, green: 0.380, blue: 0.427, alpha: 1)  // #F0616D (down)
     static let blue     = CGColor(red: 0.40, green: 0.66, blue: 0.98, alpha: 1)
     static func alpha(_ c: CGColor, _ a: CGFloat) -> CGColor { c.copy(alpha: a) ?? c }
+    static func cg(_ rgba: (Double, Double, Double, Double)) -> CGColor {
+        CGColor(red: rgba.0, green: rgba.1, blue: rgba.2, alpha: rgba.3)
+    }
     // Multiply rgb by `m` (clamped) — darken (<1) wicks, brighten (>1) borders.
     static func shade(_ c: CGColor, _ m: CGFloat) -> CGColor {
         guard let k = c.components, k.count >= 3 else { return c }
@@ -56,6 +59,31 @@ struct RenderFire {
     var outcome: String? = nil     // nil = open (label "ENTRY"); set = closed (label "EXIT <outcome>")
 }
 
+// One real edge-gated fire to MARK on the chart at its bar/timestamp (▲ long / ▼ short), in its
+// engine's distinct color. Built ONLY from a recorded FireRow via EngineFireMarkers — never invented.
+struct EngineMarker {
+    var barIndex: Int        // candle index this fire maps to (within the plotted series)
+    var price: Double        // the fire's REAL entry price
+    var isLong: Bool
+    var engine: String       // raw engine id (for grouping)
+    var short: String        // 3–4 char marker code
+    var rgba: (Double, Double, Double, Double)
+}
+
+// One legend/status row naming an engine, its color, its real fire count + last fire. `quiet`
+// means zero fires for the displayed symbol (named but no marker — honest, never fabricated).
+struct EngineLegendRow {
+    var engine: String
+    var label: String
+    var short: String
+    var blurb: String
+    var rgba: (Double, Double, Double, Double)
+    var count: Int           // real fires for the displayed symbol in the loaded journal
+    var inWindow: Int        // how many land on the plotted window (markers actually drawn)
+    var lastFire: String     // human last-fire string (or a quiet note)
+    var quiet: Bool
+}
+
 // What to draw on top of the candles. Mirrors ChartIndicatorSet (the SwiftUI toggles) so the
 // render proof and the live chart show the same overlays from the same math.
 struct RenderIndicators {
@@ -71,6 +99,8 @@ struct RenderIndicators {
     var lastPriceLine: Double? = nil
     var fire: RenderFire? = nil   // active engine signal: entry/stop/target overlay (edge-gate transparency)
     var fires: [RenderFire] = []  // one entry line per engine (live multi-engine overlay)
+    var engineMarkers: [EngineMarker] = []   // per-engine REAL fire markers at the fire bar/timestamp
+    var engineLegend: [EngineLegendRow] = [] // status rail naming each engine + color + count/last-fire
     var logScale = false
 }
 
