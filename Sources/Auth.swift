@@ -25,6 +25,7 @@ struct AuthView: View {
     @State private var err = ""
     @State private var glow = false
     @State private var orb = false
+    @Environment(\.blMotion) private var motion   // pauses ambient loops when app is backgrounded
     @State private var note = ""           // inline, non-crashing provider note (e.g. "add a client ID")
     @StateObject private var google = GoogleSignIn()
 
@@ -111,6 +112,14 @@ struct AuthView: View {
         }
         .frame(minWidth: 820, minHeight: 640)
         .onAppear {
+            guard motion else { return }
+            withAnimation(.easeInOut(duration: 3).repeatForever(autoreverses: true)) { glow = true }
+            withAnimation(.easeInOut(duration: 7).repeatForever(autoreverses: true)) { orb = true }
+        }
+        // Backgrounded app: plain assignment cancels the loops; foregrounding restarts them.
+        .onChange(of: motion) { on in
+            glow = false; orb = false
+            guard on else { return }
             withAnimation(.easeInOut(duration: 3).repeatForever(autoreverses: true)) { glow = true }
             withAnimation(.easeInOut(duration: 7).repeatForever(autoreverses: true)) { orb = true }
         }

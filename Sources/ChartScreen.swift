@@ -701,10 +701,11 @@ struct ChartScreen: View {
 struct LivePulse: ViewModifier {
     let active: Bool
     @State private var on = false
+    @Environment(\.blMotion) private var motion   // pause the pulse when app is backgrounded
     func body(content: Content) -> some View {
         content.background(
             Group {
-                if active {
+                if active && motion {
                     Circle().stroke(BLTheme.green, lineWidth: 1.5)
                         .scaleEffect(on ? 2.4 : 1).opacity(on ? 0 : 0.7)
                         .onAppear { withAnimation(.easeOut(duration: 1.6).repeatForever(autoreverses: false)) { on = true } }

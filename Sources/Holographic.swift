@@ -93,14 +93,19 @@ final class HoloThemeController: ObservableObject {
     func resetToDefault() { apply(.goldVault) }
 }
 
-// Inject `\.blMotion` from the controller + the live system Reduce-Motion setting.
+// Inject `\.blMotion` from the controller + the live system Reduce-Motion setting + app
+// activity: ambient FX pause when the app is backgrounded (an idle window burned ~20% CPU
+// on TimelineView/repeatForever layers that never slept — same gate as Marketing).
 struct HoloEnvironment: ViewModifier {
     @ObservedObject var controller: HoloThemeController
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var appActive = true
     func body(content: Content) -> some View {
         content
             .environment(\.holoTheme, controller.theme)
-            .environment(\.blMotion, controller.motionEnabled && !reduceMotion)
+            .environment(\.blMotion, controller.motionEnabled && !reduceMotion && appActive)
+            .onReceive(NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)) { _ in appActive = false }
+            .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in appActive = true }
     }
 }
 extension View {
@@ -317,6 +322,16 @@ struct HoloCard: ViewModifier {
                 withAnimation(.linear(duration: 18 / max(0.3, sp)).repeatForever(autoreverses: false)) { phase = 1 }
                 if sweep { withAnimation(.easeInOut(duration: 7 / max(0.3, sp)).repeatForever(autoreverses: false).delay(1.2)) { sweepX = 2 } }
             }
+            // Backgrounded app: PLAIN assignment cancels the repeatForever loops (idle CPU → ~0);
+            // foregrounding restarts them exactly like onAppear.
+            .onChange(of: motion) { on in
+                phase = 0.5; sweepX = 2
+                guard on && theme.motion.speed > 0 else { return }
+                phase = 0; if sweep { sweepX = -1 }
+                let sp = theme.motion.speed
+                withAnimation(.linear(duration: 18 / max(0.3, sp)).repeatForever(autoreverses: false)) { phase = 1 }
+                if sweep { withAnimation(.easeInOut(duration: 7 / max(0.3, sp)).repeatForever(autoreverses: false).delay(1.2)) { sweepX = 2 } }
+            }
     }
     private func borderStyle(live: Bool) -> AnyShapeStyle {
         if fx <= 0 { return AnyShapeStyle(LinearGradient(colors: [theme.accent.opacity(0.28), BL.hair2.opacity(0.7)], startPoint: .top, endPoint: .bottom)) }
@@ -356,6 +371,12 @@ struct HoloSheen: ViewModifier {
                 .onAppear {
                     let live = motion && theme.motion.speed > 0
                     guard live else { x = 2; return }
+                    withAnimation(.easeInOut(duration: 4.5 / max(0.4, theme.motion.speed)).repeatForever(autoreverses: false).delay(0.5)) { x = 2 }
+                }
+                .onChange(of: motion) { on in
+                    x = 2                                       // plain assign cancels the loop
+                    guard on && theme.motion.speed > 0 else { return }
+                    x = -1.2
                     withAnimation(.easeInOut(duration: 4.5 / max(0.4, theme.motion.speed)).repeatForever(autoreverses: false).delay(0.5)) { x = 2 }
                 }
             }
@@ -402,6 +423,12 @@ struct FoilText: View {
             .onAppear {
                 let live = motion && theme.motion.speed > 0 && fx > 0
                 guard live else { phase = 0; return }
+                withAnimation(.easeInOut(duration: 16 / max(0.4, theme.motion.speed)).repeatForever(autoreverses: true)) { phase = 1 }
+            }
+            .onChange(of: motion) { on in
+                phase = 0                                       // plain assign cancels the loop
+                guard on && theme.motion.speed > 0 && fx > 0 else { return }
+                phase = -1
                 withAnimation(.easeInOut(duration: 16 / max(0.4, theme.motion.speed)).repeatForever(autoreverses: true)) { phase = 1 }
             }
             .accessibilityLabel(text)
@@ -502,6 +529,11 @@ struct IridescentBorder: ViewModifier {
             guard live else { return }
             withAnimation(.linear(duration: 6 / max(0.4, theme.motion.speed)).repeatForever(autoreverses: false)) { phase = 1 }
         }
+        .onChange(of: motion) { on in
+            phase = 0                                           // plain assign cancels the loop
+            guard on && theme.motion.speed > 0 && active && fx > 0 else { return }
+            withAnimation(.linear(duration: 6 / max(0.4, theme.motion.speed)).repeatForever(autoreverses: false)) { phase = 1 }
+        }
     }
 }
 extension View { func iridescentBorder(radius: CGFloat = 12, lineWidth: CGFloat = 1.4, active: Bool = true) -> some View { modifier(IridescentBorder(radius: radius, lineWidth: lineWidth, active: active)) } }
@@ -517,6 +549,11 @@ struct GlowPulse: ViewModifier {
             .onAppear {
                 let live = motion && theme.motion.speed > 0
                 guard live else { return }
+                withAnimation(.easeInOut(duration: 2.4 / max(0.4, theme.motion.speed)).repeatForever(autoreverses: true)) { on = true }
+            }
+            .onChange(of: motion) { m in
+                on = false                                      // plain assign cancels the loop
+                guard m && theme.motion.speed > 0 else { return }
                 withAnimation(.easeInOut(duration: 2.4 / max(0.4, theme.motion.speed)).repeatForever(autoreverses: true)) { on = true }
             }
     }
@@ -548,6 +585,12 @@ struct HoloShimmerSkeleton: View {
             .onAppear {
                 let live = motion && theme.motion.speed > 0
                 guard live else { x = 0.2; return }
+                withAnimation(.linear(duration: 1.4 / max(0.4, theme.motion.speed)).repeatForever(autoreverses: false)) { x = 2 }
+            }
+            .onChange(of: motion) { on in
+                x = 0.2                                         // plain assign cancels the loop
+                guard on && theme.motion.speed > 0 else { return }
+                x = -1
                 withAnimation(.linear(duration: 1.4 / max(0.4, theme.motion.speed)).repeatForever(autoreverses: false)) { x = 2 }
             }
     }
