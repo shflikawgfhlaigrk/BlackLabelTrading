@@ -25,8 +25,8 @@ enum RenderPalette {
     static let panel   = CGColor(red: 0.055, green: 0.055, blue: 0.071, alpha: 1)   // #0E0E12
     static let panelHi = CGColor(red: 0.071, green: 0.071, blue: 0.102, alpha: 1)   // #12121A
     static let stroke  = CGColor(red: 0.149, green: 0.149, blue: 0.169, alpha: 1)   // #26262B
-    static let gridMinor = CGColor(red: 1, green: 1, blue: 1, alpha: 0.045)
-    static let gridMajor = CGColor(red: 1, green: 1, blue: 1, alpha: 0.085)
+    static let gridMinor = CGColor(red: 1, green: 1, blue: 1, alpha: 0.06)
+    static let gridMajor = CGColor(red: 1, green: 1, blue: 1, alpha: 0.10)
     static let text    = CGColor(red: 0.93, green: 0.93, blue: 0.93, alpha: 1)      // #EDEDED
     static let sub     = CGColor(red: 0.549, green: 0.549, blue: 0.549, alpha: 1)   // #8C8C8C
     static let gold     = CGColor(red: 0.851, green: 0.714, blue: 0.361, alpha: 1)  // #D9B65C
@@ -218,23 +218,62 @@ enum ChartRender {
 
         // ---- Price pane: panel, gridlines, right-aligned price ladder ----
         drawPanel(ctx, priceRect)
+        // Subtle vertical depth so the plot doesn't read as a flat black slab: a whisper of
+        // light at the top of the pane fading to nothing (TradingView-style paper depth).
+        ctx.saveGState()
+        ctx.clip(to: priceRect)
+        if let grad = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(),
+                                 colors: [RenderPalette.alpha(CGColor(red: 1, green: 1, blue: 1, alpha: 1), 0.022),
+                                          RenderPalette.alpha(CGColor(red: 1, green: 1, blue: 1, alpha: 1), 0.0)] as CFArray,
+                                 locations: [0, 1]) {
+            ctx.drawLinearGradient(grad, start: CGPoint(x: priceRect.midX, y: priceRect.maxY),
+                                   end: CGPoint(x: priceRect.midX, y: priceRect.minY), options: [])
+        }
+        ctx.restoreGState()
         ctx.setFillColor(RenderPalette.panel)
         ctx.fill(CGRect(x: priceRect.maxX, y: priceRect.minY, width: marginR, height: priceRect.height))
         strokeLine(ctx, CGPoint(x: priceRect.maxX, y: priceRect.minY),
                    CGPoint(x: priceRect.maxX, y: priceRect.maxY), color: RenderPalette.stroke, width: 1)
-        let ticks = ChartScale.ticks(lo: dom.lo, hi: dom.hi, target: 6)
+        let ticks = ChartScale.ticks(lo: dom.lo, hi: dom.hi, target: 9)
         let step = ticks.count > 1 ? (ticks[1] - ticks[0]) : (dom.hi - dom.lo)
         let decimals = ChartScale.priceDecimals(step: step)
+        // Tag precision: the grid step can be coarser than the instrument's real tick (ES
+        // gridlines land on whole points while price trades in 0.25s) — infer the traded
+        // precision from the visible bars so price tags never truncate a tick.
+        let tagDecimals: Int = {
+            let sample = visible.suffix(80)
+            for d in 0...4 {
+                let m = pow(10.0, Double(d))
+                let clean = sample.allSatisfy {
+                    abs($0.close * m - ($0.close * m).rounded()) < 1e-6
+                        && abs($0.high * m - ($0.high * m).rounded()) < 1e-6
+                        && abs($0.low * m - ($0.low * m).rounded()) < 1e-6
+                }
+                if clean { return max(d, decimals) }
+            }
+            return 4
+        }()
         let lastClose = visible.last?.close
         for t in ticks {
             let y = yPrice(t, priceRect)
             guard y >= priceRect.minY - 0.5 && y <= priceRect.maxY + 0.5 else { continue }
             strokeLine(ctx, CGPoint(x: priceRect.minX, y: y), CGPoint(x: priceRect.maxX, y: y),
                        color: RenderPalette.gridMinor, width: 0.5)
+            // Small tick nib on the axis edge anchors each label to its gridline.
+            strokeLine(ctx, CGPoint(x: priceRect.maxX, y: y), CGPoint(x: priceRect.maxX + 4, y: y),
+                       color: RenderPalette.stroke, width: 1)
             if let lc = lastClose, abs(yPrice(lc, priceRect) - y) < 9 { continue }
             let s = fmt(t, decimals)
             let tw = textWidth(s, size: 10, bold: false)
             drawText(ctx, s, at: CGPoint(x: W - 10 - tw, y: y - 4), size: 10, color: RenderPalette.sub)
+        }
+        // Faint centered symbol watermark under the candles — pro-terminal cue, never loud.
+        if !symbol.isEmpty {
+            let wmSize = min(priceRect.height * 0.17, 72)
+            let wmW = textWidth(symbol, size: wmSize, bold: true)
+            drawText(ctx, symbol,
+                     at: CGPoint(x: priceRect.midX - wmW / 2, y: priceRect.midY - wmSize / 2),
+                     size: wmSize, color: RenderPalette.alpha(RenderPalette.text, 0.035), bold: true)
         }
         // Time-aware x-axis over the VISIBLE candles (round-clock labels + session separators).
         let lowerRects = [L.rsi, L.macd, L.atr, L.vol].filter { $0 != .zero }
@@ -269,17 +308,18 @@ enum ChartRender {
                 let x = xCenter(c.index).rounded() + 0.5
                 let col = c.up ? RenderPalette.green : RenderPalette.red
                 let isCurrent = c.index == lastIdx
+                // Wick at full candle hue (a darkened wick disappears into the dark panel).
                 strokeLine(ctx, CGPoint(x: x, y: yPrice(c.high, priceRect)), CGPoint(x: x, y: yPrice(c.low, priceRect)),
-                           color: RenderPalette.shade(col, 0.8), width: wickW)
+                           color: RenderPalette.alpha(col, 0.95), width: wickW)
                 let yo = yPrice(c.open, priceRect), yc = yPrice(c.close, priceRect)
                 let top = min(yo, yc), bot = max(yo, yc)
                 let bodyH = max(1.5, bot - top)
                 let bodyRect = CGRect(x: (x - bodyW/2).rounded(), y: top, width: bodyW, height: bodyH)
                 let path = CGPath(roundedRect: bodyRect, cornerWidth: radius, cornerHeight: radius, transform: nil)
-                ctx.setFillColor(RenderPalette.alpha(col, isCurrent ? 1.0 : 0.92))
+                ctx.setFillColor(RenderPalette.alpha(col, 1.0))
                 ctx.addPath(path); ctx.fillPath()
                 ctx.addPath(path)
-                ctx.setStrokeColor(RenderPalette.alpha(RenderPalette.shade(col, 1.15), 0.9)); ctx.setLineWidth(0.75); ctx.strokePath()
+                ctx.setStrokeColor(RenderPalette.shade(col, 1.28)); ctx.setLineWidth(1.0); ctx.strokePath()
                 if isCurrent {
                     ctx.addPath(CGPath(roundedRect: bodyRect.insetBy(dx: -1.5, dy: -1.5), cornerWidth: radius, cornerHeight: radius, transform: nil))
                     ctx.setStrokeColor(RenderPalette.alpha(RenderPalette.goldHi, 0.6)); ctx.setLineWidth(1); ctx.strokePath()
@@ -307,7 +347,7 @@ enum ChartRender {
             let tagCol = lp >= prevClose ? RenderPalette.green : RenderPalette.red
             strokeLine(ctx, CGPoint(x: priceRect.minX, y: y), CGPoint(x: priceRect.maxX, y: y),
                        color: RenderPalette.alpha(tagCol, 0.85), width: 1, dash: [3,3])
-            let lbl = fmt(lp, decimals)
+            let lbl = fmt(lp, tagDecimals)
             let tagW = textWidth(lbl, size: 10.5, bold: true) + 12, tagH: CGFloat = 17
             let ty = min(max(y - tagH/2, priceRect.minY + 1), priceRect.maxY - tagH - 1)
             let tagRect = CGRect(x: priceRect.maxX + 3, y: ty, width: tagW, height: tagH)
@@ -336,14 +376,14 @@ enum ChartRender {
                 strokeLine(ctx, CGPoint(x: priceRect.minX, y: cy), CGPoint(x: priceRect.maxX, y: cy),
                            color: RenderPalette.alpha(RenderPalette.gold, 0.30), width: 1, dash: [2,2])
                 // crosshair price tag in the gutter
-                let lbl = fmt(c.close, decimals)
+                let lbl = fmt(c.close, tagDecimals)
                 let tagW = textWidth(lbl, size: 9.5, bold: true) + 10, tagH: CGFloat = 15
                 let tagRect = CGRect(x: priceRect.maxX + 3, y: cy - tagH/2, width: tagW, height: tagH)
                 ctx.setFillColor(RenderPalette.gold)
                 ctx.addPath(CGPath(roundedRect: tagRect, cornerWidth: 3, cornerHeight: 3, transform: nil)); ctx.fillPath()
                 drawText(ctx, lbl, at: CGPoint(x: tagRect.minX + 5, y: tagRect.midY - 4), size: 9.5,
                          color: CGColor(red: 0.05, green: 0.05, blue: 0.05, alpha: 1), bold: true)
-                drawOHLCReadout(ctx, c: c, decimals: decimals, at: CGPoint(x: priceRect.minX + 8, y: priceRect.maxY - 22))
+                drawOHLCReadout(ctx, c: c, decimals: tagDecimals, at: CGPoint(x: priceRect.minX + 8, y: priceRect.maxY - 22))
             }
         }
 
