@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <!-- RELEASE entitlements for a PROVISIONED build (Apple Development / Distribution +
+       embedded provisioning profile). Unlike the ad-hoc app.entitlements, this carries the
+       RESTRICTED "Sign in with Apple" entitlement, which is only honored when the build is
+       signed against a provisioning profile that grants it (the Mac Team Provisioning Profile
+       for com.blacklabel.trading does). Building this WITHOUT the profile + a real identity
+       would make AMFI SIGKILL the app — build-signed.command enforces that. -->
+  <key>com.apple.security.app-sandbox</key><true/>
+  <key>com.apple.security.network.client</key><true/>
+  <key>com.apple.developer.applesignin</key>
+  <array><string>Default</string></array>
+  <key>keychain-access-groups</key>
+  <array><string>745ZPGFRA5.com.blacklabel.trading</string></array>
+</dict></plist>

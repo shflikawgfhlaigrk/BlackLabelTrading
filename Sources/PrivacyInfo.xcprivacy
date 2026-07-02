@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Black Label Trading — Privacy Manifest.
+
+  Honest + minimal, matching what the app ACTUALLY does:
+    * No tracking. The app does no cross-app/website tracking and contacts no
+      ad/tracking networks (NSPrivacyTracking = false, no tracking domains).
+    * No data collection. Nothing is collected, sold, or sent to Black Label.
+      All bars/ticks/signals live ONLY in the buyer's own local SQLite store
+      (~/Library/Application Support/Black Label Trading). The app talks only
+      to 127.0.0.1:8787 (its own bundled backend) and the buyer's own
+      TopstepX or WealthCharts browser session.
+    * One required-reason API: UserDefaults, used only to persist this user's
+      own settings/session locally (reason CA92.1).
+
+  Keep this file in sync with the source — every entry below is verifiable in
+  Sources/*.swift. Do not declare a data type the app does not collect.
+-->
+<plist version="1.0">
+<dict>
+  <key>NSPrivacyTracking</key>
+  <false/>
+  <key>NSPrivacyTrackingDomains</key>
+  <array/>
+  <key>NSPrivacyCollectedDataTypes</key>
+  <array/>
+  <key>NSPrivacyAccessedAPITypes</key>
+  <array>
+    <dict>
+      <key>NSPrivacyAccessedAPIType</key>
+      <string>NSPrivacyAccessedAPICategoryUserDefaults</string>
+      <key>NSPrivacyAccessedAPITypeReasons</key>
+      <array>
+        <string>CA92.1</string>
+      </array>
+    </dict>
+  </array>
+</dict>
+</plist>
