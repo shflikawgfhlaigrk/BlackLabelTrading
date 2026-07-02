@@ -40,13 +40,14 @@ def _num(v):
     return f
 
 
-def _candle(symbol, close, *, open=None, high=None, low=None, epoch=None):
+def _candle(symbol, close, *, open=None, high=None, low=None, epoch=None, volume=None, delta=None):
     c = _num(close)
     if not symbol or c is None:
         return None
     return {"symbol": str(symbol), "open": _num(open), "high": _num(high),
             "low": _num(low), "close": c,
-            "epoch": (int(epoch) if isinstance(epoch, (int, float)) and epoch == epoch else None)}
+            "epoch": (int(epoch) if isinstance(epoch, (int, float)) and epoch == epoch else None),
+            "volume": _num(volume) or 0.0, "delta": _num(delta) or 0.0}
 
 
 # ===========================================================================
@@ -129,7 +130,8 @@ class TradovateParser:
                 if sym and isinstance(bars, list) and bars and isinstance(bars[-1], dict):
                     b = bars[-1]
                     cd = _candle(sym, b.get("close"), open=b.get("open"), high=b.get("high"),
-                                 low=b.get("low"), epoch=b.get("timestamp"))
+                                 low=b.get("low"), epoch=b.get("timestamp"),
+                                 volume=b.get("volume"), delta=b.get("delta"))
                     if cd:
                         return cd
                 # tick shape
@@ -212,7 +214,9 @@ class GenericOHLCParser:
         ts = next((d[k] for k in _TS_KEYS if isinstance(d.get(k), (int, float))), None)
         # Timestamps are often ms or non-unix; only keep a plausible unix-seconds value, else None.
         epoch = int(ts) if isinstance(ts, (int, float)) and 1_000_000_000 <= ts <= 4_000_000_000 else None
-        return _candle(sym, close, open=o, high=h, low=lo, epoch=epoch)
+        vol = next((_num(d[k]) for k in ("volume", "vol", "v") if _num(d.get(k)) is not None), None)
+        dlt = next((_num(d[k]) for k in ("delta", "cvd", "orderFlowDelta") if _num(d.get(k)) is not None), None)
+        return _candle(sym, close, open=o, high=h, low=lo, epoch=epoch, volume=vol, delta=dlt)
 
 
 # ===========================================================================

@@ -436,6 +436,8 @@ class StoreExecState:
         import subprocess
         f = self.store.exec_flags()
         broker = (f.get("broker") or "projectx").strip().lower()
+        if broker != "projectx":
+            return None
         svc = f"com.blacklabel.trading.exec.{broker}"
         try:
             r = subprocess.run(["security", "find-generic-password", "-s", svc, "-w"],

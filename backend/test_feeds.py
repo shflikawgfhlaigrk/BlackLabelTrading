@@ -438,16 +438,16 @@ def test_feed_manager_catalogue_and_routing():
     mgr = F.FeedManager(_temp_store())
     srcs = mgr.sources()["sources"]
     keys = {s["key"] for s in srcs}
-    # This release exposes TopstepX browser capture alongside webhook ingestion. WealthCharts and
-    # other platforms must not appear, because Connect is sold/setup for Topstep.
-    assert {"topstepx", "webhook"} <= keys
-    assert "wealthcharts" not in keys
+    # This release exposes TopstepX and WealthCharts browser capture alongside webhook ingestion.
+    assert {"topstepx", "wealthcharts", "webhook"} <= keys
     webhook = next(s for s in srcs if s["key"] == "webhook")
     assert webhook["kind"] == "webhook"
     assert webhook["credFields"] == []
     assert "No prop-firm credentials" in webhook["note"]
     topstepx = next(s for s in srcs if s["key"] == "topstepx")
     assert topstepx["kind"] == "browser" and topstepx["credFields"] == []
+    wealthcharts = next(s for s in srcs if s["key"] == "wealthcharts")
+    assert wealthcharts["kind"] == "browser" and wealthcharts["credFields"] == []
     assert mgr.sources()["active"] is None
     assert mgr.connect("bogus", {})["state"] == "error"
     projectx = mgr.connect("projectx", {"apiKey": "must-not-be-used"})
@@ -457,7 +457,7 @@ def test_feed_manager_catalogue_and_routing():
     # Browser sources route to the capture-browser state (pure — no Chrome is spawned from here).
     assert mgr.connect("browser", {})["state"] == "browser"
     assert mgr.connect("topstepx", {})["state"] == "browser"
-    assert mgr.connect("wealthcharts", {})["state"] == "error"
+    assert mgr.connect("wealthcharts", {})["state"] == "browser"
 
 
 def test_feed_manager_ingest_wires_to_store():

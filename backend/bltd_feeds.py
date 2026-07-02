@@ -133,7 +133,8 @@ def map_market_symbol(native) -> str | None:
     return None
 
 
-def make_candle(symbol, close, *, open=None, high=None, low=None, epoch=None) -> dict | None:
+def make_candle(symbol, close, *, open=None, high=None, low=None, epoch=None,
+                volume=None, delta=None) -> dict | None:
     """One NORMALIZED candle dict for Capture.on_candle, or None. close is mandatory and must be a
     finite, plausible price — a frame without one is NOT a candle (never fabricate)."""
     try:
@@ -160,7 +161,8 @@ def make_candle(symbol, close, *, open=None, high=None, low=None, epoch=None) ->
         if 1_000_000_000 <= e <= 4_000_000_000:
             ep = int(e)
     return {"symbol": str(symbol), "open": _f(open), "high": _f(high),
-            "low": _f(low), "close": c, "epoch": ep}
+            "low": _f(low), "close": c, "epoch": ep,
+            "volume": max(0.0, _f(volume) or 0.0), "delta": _f(delta) or 0.0}
 
 
 def ws_encode_binary(data: bytes) -> bytes:
@@ -501,11 +503,14 @@ _WEBHOOK_DESCRIPTOR = {
             "receiver. The app writes only pushed real data into your local store.",
 }
 
-# Browser-capture platform for this release. The buyer signs into TopstepX in the product-owned
-# debug Chrome; the capture daemon reads the same market-data frames feeding the chart.
+# Browser-capture platforms for this release. The buyer signs into the selected platform in the
+# product-owned debug Chrome; the bridge/capture path reads the same market-data frames feeding the
+# chart and writes them into the local store.
 _BROWSER_PLATFORMS = [
     {"key": "topstepx", "label": "TopStepX", "support": "generic",
      "note": "Opens TopStepX. Sign in and the app reads its live market-data frames."},
+    {"key": "wealthcharts", "label": "WealthCharts", "support": "generic",
+     "note": "Opens WealthCharts. Sign in, open a chart, and the app reads its live chart feed."},
 ]
 _BROWSER_KEYS = {p["key"] for p in _BROWSER_PLATFORMS}
 
@@ -575,6 +580,18 @@ class FeedManager:
         with self._lock:
             src = self.active
         if not src:
+            try:
+                import bltd_capture as C
+                pages = C.discover_feed_pages()
+                if pages:
+                    key = pages[0][0]
+                    label = next((p["label"] for p in _BROWSER_PLATFORMS if p["key"] == key), key)
+                    return {"source": key, "label": label, "kind": "browser",
+                            "state": "browser",
+                            "detail": f"{label} is open in the capture browser. Keep a live chart open; bars flow into this Mac when market-data frames arrive.",
+                            "symbol": None, "lastTickAge": None}
+            except Exception:  # noqa: BLE001
+                pass
             syms = self.store.symbols()
             if syms.get("liveTicks"):
                 return {"source": "webhook", "label": _WEBHOOK_DESCRIPTOR["label"],

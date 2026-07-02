@@ -1,7 +1,7 @@
 // Black Label Trading — no-creds webhook feed connection ("Connect a feed" UI).
 //
 // WHY: a buyer on a prop account should not need a broker API key or stored platform credentials.
-// The bundled Topstep bridge posts observed ticks or OHLC bars into the local webhook receiver.
+// The bundled browser bridge posts observed ticks or OHLC bars into the local webhook receiver.
 // The local backend stores only pushed real bars/ticks. Signals-only: a feed is read-only market
 // data; nothing here can place an order or move money. Every status shown is the backend's REAL,
 // observed state — never a fake "connected".
@@ -226,7 +226,7 @@ struct ConnectFeedScreen: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
                 ScreenTitle(title: "Connect a feed",
-                            subtitle: "Use the bundled Topstep bridge and local webhook URL to capture your own TopstepX chart data. No API key is requested; sign into your own TopstepX session in the app-owned browser and the bridge posts observed bars into this Mac.",
+                            subtitle: "Use the bundled browser bridge and local webhook URL to capture your own TopstepX or WealthCharts chart data. No API key is requested; sign into your own session in the app-owned browser and the bridge posts observed bars into this Mac.",
                             icon: "antenna.radiowaves.left.and.right")
 
                 if let pre = feed.prereq {
@@ -295,7 +295,7 @@ struct ConnectFeedScreen: View {
                     .font(.system(size: 11.5, design: .rounded)).foregroundColor(BLTheme.sub)
                     .fixedSize(horizontal: false, vertical: true)
             } else if src.isWebhook {
-                Text("The bundled Topstep bridge opens TopstepX in a product-owned browser profile and posts observed market data to the local webhook/store. The webhook URL and curl below are copyable for inspection or a custom sender; your platform password is never stored.")
+                Text("The bundled browser bridge opens your selected platform in a product-owned browser profile and posts observed market data to the local webhook/store. The webhook URL and curl below are copyable for inspection or a custom sender; your platform password is never stored.")
                     .font(.system(size: 11.5, design: .rounded)).foregroundColor(BLTheme.sub)
                     .fixedSize(horizontal: false, vertical: true)
                 webhookLine("Webhook URL", webhook.url)
@@ -305,7 +305,7 @@ struct ConnectFeedScreen: View {
                         Task {
                             busy = true
                             _ = await feed.ensureBackendRunning()
-                            await feed.launchCapture()
+                            await feed.launchCapture(source: selected)
                             if let st = await feed.feedStatus() { status = st }
                             await feed.refreshStatus()
                             busy = false
@@ -403,9 +403,10 @@ struct ConnectFeedScreen: View {
     private func connect(_ src: FeedSourceInfo) async {
         busy = true; defer { busy = false }
         if src.isBrowser {
-            // Browser platforms: open the capture browser (login tabs) and surface the no-Chrome
+            // Browser platforms: open the selected capture browser login tab and surface the no-Chrome
             // prerequisite if needed. The buyer signs into THEIR platform there; bars then flow.
-            await feed.launchCapture()
+            if let st = await feed.connectFeed(source: src.key, creds: [:]) { status = st }
+            await feed.launchCapture(source: src.key)
             if let st = await feed.feedStatus() { status = st }
             await feed.refreshStatus()
             return

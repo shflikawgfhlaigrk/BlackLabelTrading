@@ -386,9 +386,9 @@ def test_stream_tab_routes_registry_candle_into_capture():
     assert cap.latest.get("CM.ESU6", (None,))[0] == 7546.50, cap.latest   # landed in ES-filtered buffer
 
 
-def test_stream_tab_drops_non_es_candle_after_parse():
-    # Parser lock: a non-ES platform candle parsed by the GENERIC sniffer is still recognized as a
-    # real candle, but the shipped Topstep scope drops it before it can populate the store/chart.
+def test_stream_tab_keeps_non_es_candle_after_parse():
+    # Parser lock: a non-ES platform candle parsed by the GENERIC sniffer is recognized as real
+    # market data and kept by the WealthCharts-wide default scope.
     import bltd_capture as C
     state = {"t": 0.0, "done": False}
 
@@ -416,7 +416,7 @@ def test_stream_tab_drops_non_es_candle_after_parse():
     page = {"url": "https://trader.tradovate.com/", "webSocketDebuggerUrl": "ws://x"}
     res = C.stream_tab("tradovate", page, cap, idle_stall=10, _ws=_WS(), _clock=clock)
     assert res["candles"] == 1, res            # parser registry parsed the non-WC frame
-    assert "BTCUSD" not in cap.latest, cap.latest  # but scope gate keeps it out of the app
+    assert cap.latest.get("BTCUSD") == (100.5, cap.latest["BTCUSD"][1]), cap.latest
 
 
 def test_recv_text_bounded_on_half_dead_socket():
@@ -478,15 +478,15 @@ def _temp_store():
     return S.Store(path, config_path=cfg), path, cfg
 
 
-def test_store_accepts_and_serves_only_es_by_default():
-    # Shipped Topstep scope: ES-family rows are stored/served. Stale non-ES rows are rejected so
-    # old WealthCharts/equity data cannot populate the app.
+def test_store_accepts_and_serves_wealthcharts_symbols_by_default():
+    # WealthCharts default scope: real non-ES rows are stored/served too. Junk symbols are still
+    # rejected so empty/garbage rows cannot populate the app.
     store, path, cfg = _temp_store()
     try:
         es = [(1_700_000_000 + i, 100.0 + i, 101.0 + i, 99.0 + i, 100.5 + i) for i in range(45)]
         nq = [(1_700_000_000 + i, 200.0 + i, 201.0 + i, 199.0 + i, 200.5 + i) for i in range(50)]
         assert store.record_bars("CM.ESU6", es) == 45
-        assert store.record_bars("CM.NQU6", nq) == 0      # non-ES filtered
+        assert store.record_bars("CM.NQU6", nq) == 50
         assert store.record_bars("", es) == 0             # junk symbol still rejected
         store.record_tick("CM.ESU6", 5100.0, int(time.time()))
         store.record_tick("CM.NQU6", 17000.0, int(time.time()))
@@ -494,13 +494,13 @@ def test_store_accepts_and_serves_only_es_by_default():
         store.record_fire("momentum", "long", 17000.0, symbol="CM.NQU6", synthetic=False)
 
         syms = store.symbols()
-        assert set(syms["backtestable"]) == {"CM.ESU6"}, syms
-        assert set(syms["liveTicks"]) == {"CM.ESU6"}, syms
-        assert syms["busiest"] == "CM.ESU6", syms
-        assert store.bars("CM.NQU6", 100, newest=False)["bars"] == []
-        assert store.live_price("CM.NQU6") == {"gated": True}
-        assert store.ohlc("CM.NQU6") == []
-        assert {f["symbol"] for f in store.fires()["fires"]} == {"CM.ESU6"}
+        assert set(syms["backtestable"]) == {"CM.ESU6", "CM.NQU6"}, syms
+        assert set(syms["liveTicks"]) == {"CM.ESU6", "CM.NQU6"}, syms
+        assert syms["busiest"] in {"CM.ESU6", "CM.NQU6"}, syms
+        assert len(store.bars("CM.NQU6", 100, newest=False)["bars"]) == 50
+        assert store.live_price("CM.NQU6")["price"] == 17000.0
+        assert len(store.ohlc("CM.NQU6")) == 50
+        assert {f["symbol"] for f in store.fires()["fires"]} == {"CM.ESU6", "CM.NQU6"}
     finally:
         for p in (path, cfg):
             try:
@@ -509,31 +509,31 @@ def test_store_accepts_and_serves_only_es_by_default():
                 pass
 
 
-def test_store_batch_writes_filter_non_es_and_report_failure():
+def test_store_batch_writes_wealthcharts_symbols_and_reports_failure():
     store, path, cfg = _temp_store()
     try:
         rows = [(1_700_000_000 + i, 100.0 + i, 101.0 + i, 99.0 + i, 100.5 + i) for i in range(3)]
-        # ES persists; NQ is filtered. The schema is unchanged.
-        assert store.record_bars_batch({"CM.ESU6": rows, "CM.NQU6": rows}) == 3
+        # ES and NQ persist; the schema carries volume/delta with legacy zero defaults.
+        assert store.record_bars_batch({"CM.ESU6": rows, "CM.NQU6": rows}) == 6
         assert store.bars("CM.ESU6", 10, newest=False)["bars"] == [
-            [100.0, 101.0, 99.0, 100.5, 1700000000.0],
-            [101.0, 102.0, 100.0, 101.5, 1700000001.0],
-            [102.0, 103.0, 101.0, 102.5, 1700000002.0],
+            [100.0, 101.0, 99.0, 100.5, 1700000000.0, 0.0, 0.0],
+            [101.0, 102.0, 100.0, 101.5, 1700000001.0, 0.0, 0.0],
+            [102.0, 103.0, 101.0, 102.5, 1700000002.0, 0.0, 0.0],
         ]
-        assert store.bars("CM.NQU6", 10, newest=False)["bars"] == []
+        assert len(store.bars("CM.NQU6", 10, newest=False)["bars"]) == 3
 
         now = int(time.time())
         assert store.record_ticks_batch([
             {"symbol": "CM.NQU6", "price": 17000.0, "epoch": now},
             {"symbol": "CM.ESU6", "price": 5100.25, "epoch": now},
             ("ESZ26", 5101.25, now),
-        ]) == 2                                                            # NQ filtered
-        assert store.live_price("CM.NQU6") == {"gated": True}
+        ]) == 3
+        assert store.live_price("CM.NQU6")["price"] == 17000.0
         assert store.live_price("CM.ESU6")["price"] == 5100.25
         assert store.live_price("ESZ26")["price"] == 5101.25
         # Recency gate: a STALE tick is NOT served as live (stale-as-live honesty).
         store.record_tick("CM.NQU6", 16999.0, 1_700_000_100)             # Nov-2023 epoch
-        assert store.live_price("CM.NQU6") == {"gated": True}
+        assert store.live_price("CM.NQU6") == {"symbol": "CM.NQU6", "gated": True}
 
         store._exec = lambda *a, **k: 0
         assert store.record_bars_batch({"CM.ESU6": rows}) == -1           # write failure still reported
@@ -546,16 +546,16 @@ def test_store_batch_writes_filter_non_es_and_report_failure():
                 pass
 
 
-def test_screen_includes_only_shipped_scope_symbols():
+def test_screen_includes_default_scope_symbols():
     import bltd_analytics as A
 
     class _Store:
         def config(self): return S.CONFIG_DEFAULTS
         def ohlc(self, symbol): return []
 
-    # The screener covers only shipped-scope symbols by default (ES family incl. MES micros).
+    # The screener covers every default in-scope WealthCharts symbol.
     rows = A.screen(_Store(), ["CM.NQU6", "CM.ESU6", "MESU6", "ES"], ["momentum"], S.CONFIG_DEFAULTS)
-    assert [r["symbol"] for r in rows] == ["CM.ESU6", "MESU6", "ES"]
+    assert [r["symbol"] for r in rows] == ["CM.NQU6", "CM.ESU6", "MESU6", "ES"]
 
 
 # ---- pluggable capture parser registry -------------------------------------
@@ -698,9 +698,9 @@ def test_on_candle_buffers_tick_at_arrival_then_flush_persists():
                 pass
 
 
-def test_capture_keeps_only_shipped_scope_candles():
-    # on_candle buffers shipped-scope instruments only, then the flusher persists them. Non-ES and
-    # junk/empty symbols are dropped before they can populate the store.
+def test_capture_keeps_wealthcharts_scope_candles():
+    # on_candle buffers all sane WealthCharts-scope instruments, then the flusher persists them.
+    # Junk/empty symbols are still dropped before they can populate the store.
     import bltd_capture as C
     store, path, cfg = _temp_store()
     try:
@@ -709,9 +709,9 @@ def test_capture_keeps_only_shipped_scope_candles():
         cap.on_candle({"symbol": "CM.NQU6", "close": 17000.0, "epoch": None}, arrival=base)
         cap.on_candle({"symbol": "CM.ESU6", "close": 7546.5, "epoch": None}, arrival=base + 1)
         cap.on_candle({"symbol": "", "close": 1.0, "epoch": None}, arrival=base + 2)
-        assert set(cap.latest.keys()) == {"CM.ESU6"}
+        assert set(cap.latest.keys()) == {"CM.ESU6", "CM.NQU6"}
         cap.flush()
-        assert store.live_price("CM.NQU6") == {"gated": True}
+        assert store.live_price("CM.NQU6")["price"] == 17000.0
         assert store.live_price("CM.ESU6")["price"] == 7546.5
     finally:
         for p in (path, cfg):
@@ -721,10 +721,10 @@ def test_capture_keeps_only_shipped_scope_candles():
                 pass
 
 
-def test_roll_queues_five_field_bars_off_read_loop_then_flush_persists():
+def test_roll_queues_volume_delta_bars_off_read_loop_then_flush_persists():
     # Crossing a bar boundary must QUEUE the closed bar in memory (read loop = no SQLite I/O), and
-    # only the flusher persists it through record_bars_batch. Bars keep the five-field (ts,o,h,l,c)
-    # schema — no volume/quote-delta widening — so the queued rows match the store's batch API.
+    # only the flusher persists it through record_bars_batch. Bars carry volume/delta when supplied
+    # and preserve zero defaults for close-only streams.
     import bltd_capture as C
     store, path, cfg = _temp_store()
     try:
@@ -733,12 +733,37 @@ def test_roll_queues_five_field_bars_off_read_loop_then_flush_persists():
                                (102.0, 1_700_000_015.0)]:
             cap.on_candle({"symbol": "CM.ESU6", "close": close, "epoch": None}, arrival=arrival)
         queued = cap.pending_bars["CM.ESU6"]
-        assert len(queued) == 1 and len(queued[0]) == 5, queued       # five-field bar, queued
+        assert len(queued) == 1 and len(queued[0]) == 7, queued       # volume/delta-capable bar
         assert store.bars("CM.ESU6", 10, newest=False)["bars"] == []  # nothing persisted yet
         cap.flush()
         assert store.bars("CM.ESU6", 10, newest=False)["bars"] == [
-            [100.0, 101.0, 100.0, 101.0, 1700000010.0]]
+            [100.0, 101.0, 100.0, 101.0, 1700000010.0, 0.0, 0.0]]
         assert cap.pending_bars == {}                                 # drained by the flusher
+    finally:
+        for p in (path, cfg):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
+def test_capture_derives_tick_rule_delta_from_real_volume():
+    # WealthCharts live tick candles can have open=high=low=close on each print, so candle-direction
+    # delta is zero even though cq volume is real. Capture signs that real volume by tick-to-tick
+    # price movement, giving CVD/VPIN a real source without inventing volume.
+    import bltd_capture as C
+    store, path, cfg = _temp_store()
+    try:
+        cap = C.Capture(store, bar_seconds=15, lookback=20, edge_gate=False)
+        cap.on_candle({"symbol": "CM.ESU6", "close": 100.0, "volume": 2.0, "delta": 0.0, "epoch": None},
+                      arrival=1_700_000_000.0)
+        cap.on_candle({"symbol": "CM.ESU6", "close": 101.0, "volume": 3.0, "delta": 0.0, "epoch": None},
+                      arrival=1_700_000_001.0)
+        cap.on_candle({"symbol": "CM.ESU6", "close": 102.0, "volume": 4.0, "delta": 0.0, "epoch": None},
+                      arrival=1_700_000_015.0)
+        cap.flush()
+        assert store.bars("CM.ESU6", 10, newest=False)["bars"] == [
+            [100.0, 101.0, 100.0, 101.0, 1700000010.0, 3.0, 3.0]]
     finally:
         for p in (path, cfg):
             try:

@@ -138,12 +138,11 @@ def es_symbols(symbols) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# INSTRUMENT SCOPE. The shipped Topstep setup is ES-family only by default. That keeps stale
-# WealthCharts/equity rows from older local stores out of the symbol picker and chart, and it matches
-# the customer-facing setup docs. Developers can still set BLTD_SCOPE=all to exercise the wider
-# parser/feed stack in tests; the release default remains narrow and predictable.
+# INSTRUMENT SCOPE. WealthCharts can stream multiple real instruments, so the product default is to
+# accept any sane symbol the buyer's own browser feed emits. Developers can still set BLTD_SCOPE=es
+# to exercise the legacy Topstep-only release scope in tests.
 # ---------------------------------------------------------------------------
-INSTRUMENT_SCOPE = (os.environ.get("BLTD_SCOPE", "es") or "es").strip().lower()
+INSTRUMENT_SCOPE = (os.environ.get("BLTD_SCOPE", "all") or "all").strip().lower()
 
 
 def futures_root_any(symbol) -> str:
@@ -162,11 +161,11 @@ def futures_root_any(symbol) -> str:
 def in_scope(symbol) -> bool:
     """True if this symbol is an instrument the product accepts (stores/charts).
 
-    Release default is ES-family only. The opt-in developer scope 'all' accepts any sane, non-empty
-    normalized symbol for parser/feed tests."""
+    Default scope accepts any sane, non-empty normalized symbol. The opt-in developer scope 'es'
+    keeps only ES-family instruments for legacy Topstep-only tests."""
     if is_es_symbol(symbol):
         return True
-    if INSTRUMENT_SCOPE != "all":
+    if INSTRUMENT_SCOPE == "es":
         return False
     return bool(normalize_symbol(symbol))
 
@@ -249,6 +248,26 @@ def _f(v):
         return None
 
 
+def _signed_volume_delta(candle: dict, close: float) -> float:
+    """Best-effort delta from real WC candle fields.
+
+    If WC supplies an explicit delta-like field we use it. Otherwise, when WC supplies real volume,
+    derive a Lee-Ready-style signed volume from the candle direction. That makes CVD/VPIN reflect
+    real traded volume and price direction while staying deterministic and source-bound.
+    """
+    for k in ("delta", "cd", "cDelta", "cvd", "aggressorDelta"):
+        v = _f(candle.get(k))
+        if v is not None:
+            return v
+    vol = _f(candle.get("cq") or candle.get("volume") or candle.get("v") or candle.get("cv"))
+    if vol is None or vol <= 0:
+        return 0.0
+    op = _f(candle.get("co"))
+    if op is None or close == op:
+        return 0.0
+    return vol if close > op else -vol
+
+
 def parse_candle(payload: str):
     """One WC WebSocket frame string -> {symbol, close, open, high, low, epoch} or None.
     PURE. Returns None for keepalives / non-candle / malformed / value-less frames so junk
@@ -282,8 +301,10 @@ def parse_candle(payload: str):
         return None                          # no price -> junk, never fabricate one
     raw_epoch = candle.get("cepoch")
     epoch = int(raw_epoch) if raw_epoch is not None else None
+    volume = _f(candle.get("cq") or candle.get("volume") or candle.get("v") or candle.get("cv")) or 0.0
     return {"symbol": symbol, "close": close, "open": _f(candle.get("co")),
-            "high": _f(candle.get("cM")), "low": _f(candle.get("cm")), "epoch": epoch}
+            "high": _f(candle.get("cM")), "low": _f(candle.get("cm")), "epoch": epoch,
+            "volume": max(0.0, volume), "delta": _signed_volume_delta(candle, close)}
 
 
 def normalize_epoch(epoch: int, arrival: float, step: int = 900) -> int:
@@ -310,6 +331,42 @@ def ohlc_bars(ticks, bar_seconds: int = 15):
         agg[k].append(cl)
     closed = order[:-1] if len(order) >= 2 else []
     return [(k, agg[k][0], max(agg[k]), min(agg[k]), agg[k][-1]) for k in closed]
+
+
+def ohlcv_bars(ticks, bar_seconds: int = 15):
+    """[(epoch, close, volume, delta), ...] -> [(bar_key,o,h,l,c,volume,delta), ...].
+
+    Volume and delta are carried from real source fields when present. WC tick updates usually carry
+    the current candle's cumulative volume, so each bucket uses the max observed volume and the last
+    observed signed delta instead of summing every websocket update.
+    """
+    order = []
+    agg = {}
+    for item in ticks:
+        if len(item) < 2:
+            continue
+        ep, cl = item[0], item[1]
+        if ep is None or cl is None:
+            continue
+        vol = _f(item[2]) if len(item) >= 3 else 0.0
+        dlt = _f(item[3]) if len(item) >= 4 else 0.0
+        k = int(ep) // bar_seconds
+        if k not in agg:
+            order.append(k)
+            agg[k] = {"prices": [], "volume": 0.0, "delta": 0.0}
+        agg[k]["prices"].append(cl)
+        agg[k]["volume"] = max(agg[k]["volume"], max(0.0, vol or 0.0))
+        if dlt:
+            agg[k]["delta"] = dlt
+    closed = order[:-1] if len(order) >= 2 else []
+    out = []
+    for k in closed:
+        prices = agg[k]["prices"]
+        if not prices:
+            continue
+        out.append((k, prices[0], max(prices), min(prices), prices[-1],
+                    agg[k]["volume"], agg[k]["delta"]))
+    return out
 
 
 # ===========================================================================
@@ -1007,6 +1064,8 @@ CREATE TABLE IF NOT EXISTS bars (
     symbol TEXT NOT NULL,
     ts INTEGER NOT NULL,          -- bar close epoch (seconds)
     o REAL, h REAL, l REAL, c REAL NOT NULL,
+    v REAL NOT NULL DEFAULT 0,     -- real source volume when supplied
+    delta REAL NOT NULL DEFAULT 0, -- real/inferred source order-flow delta when supplied
     ts_recorded INTEGER NOT NULL, -- wall-clock when captured (for feedLive window)
     PRIMARY KEY (symbol, ts)
 );
@@ -1085,6 +1144,11 @@ class Store:
                 os.makedirs(d, exist_ok=True)
             with self._connect() as cx:
                 cx.executescript(SCHEMA)
+                cols = {r[1] for r in cx.execute("PRAGMA table_info(bars)").fetchall()}
+                if "v" not in cols:
+                    cx.execute("ALTER TABLE bars ADD COLUMN v REAL NOT NULL DEFAULT 0")
+                if "delta" not in cols:
+                    cx.execute("ALTER TABLE bars ADD COLUMN delta REAL NOT NULL DEFAULT 0")
                 # Idempotent: relabel any fires captured under the old engine codenames.
                 for old, new in _RENAMED_ENGINES.items():
                     cx.execute("UPDATE fires SET engine=? WHERE engine=?", (new, old))
@@ -1164,13 +1228,13 @@ class Store:
             return {"symbol": symbol, "bars": []}
         if newest:
             rows = self._q(
-                "SELECT o,h,l,c,ts FROM (SELECT o,h,l,c,ts FROM bars WHERE symbol=? "
+                "SELECT o,h,l,c,ts,v,delta FROM (SELECT o,h,l,c,ts,v,delta FROM bars WHERE symbol=? "
                 "ORDER BY ts DESC LIMIT ?) ORDER BY ts ASC", (symbol, limit))
         else:
-            rows = self._q("SELECT o,h,l,c,ts FROM bars WHERE symbol=? ORDER BY ts LIMIT ?",
+            rows = self._q("SELECT o,h,l,c,ts,v,delta FROM bars WHERE symbol=? ORDER BY ts LIMIT ?",
                            (symbol, limit))
         return {"symbol": symbol,
-                "bars": [[r[0], r[1], r[2], r[3], float(r[4])] for r in rows]}
+                "bars": [[r[0], r[1], r[2], r[3], float(r[4]), r[5], r[6]] for r in rows]}
 
     def record_bars(self, symbol: str, rows) -> int:
         """rows: [(ts_epoch, o, h, l, c), ...]. Upsert by (symbol, ts) so overlapping capture
@@ -1178,21 +1242,26 @@ class Store:
         if not in_scope(symbol):
             return 0
         now = int(time.time())
-        seq = [(symbol, int(ts), o, h, l, c, now) for (ts, o, h, l, c) in rows]
+        seq = []
+        for row in rows:
+            ts, o, h, l, c = row[:5]
+            v = row[5] if len(row) >= 6 else 0.0
+            d = row[6] if len(row) >= 7 else 0.0
+            seq.append((symbol, int(ts), o, h, l, c, float(v or 0), float(d or 0), now))
         if not seq:
             return 0
         self._exec(
-            "INSERT INTO bars(symbol,ts,o,h,l,c,ts_recorded) VALUES(?,?,?,?,?,?,?) "
+            "INSERT INTO bars(symbol,ts,o,h,l,c,v,delta,ts_recorded) VALUES(?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(symbol,ts) DO UPDATE SET o=excluded.o,h=excluded.h,l=excluded.l,"
-            "c=excluded.c,ts_recorded=excluded.ts_recorded", seq, many=True)
+            "c=excluded.c,v=excluded.v,delta=excluded.delta,ts_recorded=excluded.ts_recorded", seq, many=True)
         return len(seq)
 
     def record_bars_batch(self, by_symbol) -> int:
-        """by_symbol: {symbol: [(ts_epoch, o, h, l, c), ...]}.
+        """by_symbol: {symbol: [(ts_epoch, o, h, l, c[, volume[, delta]]), ...]}.
 
-        Batch-shaped companion to record_bars for a future capture flusher. Keeps the current
-        five-field bar schema, filters out-of-scope symbols before write, and returns -1 if the batch
-        write fails so callers can requeue instead of dropping source data silently."""
+        Batch-shaped companion to record_bars. Filters out-of-scope symbols before write, and
+        returns -1 if the batch write fails so callers can requeue instead of dropping source data
+        silently."""
         if not isinstance(by_symbol, dict):
             return 0
         now = int(time.time())
@@ -1201,16 +1270,19 @@ class Store:
             for symbol, rows in by_symbol.items():
                 if not in_scope(symbol):
                     continue
-                for (ts, o, h, l, c) in rows or []:
-                    seq.append((symbol, int(ts), o, h, l, c, now))
+                for row in rows or []:
+                    ts, o, h, l, c = row[:5]
+                    v = row[5] if len(row) >= 6 else 0.0
+                    d = row[6] if len(row) >= 7 else 0.0
+                    seq.append((symbol, int(ts), o, h, l, c, float(v or 0), float(d or 0), now))
         except (TypeError, ValueError):
             return -1
         if not seq:
             return 0
         rc = self._exec(
-            "INSERT INTO bars(symbol,ts,o,h,l,c,ts_recorded) VALUES(?,?,?,?,?,?,?) "
+            "INSERT INTO bars(symbol,ts,o,h,l,c,v,delta,ts_recorded) VALUES(?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(symbol,ts) DO UPDATE SET o=excluded.o,h=excluded.h,l=excluded.l,"
-            "c=excluded.c,ts_recorded=excluded.ts_recorded", seq, many=True)
+            "c=excluded.c,v=excluded.v,delta=excluded.delta,ts_recorded=excluded.ts_recorded", seq, many=True)
         return -1 if rc <= 0 else len(seq)
 
     # ---- live tick -----------------------------------------------------

@@ -149,6 +149,22 @@ check("complete 10-image mac AppIcon set", len(images) == 10, f"count={len(image
 mac_slots = {(im.get("idiom"), im.get("size"), im.get("scale")) for im in images}
 check_exact_slots("mac AppIcon slots match canonical 10-image policy", mac_slots, MAC_SLOTS)
 
+# 4) launcher must not narrow WealthCharts back to ES-only -----------------------
+launcher = os.path.join(ROOT, "backend", "launch-backend.sh")
+try:
+    launch = open(launcher, encoding="utf-8").read()
+except OSError as e:
+    launch = ""
+    check("backend launcher readable", False, str(e))
+check(
+    "backend launcher defaults to WealthCharts-wide scope",
+    'export BLTD_SCOPE="${BLTD_SCOPE:-all}"' in launch,
+)
+check(
+    "backend launcher does not force ES-only scope",
+    'export BLTD_SCOPE="${BLTD_SCOPE:-es}"' not in launch,
+)
+
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)
 PY

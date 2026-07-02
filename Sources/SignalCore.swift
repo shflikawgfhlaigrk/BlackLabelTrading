@@ -153,14 +153,14 @@ struct SignalInputs: Codable {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Live factor engine — auto-computes factor raw scores [-1,1] from the buyer's OWN
-// captured ES data + real edge-gated fire journal. HONEST BY CONSTRUCTION: a factor is
+// captured live data + real edge-gated fire journal. HONEST BY CONSTRUCTION: a factor is
 // present ONLY when it has a real source; the rest stay absent (→ 0, "no live data").
 // Nothing is fabricated or estimated.
 //   • From close prices: Trend, Momentum, StepGMA, HMM-regime, Session.
 //   • From real bar volume (WC cq): Volume, VWAP.
 //   • From real order-flow delta (WC bid/ask + prints, Lee-Ready): CVD Flow, CVD Divergence, VPIN.
 //   • From the real fire journal: Alpha Monitor.
-//   • Still no source (absent): SMT — needs a correlated asset (e.g. NQ) on the buyer's WC.
+//   • From a real correlated NQ stream: SMT.
 struct LiveFactorSnapshot {
     var factors: [String: Double] = [:]
     var available: Set<String> = []
@@ -178,8 +178,8 @@ enum LiveFactorEngine {
     // would FABRICATE on another instrument, so they are computed ONLY when esFamily is true and
     // stay honestly absent ("no live data") otherwise: Session (hardcoded US index prime hours,
     // meaningless for FX/non-US) and SMT (ES<->NQ correlated-asset divergence; on a non-ES symbol
-    // the NQ reference doesn't apply). The shipped feed scope is ES-family, but the pure
-    // price/volume factors remain symbol-neutral for tests and future adapters.
+    // the NQ reference doesn't apply). WealthCharts scope can include many symbols, while the pure
+    // price/volume factors remain symbol-neutral.
     static func compute(bars: [Bar], nqBars: [Bar], fires: [FireRow], now: Date,
                         esFamily: Bool = true) -> LiveFactorSnapshot {
         var s = LiveFactorSnapshot()

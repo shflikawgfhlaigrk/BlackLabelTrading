@@ -10,7 +10,7 @@
       All bars/ticks/signals live ONLY in the buyer's own local SQLite store
       (~/Library/Application Support/Black Label Trading). The app talks only
       to 127.0.0.1:8787 (its own bundled backend) and the buyer's own
-      TopstepX browser session.
+      TopstepX or WealthCharts browser session.
     * One required-reason API: UserDefaults, used only to persist this user's
       own settings/session locally (reason CA92.1).
 

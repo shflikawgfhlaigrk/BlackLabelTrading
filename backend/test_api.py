@@ -152,16 +152,19 @@ def test_connect_opens_no_api_browser_capture_tabs():
     saved = (C.feeds_available, C.open_feed_login_tabs, C.discover_feed_pages, C.cdp_reachable)
     try:
         C.feeds_available = lambda: False
-        C.open_feed_login_tabs = lambda: calls.append("opened")
-        C.discover_feed_pages = lambda: [("topstepx", {"url": "https://www.topstepx.com/"})]
+        C.open_feed_login_tabs = lambda source=None: calls.append(source)
+        C.discover_feed_pages = lambda source=None: (
+            [(source or "topstepx", {"url": "https://app.wealthcharts.com/"})] if calls else []
+        )
         C.cdp_reachable = lambda: True
 
-        obj = A._connect()
+        obj = A._connect({"source": "wealthcharts"})
         assert obj["ok"] is True
+        assert obj["source"] == "wealthcharts"
         assert obj["launched"] is True
         assert obj["feedAvailable"] is True
-        assert obj["feedPages"] == ["topstepx"]
-        assert calls == ["opened"]
+        assert obj["feedPages"] == ["wealthcharts"]
+        assert calls == ["wealthcharts"]
     finally:
         C.feeds_available, C.open_feed_login_tabs, C.discover_feed_pages, C.cdp_reachable = saved
 
@@ -219,6 +222,29 @@ def test_webhook_feed_ingests_ticks_and_bars():
         assert cap["feedAvailable"] is True
         assert cap["feedSource"] == "webhook"
         assert "ESU6" in cap["liveTicks"]
+    finally:
+        srv.shutdown()
+
+
+def test_webhook_feed_signs_volume_delta_for_wc_tick_bars():
+    srv, port = _start_server()
+    try:
+        h = f"127.0.0.1:{port}"
+        now = int(time.time())
+        sym = "CM.DLT6"
+        payload = {"symbol": sym,
+                   "candles": [
+                       {"open": 100.0, "high": 100.0, "low": 100.0, "close": 100.0,
+                        "ts": now, "volume": 2.0},
+                       {"open": 101.0, "high": 101.0, "low": 101.0, "close": 101.0,
+                        "ts": now + 1, "volume": 3.0},
+                   ]}
+        st, o = _req(port, "POST", "/webhook/feed", host=h, token=TOK, body=payload)
+        assert st == 200 and o["ok"] is True and o["bars"] == 2
+        st, recent = _req(port, "GET", f"/api/recent?symbol={sym}&limit=5", host=h, token=TOK)
+        assert st == 200
+        assert recent["bars"][-1][5] == 3.0       # real WC volume preserved
+        assert recent["bars"][-1][6] == 3.0       # tick-rule signed delta
     finally:
         srv.shutdown()
 

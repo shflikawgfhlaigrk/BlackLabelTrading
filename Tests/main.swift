@@ -1272,12 +1272,14 @@ testHoloLegibilityTextGlowIsMinimalAndHeadingOnly()
 func testFeedBarsDecode() {
     let obj: [String: Any] = ["symbol": "ES", "bars": [
         [100.0, 101.0, 99.0, 100.5, 1_700_000_000.0],
-        [100.5, 102.0, 100.0, 101.5, 1_700_000_015.0],
+        [100.5, 102.0, 100.0, 101.5, 1_700_000_015.0, 1200.0, -300.0],
     ]]
     let bars = FeedBars.decode(obj)
     eqi(bars.count, 2, "feed bars count")
     eq(bars[0].open, 100, "feed bar0 open")
     eq(bars[1].close, 101.5, "feed bar1 close")
+    eq(bars[1].volume, 1200, "feed bar1 volume")
+    eq(bars[1].delta, -300, "feed bar1 order-flow delta")
     ok(bars[0].date < bars[1].date, "feed bars sorted ascending")
 }
 func testFeedBarsEmptyAndMalformed() {
@@ -1297,7 +1299,7 @@ func testLiveTickDecode() {
     ok(LiveTick.decode(["gated": true]) == nil, "gated tick -> nil")
     ok(LiveTick.decode(["symbol": "ES"]) == nil, "incomplete tick -> nil")
     let nq = LiveTick.decode(["symbol": "CM.NQU6", "price": 17000.0, "ts": 1_700_000_000.0])
-    ok(nq == nil, "non-ES tick is filtered from shipped Topstep scope")
+    ok(nq != nil && nq?.symbol == "CM.NQU6", "NQ tick decodes in WealthCharts scope")
     ok(LiveTick.decode(["symbol": "", "price": 1.0, "ts": 1_700_000_000.0]) == nil,
        "empty-symbol tick still rejected")
     let t = LiveTick.decode(["symbol": "ES", "price": 4500.25, "ts": 1_700_000_000.0])
@@ -1325,16 +1327,16 @@ func testCaptureStatusState() {
     ok(CaptureStatus(cdpReachable: true, feedAvailable: true, liveTicks: ["ES"]).state(signedIn: true) == .live, "state live")
 }
 func testFeedSymbolsPicker() {
-    // Shipped Topstep scope: only ES-family symbols are kept, deduped; stale non-ES rows are dropped.
+    // WealthCharts scope: real non-empty symbols are kept and deduped; ES-specific math is gated elsewhere.
     let s = FeedSymbols.decode([
         "backtestable": ["CM.ESU6", "ESZ26"], "live": ["ESZ26", "CM.NQU6"],
         "liveTicks": ["CM.ESU6", "NQ"], "busiest": "CM.NQU6",
     ])
     let p = s.pickerList
     ok(p.contains("CM.ESU6") && p.contains("ESZ26"), "picker keeps ES-family instruments")
-    ok(!p.contains("CM.NQU6") && !p.contains("NQ"), "picker drops stale non-ES instruments")
+    ok(p.contains("CM.NQU6") && p.contains("NQ"), "picker keeps live WealthCharts instruments")
     ok(Set(p).count == p.count, "picker has no dupes")
-    ok(s.busiest == nil, "non-ES busiest symbol is filtered")
+    ok(s.busiest == "CM.NQU6", "busiest WealthCharts symbol is kept")
 }
 
 func testTradingSymbolScope() {
@@ -1348,9 +1350,9 @@ func testTradingSymbolScope() {
     ok(!TradingSymbolScope.isES("MESU6"), "MES is not ES-family")
     ok(!TradingSymbolScope.isES("US.SPY"), "equity symbol is not ES-family")
 
-    // Shipped scope is Topstep ES-family only.
-    ok(!TradingSymbolScope.inScope("NQ") && !TradingSymbolScope.inScope("CM.NQU6"), "NQ out of shipped scope")
-    ok(!TradingSymbolScope.inScope("EURUSD") && !TradingSymbolScope.inScope("US.SPY"), "FX/equity out of shipped scope")
+    // Shipped scope accepts WealthCharts' real live symbols; ES-only logic uses isES above.
+    ok(TradingSymbolScope.inScope("NQ") && TradingSymbolScope.inScope("CM.NQU6"), "NQ in WealthCharts scope")
+    ok(TradingSymbolScope.inScope("EURUSD") && TradingSymbolScope.inScope("US.SPY"), "FX/equity in WealthCharts scope")
     ok(!TradingSymbolScope.inScope("") && !TradingSymbolScope.inScope("  "), "junk symbol out of scope")
 
     // futuresRoot strips the contract suffix; passes non-futures through.
@@ -1378,11 +1380,11 @@ func source(_ rel: String) -> String {
     return (try? String(contentsOf: url, encoding: .utf8)) ?? ""
 }
 
-func testProductSurfaceTopstepScopeContract() {
-    // The product surface must stay honest inside the shipped Topstep ES-family scope. This locks
+func testProductSurfaceSymbolScopeContract() {
+    // The product surface must stay honest inside the shipped WealthCharts symbol scope. This locks
     // two things a future edit must not regress: (1) the live Signals path must derive symbol and
     // point value from the feed instead of hardcoding display defaults; (2) entry guards use the
-    // shared in-scope predicate so stale non-ES rows are filtered consistently.
+    // shared in-scope predicate so junk rows are filtered consistently.
     let files = ["Sources/Model.swift", "Sources/Screens.swift", "Sources/Screens2.swift", "Sources/Screens3.swift"]
     let text = files.map { source($0) }.joined(separator: "\n")
     ok(!text.isEmpty, "product-surface source loaded")
@@ -1419,37 +1421,35 @@ func testNoAPIWebhookIngestionContract() {
        !launcher.isEmpty && !entitlements.isEmpty,
        "no-api webhook-ingestion source loaded")
 
-    ok(ui.contains("bundled Topstep bridge") && ui.contains("webhook URL"),
-       "feed UI explicitly says bundled Topstep bridge/webhook")
+    ok(ui.contains("bundled browser bridge") && ui.contains("TopstepX or WealthCharts") && ui.contains("webhook URL"),
+       "feed UI explicitly says bundled browser bridge/webhook")
     ok(ui.contains("FeedCredStore.lastSource ?? \"webhook\""), "feed UI defaults to webhook receiver")
     ok(ui.contains("Copy curl") && ui.contains("webhookInfo()"),
        "feed UI exposes copyable webhook setup")
-    ok(chart.contains("Waiting for Topstep data") && chart.contains("Refresh webhook"),
-       "chart waits for Topstep bridge data instead of asking for broker credentials")
-    ok(!chart.contains("Connect WealthCharts") && !chart.contains("Open browser capture"),
-       "chart does not route prop users to WealthCharts/browser credential flows")
-    ok(feedTypes.contains("No webhook data") && feedTypes.contains("your Topstep webhook feed"),
-       "feed status labels are webhook based")
-    ok(settings.contains("bundled Topstep bridge") && !settings.contains("prop-firm API"),
-       "settings copy describes no-creds Topstep bridge ingestion")
+    ok(chart.contains("Waiting for browser feed data") && chart.contains("Refresh webhook"),
+       "chart waits for browser bridge data instead of asking for broker credentials")
+    ok(feedTypes.contains("No webhook data") && feedTypes.contains("your WealthCharts webhook feed"),
+       "feed status labels include WealthCharts webhook state")
+    ok(settings.contains("bundled browser bridge") && !settings.contains("prop-firm API"),
+       "settings copy describes no-creds bridge ingestion")
     ok(feedClient.contains("/api/webhook/info"), "feed client fetches webhook receiver details")
     ok(api.contains("_webhook_ingest") && api.contains("\"/webhook/feed\""),
        "backend exposes webhook ingestion route")
     ok(api.contains("cap.on_candle") && api.contains("STORE.record_bars_batch"),
        "webhook writes through capture/store ingestion")
     ok(api.contains("API feed posts rejected"), "/api/feed/connect documents API feed rejection")
-    ok(feeds.contains("\"key\": \"webhook\"") && !feeds.contains("\"key\": \"projectx\""),
-       "feed catalogue exposes webhook receiver, not API sources")
+    ok(feeds.contains("\"key\": \"webhook\"") && feeds.contains("\"key\": \"wealthcharts\"") && !feeds.contains("\"key\": \"projectx\""),
+       "feed catalogue exposes webhook receiver plus WealthCharts browser source, not API sources")
     ok(feeds.contains("webhook ingestion only; no broker/API feed is accepted"),
        "feed manager rejects direct API feed source posts")
-    ok(topstepBridge.contains("class WebhookSink") && topstepBridge.contains("topstepx.com") &&
+    ok(topstepBridge.contains("class WebhookSink") && topstepBridge.contains("WealthCharts") &&
        topstepBridge.contains("/webhook/feed"),
-       "bundled Topstep bridge posts parsed TopstepX data to webhook")
+       "bundled browser bridge posts parsed browser-feed data to webhook")
     ok(launcher.contains("supervise_topstep_bridge") && launcher.contains("BLTD_TOKEN") &&
        launcher.contains("BLTD_CAPTURE_BROWSER=\"0\"") && !launcher.contains("prop-firm API feed"),
-       "launcher auto-starts Topstep bridge with shared webhook token and disables direct browser writes")
-    ok(entitlements.contains("Topstep bridge/webhook feed") && !entitlements.contains("WealthCharts feed"),
-       "Developer ID entitlement rationale names Topstep bridge/webhook ingestion")
+       "launcher auto-starts browser bridge with shared webhook token and disables direct browser writes")
+    ok(entitlements.contains("TopstepX or WealthCharts browser bridge/webhook feed"),
+       "Developer ID entitlement rationale names browser/webhook ingestion")
     ok(!ui.contains("API Key") && !ui.contains("ProjectX/TopstepX"),
        "feed UI does not ask for prop-account API credentials")
 }
@@ -1551,10 +1551,11 @@ func testEngineRosterDecode() {
          "winRate": 0.0, "netPts": 0.0, "expectancyR": 0.0, "trades": 0, "bars": 12, "reason": "warming"],
     ]]
     let rows = EngineRoster.decode(obj)
-    eqi(rows.count, 1, "roster filters stale non-ES instruments")
+    eqi(rows.count, 2, "roster keeps WealthCharts instruments")
     ok(rows[0].engine == "momentum" && rows[0].edge && !rows[0].warming, "roster row 0 fields")
     eq(rows[0].netPts, 12.5, "roster row 0 netPts")
     eqi(rows[0].trades, 30, "roster row 0 trades")
+    ok(rows[1].engine == "regime" && !rows[1].edge && rows[1].warming, "roster row 1 fields")
     eqi(EngineRoster.decode(["rows": []]).count, 0, "empty roster honest")
     eqi(EngineRoster.decode([:]).count, 0, "missing rows key honest")
 }
@@ -1584,10 +1585,12 @@ func testFireFeedDecode() {
          "stop": 16900.0, "target": 17200.0, "rationale": "r", "ts": "2026-06-18 12:01:00"],
     ]]
     let fires = FireFeed.decode(obj)
-    eqi(fires.count, 1, "fire decode filters stale non-ES instruments")
+    eqi(fires.count, 2, "fire decode keeps WealthCharts instruments")
     ok(fires[0].engine == "structure" && fires[0].direction == "short", "fire fields")
     eq(fires[0].entry, 5100.0, "fire entry")
     ok(fires[0].outcome == nil && fires[0].pnl == nil, "ungraded fire -> nil outcome/pnl (honest)")
+    ok(fires[1].engine == "momentum" && fires[1].direction == "long", "fire row 1 fields")
+    eq(fires[1].entry, 17000.0, "fire row 1 entry")
     eqi(FireFeed.decode(["fires": []]).count, 0, "empty fires honest")
 }
 
@@ -1724,7 +1727,7 @@ testLiveFold()
 testCaptureStatusState()
 testFeedSymbolsPicker()
 testTradingSymbolScope()
-testProductSurfaceTopstepScopeContract()
+testProductSurfaceSymbolScopeContract()
 testNoAPIWebhookIngestionContract()
 
 // Engine roster + fire feed decode (the /api/screen + /api/fires wire contract)

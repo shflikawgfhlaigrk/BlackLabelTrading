@@ -50,7 +50,8 @@ enum Resampler {
                 out.append(Bar(date: f.date, open: f.open,
                                high: chunk.map(\.high).max() ?? f.high,
                                low: chunk.map(\.low).min() ?? f.low,
-                               close: l.close, volume: chunk.reduce(0) { $0 + $1.volume }))
+                               close: l.close, volume: chunk.reduce(0) { $0 + $1.volume },
+                               delta: chunk.reduce(0) { $0 + $1.delta }))
             }
             i += factor
         }
@@ -63,7 +64,9 @@ enum Resampler {
             let chunk = (groups[day] ?? []).sorted { $0.date < $1.date }
             guard let f = chunk.first, let l = chunk.last else { return nil }
             return Bar(date: day, open: f.open, high: chunk.map(\.high).max() ?? f.high,
-                       low: chunk.map(\.low).min() ?? f.low, close: l.close, volume: chunk.reduce(0) { $0 + $1.volume })
+                       low: chunk.map(\.low).min() ?? f.low, close: l.close,
+                       volume: chunk.reduce(0) { $0 + $1.volume },
+                       delta: chunk.reduce(0) { $0 + $1.delta })
         }
     }
 }
@@ -219,7 +222,7 @@ struct ChartScreen: View {
         case .live: return "Ticks flowing from \(src) into your local store."
         case .idle: return "Feed reachable, no fresh ticks right now (market quiet / closed)."
         case .connecting: return "Webhook receiver ready - waiting for pushed ticks or bars."
-        case .loggedOut: return "Waiting for Topstep data — sign into TopstepX in the app-owned browser."
+        case .loggedOut: return "Waiting for browser feed data — sign into TopstepX or WealthCharts in the app-owned browser."
         case .notSignedIn: return "Backend reachable - connecting your local session..."
         case .offline: return "The product backend isn't reachable. It serves your own captured data."
         }
@@ -315,8 +318,8 @@ struct ChartScreen: View {
                     GhostButton(label: "Retry connection", icon: "arrow.clockwise") { Task { await reconnectFeed() } }
                 }
             case .loggedOut, .notSignedIn, .connecting:
-                EmptyState(icon: "dot.radiowaves.left.and.right", title: "Waiting for Topstep data",
-                           hint: "Use the bundled Topstep bridge and sign into your own TopstepX session in the app-owned browser. The bridge posts observed market data into the local webhook/store. Once real data flows, it appears here. Nothing is ever fabricated.")
+                EmptyState(icon: "dot.radiowaves.left.and.right", title: "Waiting for browser feed data",
+                           hint: "Use the bundled browser bridge and sign into your own TopstepX or WealthCharts session in the app-owned browser. The bridge posts observed market data into the local webhook/store. Once real data flows, it appears here. Nothing is ever fabricated.")
                 GoldButton(label: "Refresh webhook", icon: "arrow.clockwise") {
                     Task { loadingFeed = true; await refreshFeed(); loadingFeed = false }
                 }

@@ -5,7 +5,7 @@
 
   Trading ships OUTSIDE the App Store via Developer ID + Hardened Runtime, because the app
   spawns its own bundled Python data backend (/bin/bash -> python3 bltd_api.py) to receive the
-  buyer's own Topstep bridge/webhook feed into a local SQLite store and serve it on
+  buyer's own TopstepX or WealthCharts browser bridge/webhook feed into a local SQLite store and serve it on
   127.0.0.1:8787. The
   App Store sandbox would forbid that child-process spawn + local server, so:
 

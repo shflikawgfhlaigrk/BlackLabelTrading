@@ -6,7 +6,7 @@ A holographic macOS signal dashboard for the Black Label engine method — a 16-
 
 ## Overview
 
-Black Label Trading is a native macOS (SwiftUI/AppKit) application. Its bundled TopstepX bridge opens a product-owned browser, you sign into **your own** TopstepX session, and observed ES market data is posted into a private local webhook/store on **your** Mac. Nothing is fetched from Black Label or any third party — the app talks only to its own self-contained backend running on localhost.
+Black Label Trading is a native macOS (SwiftUI/AppKit) application. Its bundled browser bridge opens a product-owned browser, you sign into **your own** TopstepX or WealthCharts session, and observed market data is posted into a private local webhook/store on **your** Mac. Nothing is fetched from Black Label or any third party — the app talks only to its own self-contained backend running on localhost.
 
 The product is honest by design: when there is no data, it shows an honest empty state and never fabricates prices, win-rates, or a track record. Every number on screen is computed from your own captured bars or your own journal — none is invented. The app ships with **no data** and starts **empty** on your own accounts and your own machine.
 
@@ -39,7 +39,7 @@ The app is organized into a left sidebar with three groups — **Markets**, **Re
 ### Tools
 - **Calculators** — position sizing, risk:reward, and a compounding projector.
 - **Prop Firms** — a reference list of futures evaluation firms and their rules (confirm current terms on each firm's own site).
-- **Settings** — account, theme studio, live feed / TopstepX bridge state, backend URL, sign-in providers, and app info.
+- **Settings** — account, theme studio, live feed / browser bridge state, backend URL, sign-in providers, and app info.
 
 ### The engine fleet & research gate
 The bundled backend runs an ES-only roster of 9 engines — `meanrev`, `breakout`, `research`, `momentum`, `structure`, `regime`, `channel`, `context_a`, `context_b`. Each engine can produce an **out-of-sample candidate** on your own captured ES bars, but that is research evidence, not a verified-live profit claim. A signal appears only when your local ES data clears the configured OOS candidate gate; until then it honestly shows "warming." Recorded fires appear in a real, research-gated signal journal for manual review and grading.
@@ -49,7 +49,7 @@ The bundled backend runs an ES-only roster of 9 engines — `meanrev`, `breakout
 ## Requirements / What You Connect
 
 - **macOS** (native SwiftUI/AppKit desktop app).
-- **Your own Topstep / TopstepX account.** The app opens a product-owned TopstepX browser, you sign in there, and the bridge reads the market data already feeding your session into the local webhook/store. No Topstep credentials are bundled or stored by Black Label Trading.
+- **Your own TopstepX or WealthCharts account.** The app opens a product-owned browser, you sign in there, and the bridge reads the market data already feeding your chart session into the local webhook/store. No platform credentials are bundled or stored by Black Label Trading.
 - **(Optional) Your own Google Desktop OAuth client ID** if you want the "Sign in with Google" button to perform a real login. Paste it in Settings → Sign-in providers; it is stored on this Mac and never bundled. Email/password and "Continue as guest" always work. Apple Sign-In works in the signed (provisioned) build.
 - **(Optional) Your own backend host/port.** The app starts a bundled, stdlib-only Python backend on `http://127.0.0.1:8787` automatically. If you run the backend elsewhere on your own machine or network, point the Backend URL field (Settings → Live data feed) at it.
 - **(Optional) A broker/platform CSV export** to populate the Journal and Analytics.
@@ -66,7 +66,7 @@ There is no Black Label server in the loop. All data lives on your Mac.
    - The Signals session ledger shows "No committed signals."
    - The Journal shows "No trades logged yet."
    - Charts and grid tiles show honest empty states — no prices are fabricated.
-3. Open the bundled TopstepX bridge (Signals banner or Settings), sign into your own TopstepX session, and let ES bars accumulate through the local webhook. As your own ES data flows in, engines warm up, fires get recorded, and the charts/backtester populate from your captured bars.
+3. Open the bundled browser bridge (Signals banner or Settings), sign into your own TopstepX or WealthCharts session, and let bars accumulate through the local webhook. As your own data flows in, engines warm up, fires get recorded, and the charts/backtester populate from your captured bars.
 
 The app never shows a value it can't ground in your real data.
 
@@ -74,7 +74,7 @@ The app never shows a value it can't ground in your real data.
 
 ## How to Use (main flows)
 
-- **Capture a live feed:** Settings → Live data feed (or the Signals banner) → open the bundled TopstepX bridge → sign into your own TopstepX session → the bridge posts observed ES bars into your private local store and the feed banner reflects real capture state.
+- **Capture a live feed:** Settings → Live data feed (or the Signals banner) → open the bundled browser bridge → sign into your own TopstepX or WealthCharts session → the bridge posts observed bars into your private local store and the feed banner reflects real capture state.
 - **Read signals:** open **Signals**. Watch the engine fleet for OOS candidates on ES, review multi-timeframe consensus and the composite score, then commit a gate-passing research signal and grade it Win/Loss to build an honest session record.
 - **Research a rule:** **Strategy Builder** to compose entries → **Backtest** (with walk-forward and Monte Carlo) on your own bars → optionally turn the rule into an **Alert** or save it.
 - **Practice:** **Paper Trade** to run a simulated blotter, or **Replay** to step a session bar-by-bar with no look-ahead.
@@ -87,7 +87,7 @@ The app never shows a value it can't ground in your real data.
 
 - The app ships with **no data** — no leads, no bars, no journal, no account info. It starts empty on your own data and accounts.
 - All capture, bars, signals, journal, drawings, and account credentials are stored **privately on your Mac**. Nothing is sent to Black Label or any third party.
-- The local backend serves only what your own TopstepX bridge or webhook sender captured, over localhost. When the backend is down or your TopstepX session is logged out / not producing data, the app reports an honest offline/idle state and shows no bars.
+- The local backend serves only what your own browser bridge or webhook sender captured, over localhost. When the backend is down or your platform session is logged out / not producing data, the app reports an honest offline/idle state and shows no bars.
 - Deleting your account removes your credentials from this Mac; your local store remains under your control.
 - **Execution is OFF by default:** the app reads bars/ticks/fires and places **no** trade and moves **no** money unless you explicitly arm live execution (a separate Touch-ID-gated step) with your own broker credentials on a firm that permits automation. Paper mode (simulated fills, no broker contact) is the default; a master kill switch halts and flattens everything at any time.
 

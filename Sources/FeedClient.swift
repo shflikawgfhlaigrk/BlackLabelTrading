@@ -224,11 +224,15 @@ final class FeedClient: ObservableObject {
     // MARK: - Connect the buyer's own browser trading session (launches the product-owned debug
     // Chrome at supported platform sign-ins; reports REAL reachability). Signals-only — opens
     // login tabs, reads market-data frames after the buyer signs in, never uses broker APIs.
-    func launchCapture() async {
+    func launchCapture(source: String? = nil) async {
         guard let req0 = authed("/api/connect") else { return }
         var req = req0; req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.httpBody = "{}".data(using: .utf8)
+        if let source, !source.isEmpty {
+            req.httpBody = try? JSONSerialization.data(withJSONObject: ["source": source])
+        } else {
+            req.httpBody = "{}".data(using: .utf8)
+        }
         connecting = true; defer { connecting = false }
         // Surface the honest no-Chrome prerequisite (RC4): browser capture needs a Chromium browser.
         // If none is installed the backend reports chromePresent:false instead of looping silently.

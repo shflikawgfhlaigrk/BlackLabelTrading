@@ -2,8 +2,8 @@
 //
 // HONEST FRAMING: this is the wire-format <-> domain-model translation for the product's OWN
 // self-contained backend (bltd_api.py on 127.0.0.1). The backend serves ONLY what the buyer's
-// own Topstep webhook sender wrote into the buyer's own local store - nothing is downloaded from us,
-// sampled, or invented. When the store is cold / no Topstep data has arrived, the
+// own browser bridge or webhook sender wrote into the buyer's own local store - nothing is downloaded from us,
+// sampled, or invented. When the store is cold / no browser feed data has arrived, the
 // payloads are empty and decode to empty results (a real "feed offline" state upstream), NEVER
 // to fabricated bars. The networking + @MainActor wiring lives in FeedClient.swift; the math
 // here is verifiable headlessly so the decode contract is test-locked.
@@ -43,10 +43,10 @@ enum TradingSymbolScope {
         return out
     }
 
-    // Shipped Topstep setup is ES-family only. Keep this filter in the client too so stale rows from
-    // older local stores cannot appear in the picker if a backend response is cached or mixed.
+    // WealthCharts can stream multiple real instruments. Keep only sane non-empty symbols in the
+    // client; ES-family checks remain available for factors that are genuinely ES-specific.
     static func inScope(_ raw: String?) -> Bool {
-        isES(raw)
+        !normalized(raw).isEmpty
     }
 
     static func filterScoped(_ symbols: [String]) -> [String] {
@@ -139,9 +139,11 @@ struct CaptureStatus: Equatable {
     var sourceLabel: String {
         switch (feedSource ?? "").lowercased() {
         case "webhook", "topstepx-bridge": return "your Topstep webhook feed"
+        case "wealthcharts-bridge": return "your WealthCharts webhook feed"
         case "topstepx": return "your TopstepX browser feed"
-        case "browser", "": return "your Topstep webhook feed"
-        default: return "your Topstep feed"
+        case "wealthcharts": return "your WealthCharts browser feed"
+        case "browser", "": return "your browser feed"
+        default: return "your captured feed"
         }
     }
     // Browser capture is not the surfaced feed path; retained for older call sites/tests.

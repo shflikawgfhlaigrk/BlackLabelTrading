@@ -209,11 +209,12 @@ struct SignalsScreen: View {
                                     }
                                 }
                                 // Manual order ticket — computes size from YOUR account/risk and
-                                // formats the full bracket to copy onto your own platform. The app
-                                // never sends, places, or routes an order (signals-only).
+                                // formats the full bracket to copy onto your own platform. WealthCharts
+                                // is data-only; automated orders, if enabled, route only through the
+                                // separate Execution broker path.
                                 if result.direction != .flat {
                                     Divider().background(BLTheme.stroke).padding(.vertical, 2)
-                                    Text("ORDER TICKET — manual copy (for automated placement, use the Execution screen)")
+                                    Text("ORDER TICKET — manual copy (WealthCharts is data-only)")
                                         .font(.system(size: 9.5, weight: .bold, design: .rounded)).foregroundColor(BLTheme.sub).tracking(0.4)
                                     HStack(spacing: 8) {
                                         Field(title: "Account $", text: $tAccount)
@@ -226,7 +227,7 @@ struct SignalsScreen: View {
                                         ticketCopied = true
                                     }
                                     if ticketCopied {
-                                        Text("Copied — paste into your own platform (this is the manual path; Execution can place it for you).")
+                                        Text("Copied — paste into your own platform. WealthCharts is read-only market data here.")
                                             .font(.system(size: 10, design: .rounded)).foregroundColor(BLTheme.green)
                                     }
                                 }
@@ -281,13 +282,17 @@ struct SignalsScreen: View {
             .padding(24)
         }
         .task {
+            await feed.connect(email: "local@blacklabel")
+            await feed.refreshStatus()
             await loadFleet()
-            await feed.refreshStatus()                       // resolve the live symbol once
             var ticks = 0
             while !Task.isCancelled {
                 await refreshLive()
                 ticks += 1
-                if ticks % 20 == 0 { await feed.refreshStatus() }   // re-resolve symbol ~every 30s
+                if ticks % 20 == 0 {
+                    await feed.refreshStatus()   // re-resolve symbol ~every 30s
+                    await loadFleet()
+                }
                 try? await Task.sleep(nanoseconds: 1_500_000_000)   // 1.5s — was 5s
             }
         }
@@ -387,8 +392,8 @@ struct SignalsScreen: View {
                 Text(connected ? "Platform account saved" : "Save your platform account")
                     .font(.system(size: 14, weight: .bold, design: .rounded)).foregroundColor(BLTheme.text)
                 Text(connected
-                     ? "\(wc.account.username) · saved on this Mac. Live data comes from your TopstepX session in the app-owned browser. Autonomous execution is OFF by default (see Execution)."
-                     : "Save your Topstep account label on this Mac. Live data comes from your TopstepX session in the app-owned browser.")
+                     ? "\(wc.account.username) · saved on this Mac. Live data comes from your selected platform session in the app-owned browser. Autonomous execution is OFF by default (see Execution)."
+                     : "Save your platform account label on this Mac. Live data comes from your selected platform session in the app-owned browser.")
                     .font(.system(size: 11.5, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -550,6 +555,8 @@ struct SignalsScreen: View {
         // hardcoded root; it's whatever the buyer's feed streams (e.g. CM.ESU6).
         guard let esSym = feed.symbols.live.first ?? feed.symbols.busiest ?? feed.symbols.liveTicks.first else {
             await MainActor.run { live = LiveFactorSnapshot(); factorsLoading = false }
+            await feed.connect(email: "local@blacklabel")
+            await feed.refreshStatus()
             return
         }
         if live.bars == 0 { factorsLoading = true }
@@ -559,9 +566,10 @@ struct SignalsScreen: View {
         // Fold the live last-price tick into the latest bar so price + price-relative factors update
         // every cycle, not only when a 15s bar closes. Real tick only (nil when gated) — never invented.
         if let tick = await feed.liveTick(symbol: liveSym) { bars = LiveFold.apply(tick, to: bars) }
-        // NQ reference is fetched ONLY for ES (SMT is an ES↔NQ factor); never compare an instrument
-        // to itself, which would fabricate a neutral SMT score on non-ES.
-        let nqBars = esFamily ? await feed.recentBars(symbol: nqSymbol(for: liveSym)) : []
+        // NQ reference is fetched ONLY for ES (SMT is an ES<->NQ factor); never compare an instrument
+        // to itself, which would fabricate a neutral SMT score on non-ES. WealthCharts may stream
+        // either the micro or full-size NQ contract, so try both matching-expiry symbols.
+        let nqBars = esFamily ? await referenceNQBars(for: liveSym) : []
         let snap = LiveFactorEngine.compute(bars: bars, nqBars: nqBars, fires: backendFires,
                                             now: Date(), esFamily: esFamily)
         await MainActor.run {
@@ -577,11 +585,24 @@ struct SignalsScreen: View {
         }
     }
 
-    // Map the live ES contract to its matching-expiry NQ micro for SMT (e.g. CM.ESU6 -> CM.MNQU6).
-    // NQ is a correlated REFERENCE only, used solely when the live instrument is ES-family.
-    private func nqSymbol(for es: String) -> String {
-        if let r = es.range(of: "ES") { return es.replacingCharacters(in: r, with: "MNQ") }
-        return es
+    // Map the live ES contract to its matching-expiry NQ references for SMT. NQ is a correlated
+    // REFERENCE only, used solely when the live instrument is ES-family.
+    private func referenceNQBars(for es: String) async -> [Bar] {
+        for symbol in nqSymbols(for: es) {
+            let bars = await feed.recentBars(symbol: symbol)
+            if !bars.isEmpty { return bars }
+        }
+        return []
+    }
+
+    private func nqSymbols(for es: String) -> [String] {
+        guard let r = es.range(of: "ES") else { return [] }
+        var out: [String] = []
+        for root in ["MNQ", "NQ"] {
+            let symbol = es.replacingCharacters(in: r, with: root)
+            if !out.contains(symbol) { out.append(symbol) }
+        }
+        return out
     }
 
     // Read-only live factor row — the live raw score, or an honest "no live data" tag for factors
@@ -1042,7 +1063,7 @@ struct SettingsScreen: View {
                     Spacer()
                     GhostButton(label: "Test", icon: "arrow.clockwise") { Task { await feed.connect(email: session.email); await feed.refreshStatus() } }
                 }
-            Text("Black Label Trading uses the bundled Topstep bridge to open TopstepX in a product-owned browser profile, then posts observed ES market data into the local webhook/store on this Mac. Nothing is fetched from us. Point this at your own backend host/port only if you run the local backend elsewhere on your machine or network.")
+            Text("Black Label Trading uses the bundled browser bridge to open TopstepX or WealthCharts in a product-owned browser profile, then posts observed market data into the local webhook/store on this Mac. Nothing is fetched from us. Point this at your own backend host/port only if you run the local backend elsewhere on your machine or network.")
                     .font(.system(size: 11.5, design: .rounded)).foregroundColor(BLTheme.sub).fixedSize(horizontal: false, vertical: true)
                 Field(title: "Backend URL", text: $feedURLDraft, prompt: FeedClient.defaultURL)
                 HStack(spacing: 8) {
@@ -1099,7 +1120,7 @@ struct SettingsScreen: View {
             }
             Panel(title: "About", icon: "info.circle") {
                 Text("Black Label Trading v1.0").font(.system(size: 13, weight: .bold, design: .rounded)).foregroundColor(BLTheme.text)
-                Text("A signal dashboard built on the Black Label engine method: a multi-module composite scoring engine, a 13-gate risk checklist, multi-timeframe consensus, a trade journal, risk calculators, and a prop-firm reference. Live data comes from the TopstepX session you sign into in the app-owned browser, pushed into your local backend. All data is stored privately on this Mac.")
+                Text("A signal dashboard built on the Black Label engine method: a multi-module composite scoring engine, a 13-gate risk checklist, multi-timeframe consensus, a trade journal, risk calculators, and a prop-firm reference. Live data comes from the TopstepX or WealthCharts session you sign into in the app-owned browser, pushed into your local backend. All data is stored privately on this Mac.")
                     .font(.system(size: 12.5, design: .rounded)).foregroundColor(BLTheme.sub).fixedSize(horizontal: false, vertical: true)
             }
         }.padding(24) }
@@ -1132,7 +1153,7 @@ struct SettingsScreen: View {
     }
 }
 
-// MARK: - Topstep account reference panel (reusable - shown in Settings)
+// MARK: - Platform account reference panel (reusable - shown in Settings)
 // HONEST FRAMING: stores the buyer's own platform account reference on THIS Mac only.
 // Not a login flow; does not auto-trade or move money. Username + note -> UserDefaults,
 // password -> macOS Keychain. The UI states plainly what is and isn't connected.
@@ -1141,7 +1162,7 @@ struct WealthChartsPanel: View {
     @State private var showConnect = false
 
     var body: some View {
-        Panel(title: "Topstep account reference", icon: "link", accent: wc.account.isConfigured ? BLTheme.green : BLTheme.gold) {
+        Panel(title: "Platform account reference", icon: "link", accent: wc.account.isConfigured ? BLTheme.green : BLTheme.gold) {
             HStack(spacing: 10) {
                 Image(systemName: wc.account.isConfigured ? "checkmark.seal.fill" : "link.badge.plus")
                     .font(.system(size: 13, weight: .bold))
@@ -1151,7 +1172,7 @@ struct WealthChartsPanel: View {
                         .font(.system(size: 13, weight: .bold, design: .rounded)).foregroundColor(BLTheme.text)
                     Text(wc.account.isConfigured
                          ? "Stored locally - signals-only. Live data comes from the platform you sign into in the capture browser."
-                         : "Add your Topstep account label to keep it on hand for the engine method.")
+                         : "Add your platform account label to keep it on hand for the engine method.")
                         .font(.system(size: 11, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -1200,13 +1221,13 @@ struct ConnectWealthChartsSheet: View {
                 HStack(spacing: 10) {
                     Image(systemName: "link").font(.system(size: 15, weight: .bold)).foregroundColor(Color(hex: 0x1A1305))
                         .frame(width: 30, height: 30).background(BLTheme.goldGrad).clipShape(RoundedRectangle(cornerRadius: 9))
-                Text("Save Topstep account").font(.system(size: 18, weight: .heavy, design: .rounded)).foregroundColor(BLTheme.text)
+                Text("Save platform account").font(.system(size: 18, weight: .heavy, design: .rounded)).foregroundColor(BLTheme.text)
                 }
                 Text("Saved on this Mac only. This panel just stores your account label — it does not log in, trade, or move money. The password is stored in the macOS Keychain. Autonomous execution is OFF by default (Execution screen).")
                     .font(.system(size: 12, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
                     .fixedSize(horizontal: false, vertical: true)
 
-                Field(title: "Topstep username / email", text: $username, prompt: "you@example.com")
+                Field(title: "Platform username / email", text: $username, prompt: "you@example.com")
                 VStack(alignment: .leading, spacing: 5) {
                     Text("PASSWORD (OPTIONAL)").font(.system(size: 10, weight: .bold, design: .rounded)).foregroundColor(BLTheme.sub).tracking(0.6)
                     SecureField("••••••••", text: $password)
@@ -1217,7 +1238,7 @@ struct ConnectWealthChartsSheet: View {
                     Text("Stored in the macOS Keychain on this device. Leave blank to keep any previously saved password.")
                         .font(.system(size: 10.5, design: .rounded)).foregroundColor(BLTheme.sub)
                 }
-                Field(title: "Label (optional)", text: $note, prompt: "e.g. Topstep 50K eval")
+                Field(title: "Label (optional)", text: $note, prompt: "e.g. WealthCharts main / Topstep 50K eval")
 
                 HStack { Spacer()
                     GhostButton(label: "Cancel") { dismiss() }

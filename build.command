@@ -119,7 +119,7 @@ fi
 [ -f "$SRC/PrivacyInfo.xcprivacy" ] && cp -f "$SRC/PrivacyInfo.xcprivacy" "$APP/Contents/Resources/PrivacyInfo.xcprivacy"
 
 # --- bundle the SELF-CONTAINED data backend (stdlib-only Python; ships NO data) ---
-# The buyer's app starts its bundled Topstep bridge and receives THEIR OWN feed into THEIR OWN
+# The buyer's app starts its bundled browser bridge and receives THEIR OWN feed into THEIR OWN
 # local SQLite store over /webhook/feed. These are code only — the store is created empty at runtime.
 if [ -d "$ROOT/backend" ]; then
   echo "==> Bundling self-contained backend (code only, no data)"
@@ -127,6 +127,31 @@ if [ -d "$ROOT/backend" ]; then
   cp -f "$ROOT/backend"/bltd_*.py "$APP/Contents/Resources/backend/"
   cp -f "$ROOT/backend/launch-backend.sh" "$APP/Contents/Resources/backend/"
   chmod +x "$APP/Contents/Resources/backend/launch-backend.sh"
+
+  RUNTIME_SRC=""
+  if [ -d "$ROOT/vendor/python-runtime" ]; then
+    RUNTIME_SRC="$ROOT/vendor/python-runtime"
+  elif [ -d "/Applications/$APPNAME.app/Contents/Resources/backend/python-runtime" ]; then
+    RUNTIME_SRC="/Applications/$APPNAME.app/Contents/Resources/backend/python-runtime"
+  fi
+  if [ -z "$RUNTIME_SRC" ]; then
+    echo "ABORT: missing bundled backend runtime (expected vendor/python-runtime)."; exit 1
+  fi
+
+  echo "==> Bundling backend runtime"
+  rm -rf "$APP/Contents/Resources/backend/python-runtime"
+  cp -Rf "$RUNTIME_SRC" "$APP/Contents/Resources/backend/python-runtime"
+  cat > "$APP/Contents/Resources/backend/python3" <<'PYSH'
+#!/bin/bash
+set -euo pipefail
+export PYTHONDONTWRITEBYTECODE=1
+DIR="$(cd "$(dirname "$0")" && pwd)"
+if [ -x "$DIR/python-runtime/bin/python3.11" ]; then
+  exec "$DIR/python-runtime/bin/python3.11" "$@"
+fi
+exec "$DIR/python-runtime/bin/python3" "$@"
+PYSH
+  chmod +x "$APP/Contents/Resources/backend/python3"
 fi
 
 # --- adhoc sign with the DEVELOPER-ID entitlements (NO app-sandbox, NO applesignin) ---

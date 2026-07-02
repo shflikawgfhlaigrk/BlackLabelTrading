@@ -23,6 +23,12 @@
 		990B5D35F132390ABD3D239E /* ChartRender.swift in Sources */ = {isa = PBXBuildFile; fileRef = 827AF4899FFC1715688443FC /* ChartRender.swift */; };
 		994EAB02CA9EBD40DCB91BCB /* Charting.swift in Sources */ = {isa = PBXBuildFile; fileRef = 46AAF0E56B1CCCACF1020C9D /* Charting.swift */; };
 		99C1D0E083569E20A2795B08 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 5FBF9178ADF66A2A2A0BCCD6 /* Assets.xcassets */; };
+		7ADE22222222222222222222 /* TradeMath.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7ADE11111111111111111111 /* TradeMath.swift */; };
+		7ADE88888888888888888888 /* EngineFireMarkers.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7ADE33333333333333333333 /* EngineFireMarkers.swift */; };
+		7ADE99999999999999999999 /* Execution.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7ADE44444444444444444444 /* Execution.swift */; };
+		7ADEAAAAAAAAAAAAAAAAAAAA /* SignalCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7ADE55555555555555555555 /* SignalCore.swift */; };
+		7ADEBBBBBBBBBBBBBBBBBBBB /* Updater.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7ADE66666666666666666666 /* Updater.swift */; };
+		7ADECCCCCCCCCCCCCCCCCCCC /* UpdaterUI.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7ADE77777777777777777777 /* UpdaterUI.swift */; };
 		A8CB129546FCF3F06250A9E2 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = E11C506535021004EA73DFCF /* PrivacyInfo.xcprivacy */; };
 		ADDA9FA65998E23C0E6C9679 /* FeedTypes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2331344C8E29E9A66C4E38BE /* FeedTypes.swift */; };
 		AEBDD9CF301FBF8E35FF2CA4 /* Auth.swift in Sources */ = {isa = PBXBuildFile; fileRef = E15B1B8D78A6C53363EB2F28 /* Auth.swift */; };
@@ -53,6 +59,12 @@
 		6015624E48F9D74B2A5B3B4F /* Replay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Replay.swift; sourceTree = "<group>"; };
 		703D257329BFEBC3BB61D473 /* BacktestDepth.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BacktestDepth.swift; sourceTree = "<group>"; };
 		718382BE5082225565ACABFD /* FeedClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FeedClient.swift; sourceTree = "<group>"; };
+		7ADE11111111111111111111 /* TradeMath.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TradeMath.swift; sourceTree = "<group>"; };
+		7ADE33333333333333333333 /* EngineFireMarkers.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EngineFireMarkers.swift; sourceTree = "<group>"; };
+		7ADE44444444444444444444 /* Execution.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Execution.swift; sourceTree = "<group>"; };
+		7ADE55555555555555555555 /* SignalCore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SignalCore.swift; sourceTree = "<group>"; };
+		7ADE66666666666666666666 /* Updater.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Updater.swift; sourceTree = "<group>"; };
+		7ADE77777777777777777777 /* UpdaterUI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UpdaterUI.swift; sourceTree = "<group>"; };
 		78C6DDE65B37B25CB1501334 /* ThemeStudio.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThemeStudio.swift; sourceTree = "<group>"; };
 		7BDF25ED1D2F0125E21ED699 /* app-release.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = "app-release.entitlements"; sourceTree = "<group>"; };
 		7CF7A460CCFFAE3CB33459EB /* WatchlistModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchlistModel.swift; sourceTree = "<group>"; };
@@ -112,6 +124,8 @@
 				46AAF0E56B1CCCACF1020C9D /* Charting.swift */,
 				827AF4899FFC1715688443FC /* ChartRender.swift */,
 				7D512CC7165368D316467D73 /* ChartScreen.swift */,
+				7ADE33333333333333333333 /* EngineFireMarkers.swift */,
+				7ADE44444444444444444444 /* Execution.swift */,
 				718382BE5082225565ACABFD /* FeedClient.swift */,
 				2FC6755E2B86EF357E50DF7F /* Feeds.swift */,
 				2331344C8E29E9A66C4E38BE /* FeedTypes.swift */,
@@ -130,9 +144,13 @@
 				935D0E8F9859AD143DA19E06 /* Screens.swift */,
 				A55E16D25AFAAF57F5361C1C /* Screens2.swift */,
 				D46141BBA2686F96A5394950 /* Screens3.swift */,
+				7ADE55555555555555555555 /* SignalCore.swift */,
 				FCAB20BE28B9A7AD4C47ED8C /* StrategyBuilder.swift */,
 				AE8B21C4218C00C783C412CA /* Theme.swift */,
 				78C6DDE65B37B25CB1501334 /* ThemeStudio.swift */,
+				7ADE11111111111111111111 /* TradeMath.swift */,
+				7ADE66666666666666666666 /* Updater.swift */,
+				7ADE77777777777777777777 /* UpdaterUI.swift */,
 				7CF7A460CCFFAE3CB33459EB /* WatchlistModel.swift */,
 			);
 			path = Sources;
@@ -241,6 +259,8 @@
 				990B5D35F132390ABD3D239E /* ChartRender.swift in Sources */,
 				8F20F83390333992E64E207B /* ChartScreen.swift in Sources */,
 				994EAB02CA9EBD40DCB91BCB /* Charting.swift in Sources */,
+				7ADE88888888888888888888 /* EngineFireMarkers.swift in Sources */,
+				7ADE99999999999999999999 /* Execution.swift in Sources */,
 				EC908E8D891C25C26393C731 /* FeedClient.swift in Sources */,
 				ADDA9FA65998E23C0E6C9679 /* FeedTypes.swift in Sources */,
 				E3CA5F329149EE550F6B8911 /* Feeds.swift in Sources */,
@@ -256,9 +276,13 @@
 				219E3F143CB07B93E1DDC61B /* Screens.swift in Sources */,
 				4054B7DAA2A73A4C68973F2E /* Screens2.swift in Sources */,
 				D13F8830C47BEB7AF96F0501 /* Screens3.swift in Sources */,
+				7ADEAAAAAAAAAAAAAAAAAAAA /* SignalCore.swift in Sources */,
 				830A87745E00F2E452D60B30 /* StrategyBuilder.swift in Sources */,
 				F8804438B07CBA80083D47E2 /* Theme.swift in Sources */,
 				6ED4C223A69E78BE8AF73EAD /* ThemeStudio.swift in Sources */,
+				7ADE22222222222222222222 /* TradeMath.swift in Sources */,
+				7ADEBBBBBBBBBBBBBBBBBBBB /* Updater.swift in Sources */,
+				7ADECCCCCCCCCCCCCCCCCCCC /* UpdaterUI.swift in Sources */,
 				90707A44A07E7B9AFDB19C9A /* WatchlistModel.swift in Sources */,
 				053E5E40827EAB629A3E5B5D /* main.swift in Sources */,
 			);

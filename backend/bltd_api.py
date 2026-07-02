@@ -126,6 +126,7 @@ _FEED_MANAGER = None
 _FEED_LOCK = threading.Lock()
 _WEBHOOK_CAPTURE = None
 _WEBHOOK_LOCK = threading.Lock()
+_LAST_WEBHOOK_SOURCE = None
 
 
 def feed_manager():
@@ -160,7 +161,7 @@ def _webhook_capture():
 #                         and report whether ANY logged-in feed page is reachable on CDP.
 #   GET  /api/capture  -> live capture status (chrome up? any trading page logged in? feed flowing?)
 #                         so the UI reflects REAL capture state, never a fabricated "connected".
-def _connect() -> dict:
+def _connect(body=None) -> dict:
     """Launch/open the product-owned debug Chrome on browser trading-platform sign-ins.
 
     This is the no-API prop-account path: the buyer logs into the platform website, and the capture
@@ -168,6 +169,7 @@ def _connect() -> dict:
     connected when no logged-in feed page is present."""
     try:
         import bltd_capture as cap
+        source = cap.normalize_browser_source((body or {}).get("source") if isinstance(body, dict) else None)
         # RC4: browser capture needs a Chromium browser. If none is installed, don't loop silently —
         # surface an honest prerequisite the app shows instead of a fabricated "connected".
         chrome_ok = cap.chrome_present()
@@ -178,13 +180,13 @@ def _connect() -> dict:
                     "chromeDetail": "Black Label Trading reads the live data feeding your platform's "
                                     "charts through a Chromium browser. Install Google Chrome (or "
                                     "Chromium, Brave, or Edge), then reopen and connect your platform.",
-                    "cdpReachable": False, "feedAvailable": False, "feedPages": [],
+                    "source": source, "cdpReachable": False, "feedAvailable": False, "feedPages": [],
                     "cdpPort": cap.CDP_PORT}
-        already = cap.feeds_available()
+        already = bool(cap.discover_feed_pages(source))
         if not already:
-            cap.open_feed_login_tabs()
-        pages = cap.discover_feed_pages()
-        return {"ok": True, "chromePresent": True, "launched": not already,
+            cap.open_feed_login_tabs(source)
+        pages = cap.discover_feed_pages(source)
+        return {"ok": True, "source": source, "chromePresent": True, "launched": not already,
                 "cdpReachable": cap.cdp_reachable(), "feedAvailable": bool(pages),
                 "feedPages": [name for name, _ in pages], "cdpPort": cap.CDP_PORT}
     except Exception as exc:  # noqa: BLE001
@@ -206,19 +208,20 @@ def _capture_status() -> dict:
         pass
     syms = STORE.symbols()
     feed_live = STORE.meta().get("feedLive", False)
-    source = browser_source
-    source_state = "browser" if browser_source else None
     webhook_recent = bool(syms.get("liveTicks") or syms.get("live"))
-    if not source and webhook_recent:
-        source = "webhook"
+    if webhook_recent:
+        source = _LAST_WEBHOOK_SOURCE or "webhook"
         source_state = "webhook"
         feed = True
         feed_live = bool(feed_live or syms.get("liveTicks"))
+    else:
+        source = browser_source
+        source_state = "browser" if browser_source else None
     # Fold in a connected managed feed if one exists; no broker/API feed is surfaced.
     # feedAvailable/feedLive are about whether REAL ticks can/are flowing, not which source produced
     # them. Only reads an already-created manager (never spins one up on a poll).
     mgr = _feed_manager_if_exists()
-    if mgr is not None:
+    if mgr is not None and not webhook_recent:
         try:
             fs = mgr.status()
             source, source_state = fs.get("source"), fs.get("state")
@@ -330,7 +333,9 @@ def _webhook_ingest(body: dict) -> dict:
     """
     import bltd_feeds
 
+    global _LAST_WEBHOOK_SOURCE
     cap = _webhook_capture()
+    _LAST_WEBHOOK_SOURCE = "webhook"
     bar_rows = {}
     ticks = 0
     bars = 0
@@ -339,16 +344,27 @@ def _webhook_ingest(body: dict) -> dict:
     for raw, default_symbol, bucket in _iter_webhook_items(body):
         item = _webhook_item_dict(raw, default_symbol)
         symbol = _webhook_symbol(item, default_symbol)
+        raw_source = item.get("source") if isinstance(item, dict) else None
+        if isinstance(raw_source, str) and raw_source.strip():
+            _LAST_WEBHOOK_SOURCE = raw_source.strip()
         close = (item.get("close", item.get("c", item.get("price", item.get("last"))))
                  if isinstance(item, dict) else None)
         epoch = _webhook_epoch(item.get("epoch", item.get("ts", item.get("timestamp", item.get("time"))))
                                if isinstance(item, dict) else None)
+        volume = item.get("volume", item.get("vol", item.get("v"))) if isinstance(item, dict) else None
+        delta = item.get("delta", item.get("d", item.get("orderFlowDelta"))) if isinstance(item, dict) else None
         cd = bltd_feeds.make_candle(symbol, close, open=item.get("open", item.get("o")),
                                     high=item.get("high", item.get("h")),
-                                    low=item.get("low", item.get("l")), epoch=epoch)
+                                    low=item.get("low", item.get("l")), epoch=epoch,
+                                    volume=volume, delta=delta)
         if not cd:
             rejected += 1
             continue
+        prev_close = getattr(cap, "last_close", {}).get(cd["symbol"])
+        vol = float(cd.get("volume") or 0.0)
+        dlt = float(cd.get("delta") or 0.0)
+        if vol > 0 and dlt == 0.0 and prev_close is not None and cd["close"] != prev_close:
+            cd["delta"] = vol if cd["close"] > prev_close else -vol
         symbols.add(cd["symbol"])
         cap.on_candle(cd, arrival=epoch)
         ticks += 1
@@ -362,7 +378,8 @@ def _webhook_ingest(body: dict) -> dict:
             o = c if o is None else o
             h = max(v for v in (c, o, h) if v is not None)
             l = min(v for v in (c, o, l) if v is not None)
-            bar_rows.setdefault(cd["symbol"], []).append((epoch, o, h, l, c))
+            bar_rows.setdefault(cd["symbol"], []).append(
+                (epoch, o, h, l, c, cd.get("volume", 0.0), cd.get("delta", 0.0)))
             bars += 1
     cap.flush()
     stored_bars = STORE.record_bars_batch(bar_rows) if bar_rows else 0
@@ -549,7 +566,7 @@ class H(BaseHTTPRequestHandler):
         if u.path == "/api/connect":
             if not self._authed():
                 return self._send(401, {"error": "unauthorized"})
-            return self._send(200, _connect())
+            return self._send(200, _connect(body if isinstance(body, dict) else {}))
         if u.path == "/api/feed/connect":
             if not self._authed():
                 return self._send(401, {"error": "unauthorized"})
