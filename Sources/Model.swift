@@ -430,38 +430,27 @@ struct WealthChartsAccount: Codable, Equatable {
 enum WCKeychain {
     private static let service = "com.blacklabel.trading.wealthcharts"
 
-    static func setSecret(_ secret: String, account: String) {
-        let acct = account.isEmpty ? "_default" : account
-        delete(account: acct)
-        guard !secret.isEmpty else { return }
-        let q: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: acct,
-            kSecValueData as String: Data(secret.utf8),
-            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly
-        ]
-        SecItemAdd(q as CFDictionary, nil)
-    }
-    static func hasSecret(account: String) -> Bool {
-        let acct = account.isEmpty ? "_default" : account
-        let q: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: acct,
-            kSecReturnData as String: false,
-            kSecMatchLimit as String: kSecMatchLimitOne
-        ]
-        return SecItemCopyMatching(q as CFDictionary, nil) == errSecSuccess
-    }
-    static func delete(account: String) {
-        let acct = account.isEmpty ? "_default" : account
-        let q: [String: Any] = [
+    // Base query (class + service + account) — TradingKeychain adds storage-location/return keys.
+    private static func base(_ acct: String) -> [String: Any] {
+        [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: acct
         ]
-        SecItemDelete(q as CFDictionary)
+    }
+    static func setSecret(_ secret: String, account: String) {
+        let acct = account.isEmpty ? "_default" : account
+        delete(account: acct)
+        guard !secret.isEmpty else { return }
+        TradingKeychain.set(base(acct), data: Data(secret.utf8))
+    }
+    static func hasSecret(account: String) -> Bool {
+        let acct = account.isEmpty ? "_default" : account
+        return TradingKeychain.copy(base(acct)) != nil
+    }
+    static func delete(account: String) {
+        let acct = account.isEmpty ? "_default" : account
+        TradingKeychain.delete(base(acct))
     }
 }
 

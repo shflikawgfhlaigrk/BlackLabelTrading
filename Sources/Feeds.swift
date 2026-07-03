@@ -156,31 +156,24 @@ enum FeedCredStore {
     private static let service = "com.blacklabel.trading.feedcreds"
     static let lastSourceKey = "com.blacklabel.trading.feed.lastSource"
 
+    // Base query (class + service + account) — TradingKeychain adds storage-location/return keys.
+    private static func base(_ source: String) -> [String: Any] {
+        [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: source
+        ]
+    }
+
     static func save(source: String, creds: [String: String]) {
         delete(source: source)
         guard let data = try? JSONSerialization.data(withJSONObject: creds) else { return }
-        let q: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: source,
-            kSecValueData as String: data,
-            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly
-        ]
-        SecItemAdd(q as CFDictionary, nil)
+        TradingKeychain.set(base(source), data: data)
         UserDefaults.standard.set(source, forKey: lastSourceKey)
     }
 
     static func load(source: String) -> [String: String] {
-        let q: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: source,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne
-        ]
-        var out: AnyObject?
-        guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess,
-              let data = out as? Data,
+        guard let data = TradingKeychain.copy(base(source)),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: String] else { return [:] }
         return obj
     }
@@ -188,12 +181,7 @@ enum FeedCredStore {
     static func hasCreds(source: String) -> Bool { !load(source: source).isEmpty }
 
     static func delete(source: String) {
-        let q: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: source
-        ]
-        SecItemDelete(q as CFDictionary)
+        TradingKeychain.delete(base(source))
     }
 
     static var lastSource: String? { UserDefaults.standard.string(forKey: lastSourceKey) }
