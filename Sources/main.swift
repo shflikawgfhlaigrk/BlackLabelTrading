@@ -196,15 +196,12 @@ struct RootView: View {
             .onAppear { NotificationCenterBridge.configure(alerts) }
             // On sign-in, hand the buyer's session email to the own backend so the live feed
             // banner reflects REAL webhook state (never a fabricated "connected").
-            .onChange(of: session.signedIn) { signedIn in
-                // On sign-in: hand the session email to the own backend, then refresh the no-creds
-                // webhook state. The sender posts data; no broker API key is replayed.
-                if signedIn {
-                    Task {
-                        await feed.connect(email: session.email)
-                        await FeedReconnect.reconnectSaved(feed)
-                    }
-                }
+            .task(id: session.signedIn ? session.email : "") {
+                // Runs both for a fresh sign-in and for an already-signed-in restored session.
+                // The backend is the product-owned localhost store/webhook; no broker API key is replayed.
+                guard session.signedIn else { return }
+                await feed.connect(email: session.email)
+                await FeedReconnect.reconnectSaved(feed)
             }
     }
 }
@@ -229,7 +226,15 @@ struct KeyCatcher: NSViewRepresentable {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var window: NSWindow!
     func applicationDidFinishLaunching(_ n: Notification) {
+        NSApp.setActivationPolicy(.regular)
         if let img = BLTheme.icon() { NSApp.applicationIconImage = img }
+        if ProcessInfo.processInfo.environment["BLT_FEED_SMOKE"] == "1" {
+            Task {
+                await runFeedSmoke()
+                NSApp.terminate(nil)
+            }
+            return
+        }
         // Height 860 so the login panel (logo + title + social + email/pw + guest, ~760pt tall)
         // fits fully WITHOUT the bottom "Continue as guest" control spilling past the window's
         // hittable bounds (the dead-button bug). The AuthView also wraps the panel in a ScrollView
@@ -249,7 +254,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
-        NSApp.setActivationPolicy(.regular); NSApp.activate(ignoringOtherApps: true)
+        window.orderFrontRegardless()
         installMainMenu()   // App + Edit menu: "Check for Updates…" + Cut/Copy/Paste/Select-All
         // Auto-update: silent daily check on the Dev-ID build (no-ops on adhoc — the manifest just
         // describes a build the user already has). Only surfaces UI if an update is actually
@@ -287,6 +292,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         edit.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
         editItem.submenu = edit
         NSApp.mainMenu = main
+    }
+
+    /// Installed-app proof for the human feed-connection path. Starts the product-owned localhost
+    /// backend, signs into that local API, prints observed capture/store state, and exits. It never
+    /// opens broker execution or sends broker credentials.
+    @MainActor
+    private func runFeedSmoke() async {
+        let feed = FeedClient()
+        await feed.connect(email: "local@blacklabel")
+        smoke("BLT_FEED_SMOKE|build=\(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown")|backend=\(feed.baseURL)")
+        smoke("feed|state=\(feed.state.label)|source=\(feed.capture.sourceLabel)|feed_available=\(feed.capture.feedAvailable)|feed_live=\(feed.capture.feedLive)|ticks=\(feed.capture.liveTicks.joined(separator: ","))")
+        smoke("symbols|picker_count=\(feed.symbols.pickerList.count)|live=\(feed.symbols.live.joined(separator: ","))|ticks=\(feed.symbols.liveTicks.joined(separator: ","))|busiest=\(feed.symbols.busiest ?? "none")")
+        if let status = await feed.feedStatus() {
+            smoke("feed_status|state=\(status.state)|source=\(status.source ?? "none")|symbol=\(status.symbol ?? "none")|last_tick_age=\(status.lastTickAge.map { String(Int($0.rounded())) } ?? "none")|detail=\(smokeSafe(status.detail))")
+        }
+        if let webhook = await feed.webhookInfo() {
+            smoke("webhook|endpoint=\(smokeSafe(webhook.endpoint))|token=\(webhook.token.isEmpty ? "missing" : "set")|example=\(smokeSafe(webhook.example))")
+        }
+        let selected = feed.symbols.liveTicks.first ?? feed.symbols.live.first ?? feed.symbols.busiest ?? feed.symbols.pickerList.first ?? ""
+        if !selected.isEmpty {
+            let bars = await feed.recentBars(symbol: selected, limit: 5)
+            let newest = bars.last
+            let age = newest.map { Int(Date().timeIntervalSince($0.date).rounded()) }
+            let tick = await feed.liveTick(symbol: selected)
+            smoke("history|symbol=\(selected)|recent_bars=\(bars.count)|newest_bar_age=\(age.map(String.init) ?? "none")|fresh_tick=\(tick == nil ? "none" : String(tick!.price))")
+        } else {
+            smoke("history|symbol=none|recent_bars=0|newest_bar_age=none|fresh_tick=none")
+        }
+        if let prereq = feed.prereq {
+            smoke("prereq|reason=\(smokeSafe(prereq.reason))|fix=\(smokeSafe(prereq.fix))|detail=\(smokeSafe(prereq.detail))")
+        }
+        if let error = feed.lastError {
+            smoke("error|\(smokeSafe(error))")
+        }
+    }
+
+    private func smoke(_ line: String) {
+        FileHandle.standardOutput.write((line + "\n").data(using: .utf8)!)
+    }
+    private func smokeSafe(_ s: String) -> String {
+        s.replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+            .replacingOccurrences(of: "|", with: "/")
     }
 }
 

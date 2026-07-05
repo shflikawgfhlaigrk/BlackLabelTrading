@@ -88,31 +88,66 @@ export BLTD_WEBHOOK_URL="${BLTD_WEBHOOK_URL:-http://127.0.0.1:$BLTD_PORT/webhook
 # daemon are SEPARATE processes bridged ONLY by the shared store ($BLTD_STORE, exported above). We
   # keep it alive, but disable its direct browser readers so the bundled browser bridge is the single
 # sender path into /webhook/feed.
-supervise_capture() {
-  local SPID="$SUPPORT/capture-supervisor.pid" CLOG="$SUPPORT/capture.log"
-  # one supervisor only: if the recorded pid is still alive, do nothing.
-  if [ -f "$SPID" ] && kill -0 "$(cat "$SPID" 2>/dev/null)" 2>/dev/null; then return; fi
+supervisor_running() {
+  local SPID="$1" NAME="$2" PID CMD
+  PID="$(cat "$SPID" 2>/dev/null || true)"
+  [ -n "$PID" ] || return 1
+  CMD="$(ps -p "$PID" -o command= 2>/dev/null || true)"
+  [ -n "$CMD" ] || return 1
+  if [[ "$CMD" == *"bltd-supervisor-v2:$NAME"* ]]; then return 0; fi
+  # Upgrade cleanup: older launchers used unmarked pgrep-based supervisors whose command line
+  # included the full helper command. Stop that wrapper tree so the pid-file supervisor below owns
+  # exactly one real child and never exposes the webhook token in `ps`.
+  pkill -TERM -P "$PID" 2>/dev/null || true
+  kill "$PID" 2>/dev/null || true
+  rm -f "$SPID"
+  return 1
+}
+
+start_supervisor() {
+  local NAME="$1" SCRIPT="$2" SPID="$3" CPID="$4" CLOG="$5" MODE="$6"
+  if supervisor_running "$SPID" "$NAME"; then return; fi
   nohup bash -c '
+    set -u
+    PY_BIN="$1"; SCRIPT="$2"; CLOG="$3"; CPID="$4"; MODE="$5"
+    child_running() {
+      local PID CMD
+      PID="$(cat "$CPID" 2>/dev/null || true)"
+      [ -n "$PID" ] || return 1
+      CMD="$(ps -p "$PID" -o command= 2>/dev/null || true)"
+      [ -n "$CMD" ] && [[ "$CMD" == *"$SCRIPT"* && "$CMD" == *python* && "$CMD" != *"bltd-supervisor"* ]]
+    }
+    find_existing_child() {
+      ps -axo pid=,command= | awk -v script="$SCRIPT" \
+        "index(\$0, script) && index(\$0, \"python\") && index(\$0, \"bltd-supervisor\") == 0 && index(\$0, \"bash -c\") == 0 { print \$1; exit }"
+    }
     while true; do
-      pgrep -f "bltd_capture.py" >/dev/null 2>&1 || \
-        BLTD_AUTO_BROWSER="0" BLTD_CAPTURE_BROWSER="0" "'"$PY"'" "'"$HERE"'/bltd_capture.py" >>"'"$CLOG"'" 2>&1 &
+      if ! child_running; then
+        EXISTING="$(find_existing_child || true)"
+        if [ -n "$EXISTING" ]; then
+          echo "$EXISTING" > "$CPID"
+        elif [ "$MODE" = "capture" ]; then
+          BLTD_AUTO_BROWSER="0" BLTD_CAPTURE_BROWSER="0" "$PY_BIN" "$SCRIPT" >>"$CLOG" 2>&1 &
+          echo $! > "$CPID"
+        else
+          "$PY_BIN" "$SCRIPT" >>"$CLOG" 2>&1 &
+          echo $! > "$CPID"
+        fi
+      fi
       sleep 20
     done
-  ' >/dev/null 2>&1 &
+  ' "bltd-supervisor-v2:$NAME" "$PY" "$SCRIPT" "$CLOG" "$CPID" "$MODE" >/dev/null 2>&1 &
   echo $! > "$SPID"
 }
 
+supervise_capture() {
+  start_supervisor "capture" "$HERE/bltd_capture.py" \
+    "$SUPPORT/capture-supervisor.pid" "$SUPPORT/capture.pid" "$SUPPORT/capture.log" "capture"
+}
+
 supervise_topstep_bridge() {
-  local SPID="$SUPPORT/topstep-bridge-supervisor.pid" CLOG="$SUPPORT/topstep-bridge.log"
-  if [ -f "$SPID" ] && kill -0 "$(cat "$SPID" 2>/dev/null)" 2>/dev/null; then return; fi
-  nohup bash -c '
-    while true; do
-      pgrep -f "bltd_topstep_bridge.py" >/dev/null 2>&1 || \
-        BLTD_TOKEN="'"$BLTD_TOKEN"'" BLTD_WEBHOOK_URL="'"$BLTD_WEBHOOK_URL"'" BLTD_PORT="'"$BLTD_PORT"'" "'"$PY"'" "'"$HERE"'/bltd_topstep_bridge.py" >>"'"$CLOG"'" 2>&1 &
-      sleep 20
-    done
-  ' >/dev/null 2>&1 &
-  echo $! > "$SPID"
+  start_supervisor "topstep-bridge" "$HERE/bltd_topstep_bridge.py" \
+    "$SUPPORT/topstep-bridge-supervisor.pid" "$SUPPORT/topstep-bridge.pid" "$SUPPORT/topstep-bridge.log" "topstep-bridge"
 }
 
 supervise_capture

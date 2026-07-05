@@ -22,7 +22,7 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 python3 - <<'PY'
-import json, os, re, struct, sys
+import json, os, re, struct, subprocess, sys
 
 ROOT = os.getcwd()
 passed = 0
@@ -156,9 +156,18 @@ try:
 except OSError as e:
     launch = ""
     check("backend launcher readable", False, str(e))
+try:
+    syntax = subprocess.run(["bash", "-n", launcher], capture_output=True, text=True)
+    check("backend launcher shell syntax", syntax.returncode == 0, syntax.stderr.strip())
+except OSError as e:
+    check("backend launcher shell syntax", False, str(e))
 check(
     "backend launcher defaults to WealthCharts-wide scope",
     'export BLTD_SCOPE="${BLTD_SCOPE:-all}"' in launch,
+)
+check(
+    "backend launcher uses versioned pid-file supervisors",
+    "bltd-supervisor-v2" in launch and "pgrep -f \"bltd_capture.py\"" not in launch,
 )
 check(
     "backend launcher does not force ES-only scope",

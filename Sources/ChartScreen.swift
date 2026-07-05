@@ -700,16 +700,19 @@ struct ChartScreen: View {
 // nothing (so a static dot stays static — no fake "live" animation when the feed is off).
 struct LivePulse: ViewModifier {
     let active: Bool
-    @State private var on = false
     @Environment(\.blMotion) private var motion   // pause the pulse when app is backgrounded
     func body(content: Content) -> some View {
         content.background(
             Group {
                 if active && motion {
-                    Circle().stroke(BLTheme.green, lineWidth: 1.5)
-                        .scaleEffect(on ? 2.4 : 1).opacity(on ? 0 : 0.7)
-                        .onAppear { withAnimation(.easeOut(duration: 1.6).repeatForever(autoreverses: false)) { on = true } }
-                        .onDisappear { on = false }
+                    // Expanding ring driven by a pausable TimelineView — wall-clock sawtooth with an
+                    // ease-out, replacing the uncancelable repeatForever loop (20fps is smooth here).
+                    TimelineView(.animation(minimumInterval: 1.0 / 20.0, paused: !(active && motion))) { tl in
+                        let p = FXClock.loop(tl.date, 1.6)
+                        let e = 1 - pow(1 - p, 2)   // easeOut, matching the old curve's feel
+                        Circle().stroke(BLTheme.green, lineWidth: 1.5)
+                            .scaleEffect(1 + 1.4 * e).opacity(0.7 * (1 - e))
+                    }
                 }
             }
         )

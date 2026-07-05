@@ -71,6 +71,30 @@ extension EnvironmentValues {
     }
 }
 
+// MARK: - FXClock  (wall-clock phases for TimelineView-driven FX loops)
+// Every continuous FX loop is driven by a pausable TimelineView computing its phase from the
+// wall clock — NEVER by `withAnimation(.repeatForever)` on @State. A running repeatForever
+// cannot be cancelled: re-assigning the value (plainly or via a zero-duration withAnimation)
+// leaves the animation attached, and the layer keeps re-rasterizing every frame even when the
+// rendered output is frozen (measured 2026-07-03: ~40% CPU while DEACTIVATED, conic border
+// stroke hot in the sample). A TimelineView with `paused: true` provably stops ticking (0.0%).
+// Wall-clock phases also mean no per-view start bookkeeping — loops stay in step for free.
+enum FXClock {
+    /// 0→1 sawtooth with the given period (seconds).
+    static func loop(_ date: Date, _ period: Double) -> Double {
+        let per = max(0.001, period)
+        let p = date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: per) / per
+        return p < 0 ? p + 1 : p
+    }
+    /// 0→1→0 triangle, `period` seconds each way (the old autoreverse loops).
+    static func pingPong(_ date: Date, _ period: Double) -> Double {
+        let p = loop(date, period * 2)
+        return p < 0.5 ? p * 2 : 2 - p * 2
+    }
+    /// Standard easeInOut, matching the feel of the old .easeInOut sweep loops.
+    static func easeInOut(_ p: Double) -> Double { p < 0.5 ? 2 * p * p : 1 - pow(-2 * p + 2, 2) / 2 }
+}
+
 // MARK: - Live theme controller  (observable; persists to HoloThemeStore)
 // Injected at the root; the Theme Studio mutates `theme`, which re-renders the whole app instantly.
 final class HoloThemeController: ObservableObject {
@@ -238,8 +262,6 @@ struct HoloCard: ViewModifier {
     var sweep: Bool
     @Environment(\.blMotion) private var motion
     @Environment(\.holoTheme) private var theme
-    @State private var phase: CGFloat = 0          // animated border rotation phase
-    @State private var sweepX: CGFloat = -1.0
     @State private var hover = false
     @State private var local: CGPoint = .init(x: 0.5, y: 0.5)   // cursor position within card (0…1)
     @State private var size: CGSize = .zero
@@ -265,25 +287,32 @@ struct HoloCard: ViewModifier {
                 }
             )
             .clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
-            // Diagonal sheen sweep.
+            // Diagonal sheen sweep (pausable TimelineView — wall-clock phase, no repeatForever).
             .overlay {
                 if sweep && fx > 0 {
-                    GeometryReader { geo in
-                        LinearGradient(colors: [.clear, theme.accentHi.opacity(0.0), theme.accentHi.opacity(0.5 * fx), Color.white.opacity(0.3 * fx), theme.accentHi.opacity(0.0), .clear],
-                                       startPoint: .leading, endPoint: .trailing)
-                            .frame(width: geo.size.width * 0.5)
-                            .offset(x: sweepX * geo.size.width * 1.5)
-                            .blendMode(.screen).allowsHitTesting(false)
+                    TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: !live)) { tl in
+                        let sx = live ? -1.0 + 3.0 * FXClock.easeInOut(FXClock.loop(tl.date, 7 / max(0.3, theme.motion.speed))) : 2.0
+                        GeometryReader { geo in
+                            LinearGradient(colors: [.clear, theme.accentHi.opacity(0.0), theme.accentHi.opacity(0.5 * fx), Color.white.opacity(0.3 * fx), theme.accentHi.opacity(0.0), .clear],
+                                           startPoint: .leading, endPoint: .trailing)
+                                .frame(width: geo.size.width * 0.5)
+                                .offset(x: sx * geo.size.width * 1.5)
+                                .blendMode(.screen).allowsHitTesting(false)
+                        }
+                        .clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
                     }
-                    .clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
+                    .allowsHitTesting(false)
                 }
             }
             // Iridescent animated border (rotating AngularGradient) — or static gold when motion off.
             // Decorative rim — never hit-testable so the card's content/buttons stay clickable.
             .overlay(
-                RoundedRectangle(cornerRadius: radius, style: .continuous)
-                    .strokeBorder(borderStyle(live: live), lineWidth: 1)
-                    .allowsHitTesting(false)
+                TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: !live || fx <= 0)) { tl in
+                    let a = live && fx > 0 ? 360 * FXClock.loop(tl.date, 18 / max(0.3, theme.motion.speed)) : 90
+                    RoundedRectangle(cornerRadius: radius, style: .continuous)
+                        .strokeBorder(borderStyle(angle: .degrees(a)), lineWidth: 1)
+                }
+                .allowsHitTesting(false)
             )
             // Inner top highlight (subtle glass edge).
             .overlay(
@@ -316,26 +345,10 @@ struct HoloCard: ViewModifier {
                     withAnimation(.spring(response: 0.4, dampingFraction: 0.7)) { hover = false; local = CGPoint(x: 0.5, y: 0.5) }
                 }
             }
-            .onAppear {
-                guard live else { self.phase = 0.5; sweepX = 2; return }
-                let sp = theme.motion.speed
-                withAnimation(.linear(duration: 18 / max(0.3, sp)).repeatForever(autoreverses: false)) { phase = 1 }
-                if sweep { withAnimation(.easeInOut(duration: 7 / max(0.3, sp)).repeatForever(autoreverses: false).delay(1.2)) { sweepX = 2 } }
-            }
-            // Backgrounded app: PLAIN assignment cancels the repeatForever loops (idle CPU → ~0);
-            // foregrounding restarts them exactly like onAppear.
-            .onChange(of: motion) { on in
-                phase = 0.5; sweepX = 2
-                guard on && theme.motion.speed > 0 else { return }
-                phase = 0; if sweep { sweepX = -1 }
-                let sp = theme.motion.speed
-                withAnimation(.linear(duration: 18 / max(0.3, sp)).repeatForever(autoreverses: false)) { phase = 1 }
-                if sweep { withAnimation(.easeInOut(duration: 7 / max(0.3, sp)).repeatForever(autoreverses: false).delay(1.2)) { sweepX = 2 } }
-            }
     }
-    private func borderStyle(live: Bool) -> AnyShapeStyle {
+    private func borderStyle(angle: Angle) -> AnyShapeStyle {
         if fx <= 0 { return AnyShapeStyle(LinearGradient(colors: [theme.accent.opacity(0.28), BL.hair2.opacity(0.7)], startPoint: .top, endPoint: .bottom)) }
-        let a = Angle.degrees(live ? phase * 360 : 90)
+        let a = angle
         return AnyShapeStyle(AngularGradient(
             colors: [theme.accent.opacity(0.5 * fx), theme.iridescent.opacity(0.45 * fx), theme.accentHi.opacity(0.55 * fx),
                      theme.accentDim.opacity(0.35 * fx), theme.accent.opacity(0.5 * fx)],
@@ -354,31 +367,24 @@ struct HoloSheen: ViewModifier {
     var angle: Double
     @Environment(\.blMotion) private var motion
     @Environment(\.holoTheme) private var theme
-    @State private var x: CGFloat = -1.2
     func body(content: Content) -> some View {
         let fx = theme.fxScale
+        let live = motion && theme.motion.speed > 0
         content.overlay {
             if fx > 0 {
-                GeometryReader { geo in
-                    LinearGradient(colors: [.clear, Color.white.opacity(0.0), theme.accentHi.opacity(0.55 * fx), Color.white.opacity(0.35 * fx), theme.iridescent.opacity(0.0), .clear],
-                                   startPoint: .leading, endPoint: .trailing)
-                        .frame(width: geo.size.width * 0.6)
-                        .offset(x: x * geo.size.width * 1.6)
-                        .rotationEffect(.degrees(angle))
-                        .blendMode(.screen).allowsHitTesting(false)
+                TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: !live)) { tl in
+                    let x = live ? -1.2 + 3.2 * FXClock.easeInOut(FXClock.loop(tl.date, 4.5 / max(0.4, theme.motion.speed))) : 2.0
+                    GeometryReader { geo in
+                        LinearGradient(colors: [.clear, Color.white.opacity(0.0), theme.accentHi.opacity(0.55 * fx), Color.white.opacity(0.35 * fx), theme.iridescent.opacity(0.0), .clear],
+                                       startPoint: .leading, endPoint: .trailing)
+                            .frame(width: geo.size.width * 0.6)
+                            .offset(x: x * geo.size.width * 1.6)
+                            .rotationEffect(.degrees(angle))
+                            .blendMode(.screen).allowsHitTesting(false)
+                    }
+                    .mask(content)
                 }
-                .mask(content)
-                .onAppear {
-                    let live = motion && theme.motion.speed > 0
-                    guard live else { x = 2; return }
-                    withAnimation(.easeInOut(duration: 4.5 / max(0.4, theme.motion.speed)).repeatForever(autoreverses: false).delay(0.5)) { x = 2 }
-                }
-                .onChange(of: motion) { on in
-                    x = 2                                       // plain assign cancels the loop
-                    guard on && theme.motion.speed > 0 else { return }
-                    x = -1.2
-                    withAnimation(.easeInOut(duration: 4.5 / max(0.4, theme.motion.speed)).repeatForever(autoreverses: false).delay(0.5)) { x = 2 }
-                }
+                .allowsHitTesting(false)
             }
         }
     }
@@ -399,38 +405,31 @@ struct FoilText: View {
     }
     @Environment(\.blMotion) private var motion
     @Environment(\.holoTheme) private var theme
-    @State private var phase: CGFloat = -1
     private var font: Font { serif ? BLFont.display(size, weight) : BLFont.body(size, weight) }
     var body: some View {
         let fx = theme.fxScale
+        let live = motion && theme.motion.speed > 0 && fx > 0
         let stops = [theme.accentHi, theme.accent, theme.iridescent, theme.accentHi, theme.accent]
         Text(text)
             .font(font)
             .foregroundStyle(LinearGradient(colors: [theme.accentHi, theme.accent, theme.accentDim], startPoint: .top, endPoint: .bottom))
             .overlay(
-                GeometryReader { geo in
-                    LinearGradient(colors: stops, startPoint: .leading, endPoint: .trailing)
-                        .frame(width: geo.size.width * 2.2)
-                        .offset(x: phase * geo.size.width * 1.2)
-                        .opacity(fx)
+                TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: !live)) { tl in
+                    let phase = live ? -1 + 2 * FXClock.pingPong(tl.date, 16 / max(0.4, theme.motion.speed)) : 0
+                    GeometryReader { geo in
+                        LinearGradient(colors: stops, startPoint: .leading, endPoint: .trailing)
+                            .frame(width: geo.size.width * 2.2)
+                            .offset(x: phase * geo.size.width * 1.2)
+                            .opacity(fx)
+                    }
+                    .mask(Text(text).font(font))
                 }
-                .mask(Text(text).font(font))
                 .blendMode(.screen)
+                .allowsHitTesting(false)   // decorative foil sweep must never swallow clicks on a heading
             )
             // LEGIBILITY: only a TIGHT, bounded glow on display headings (<= 6) so edges stay sharp.
             // (Was a soft radius-12 glow that fuzzed even the headline; owner feedback "clear as shit".)
             .shadow(color: theme.accent.opacity(0.22 * theme.glowStrength), radius: theme.headingGlowRadius)
-            .onAppear {
-                let live = motion && theme.motion.speed > 0 && fx > 0
-                guard live else { phase = 0; return }
-                withAnimation(.easeInOut(duration: 16 / max(0.4, theme.motion.speed)).repeatForever(autoreverses: true)) { phase = 1 }
-            }
-            .onChange(of: motion) { on in
-                phase = 0                                       // plain assign cancels the loop
-                guard on && theme.motion.speed > 0 && fx > 0 else { return }
-                phase = -1
-                withAnimation(.easeInOut(duration: 16 / max(0.4, theme.motion.speed)).repeatForever(autoreverses: true)) { phase = 1 }
-            }
             .accessibilityLabel(text)
     }
 }
@@ -514,26 +513,19 @@ struct IridescentBorder: ViewModifier {
     var active: Bool = true
     @Environment(\.blMotion) private var motion
     @Environment(\.holoTheme) private var theme
-    @State private var phase: CGFloat = 0
     func body(content: Content) -> some View {
         let fx = theme.fxScale
+        let live = motion && theme.motion.speed > 0 && active && fx > 0
         content.overlay(
-            RoundedRectangle(cornerRadius: radius, style: .continuous)
-                .strokeBorder(active && fx > 0
-                    ? AnyShapeStyle(AngularGradient(colors: theme.spectrum, center: .center, angle: .degrees(phase * 360)))
-                    : AnyShapeStyle(theme.accent.opacity(active ? 0.5 : 0.0)), lineWidth: lineWidth)
-                .allowsHitTesting(false)   // decorative rim — must never block the CTA it decorates
+            TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: !live)) { tl in
+                let phase = live ? FXClock.loop(tl.date, 6 / max(0.4, theme.motion.speed)) : 0
+                RoundedRectangle(cornerRadius: radius, style: .continuous)
+                    .strokeBorder(active && fx > 0
+                        ? AnyShapeStyle(AngularGradient(colors: theme.spectrum, center: .center, angle: .degrees(phase * 360)))
+                        : AnyShapeStyle(theme.accent.opacity(active ? 0.5 : 0.0)), lineWidth: lineWidth)
+            }
+            .allowsHitTesting(false)   // decorative rim — must never block the CTA it decorates
         )
-        .onAppear {
-            let live = motion && theme.motion.speed > 0 && active && fx > 0
-            guard live else { return }
-            withAnimation(.linear(duration: 6 / max(0.4, theme.motion.speed)).repeatForever(autoreverses: false)) { phase = 1 }
-        }
-        .onChange(of: motion) { on in
-            phase = 0                                           // plain assign cancels the loop
-            guard on && theme.motion.speed > 0 && active && fx > 0 else { return }
-            withAnimation(.linear(duration: 6 / max(0.4, theme.motion.speed)).repeatForever(autoreverses: false)) { phase = 1 }
-        }
     }
 }
 extension View { func iridescentBorder(radius: CGFloat = 12, lineWidth: CGFloat = 1.4, active: Bool = true) -> some View { modifier(IridescentBorder(radius: radius, lineWidth: lineWidth, active: active)) } }
@@ -542,20 +534,15 @@ struct GlowPulse: ViewModifier {
     var color: Color? = nil
     @Environment(\.blMotion) private var motion
     @Environment(\.holoTheme) private var theme
-    @State private var on = false
     func body(content: Content) -> some View {
         let c = color ?? theme.accent
-        content.shadow(color: c.opacity((on ? 0.55 : 0.25) * theme.glowStrength), radius: on ? 18 : 10)
-            .onAppear {
-                let live = motion && theme.motion.speed > 0
-                guard live else { return }
-                withAnimation(.easeInOut(duration: 2.4 / max(0.4, theme.motion.speed)).repeatForever(autoreverses: true)) { on = true }
-            }
-            .onChange(of: motion) { m in
-                on = false                                      // plain assign cancels the loop
-                guard m && theme.motion.speed > 0 else { return }
-                withAnimation(.easeInOut(duration: 2.4 / max(0.4, theme.motion.speed)).repeatForever(autoreverses: true)) { on = true }
-            }
+        let live = motion && theme.motion.speed > 0
+        // Glow breathes at 12fps — the shadow wraps the content, so the timeline is capped low
+        // to keep the per-tick re-render cheap; a 2.4s soft pulse is smooth well below 30fps.
+        TimelineView(.animation(minimumInterval: 1.0 / 12.0, paused: !live)) { tl in
+            let k = live ? FXClock.easeInOut(FXClock.pingPong(tl.date, 2.4 / max(0.4, theme.motion.speed))) : 0
+            content.shadow(color: c.opacity((0.25 + 0.30 * k) * theme.glowStrength), radius: 10 + 8 * k)
+        }
     }
 }
 extension View { func glowPulse(_ color: Color? = nil) -> some View { modifier(GlowPulse(color: color)) } }
@@ -567,31 +554,23 @@ struct HoloShimmerSkeleton: View {
     var radius: CGFloat = 7
     @Environment(\.blMotion) private var motion
     @Environment(\.holoTheme) private var theme
-    @State private var x: CGFloat = -1
     var body: some View {
+        let live = motion && theme.motion.speed > 0
         RoundedRectangle(cornerRadius: radius, style: .continuous)
             .fill(BL.bg2v)
             .frame(width: width, height: height)
             .overlay {
-                GeometryReader { geo in
-                    LinearGradient(colors: [.clear, theme.accent.opacity(0.28), theme.accentHi.opacity(0.4), theme.accent.opacity(0.28), .clear],
-                                   startPoint: .leading, endPoint: .trailing)
-                        .frame(width: geo.size.width * 0.6)
-                        .offset(x: x * geo.size.width * 1.6)
-                        .blendMode(.screen)
+                TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: !live)) { tl in
+                    let x = live ? -1 + 3 * FXClock.loop(tl.date, 1.4 / max(0.4, theme.motion.speed)) : 0.2
+                    GeometryReader { geo in
+                        LinearGradient(colors: [.clear, theme.accent.opacity(0.28), theme.accentHi.opacity(0.4), theme.accent.opacity(0.28), .clear],
+                                       startPoint: .leading, endPoint: .trailing)
+                            .frame(width: geo.size.width * 0.6)
+                            .offset(x: x * geo.size.width * 1.6)
+                            .blendMode(.screen)
+                    }
+                    .clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
                 }
-                .clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
-            }
-            .onAppear {
-                let live = motion && theme.motion.speed > 0
-                guard live else { x = 0.2; return }
-                withAnimation(.linear(duration: 1.4 / max(0.4, theme.motion.speed)).repeatForever(autoreverses: false)) { x = 2 }
-            }
-            .onChange(of: motion) { on in
-                x = 0.2                                         // plain assign cancels the loop
-                guard on && theme.motion.speed > 0 else { return }
-                x = -1
-                withAnimation(.linear(duration: 1.4 / max(0.4, theme.motion.speed)).repeatForever(autoreverses: false)) { x = 2 }
             }
     }
 }

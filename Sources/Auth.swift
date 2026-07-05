@@ -23,8 +23,6 @@ struct AuthView: View {
     @State private var email = ""
     @State private var pw = ""
     @State private var err = ""
-    @State private var glow = false
-    @State private var orb = false
     @Environment(\.blMotion) private var motion   // pauses ambient loops when app is backgrounded
     @State private var note = ""           // inline, non-crashing provider note (e.g. "add a client ID")
     @StateObject private var google = GoogleSignIn()
@@ -46,7 +44,12 @@ struct AuthView: View {
             ScrollView(.vertical, showsIndicators: false) {
             VStack(spacing: 18) {
                 ZStack {
-                    Circle().fill(BLTheme.gold.opacity(0.18)).frame(width: 150).blur(radius: 40).scaleEffect(glow ? 1.1 : 0.85)
+                    // Logo glow breathes via a pausable TimelineView (12fps is plenty for a 3s pulse);
+                    // no repeatForever — a plain paused timeline provably stops ticking when backgrounded.
+                    TimelineView(.animation(minimumInterval: 1.0 / 12.0, paused: !motion)) { tl in
+                        let k = motion ? FXClock.easeInOut(FXClock.pingPong(tl.date, 3)) : 0
+                        Circle().fill(BLTheme.gold.opacity(0.18)).frame(width: 150).blur(radius: 40).scaleEffect(0.85 + 0.25 * k)
+                    }
                     Logo(size: 92).holoSheen()
                 }
                 VStack(spacing: 5) {
@@ -111,18 +114,6 @@ struct AuthView: View {
             }
         }
         .frame(minWidth: 820, minHeight: 640)
-        .onAppear {
-            guard motion else { return }
-            withAnimation(.easeInOut(duration: 3).repeatForever(autoreverses: true)) { glow = true }
-            withAnimation(.easeInOut(duration: 7).repeatForever(autoreverses: true)) { orb = true }
-        }
-        // Backgrounded app: plain assignment cancels the loops; foregrounding restarts them.
-        .onChange(of: motion) { on in
-            glow = false; orb = false
-            guard on else { return }
-            withAnimation(.easeInOut(duration: 3).repeatForever(autoreverses: true)) { glow = true }
-            withAnimation(.easeInOut(duration: 7).repeatForever(autoreverses: true)) { orb = true }
-        }
     }
     // MARK: Social buttons — both ALWAYS render; behavior is runtime-gated, never a dead/no-op tap.
 

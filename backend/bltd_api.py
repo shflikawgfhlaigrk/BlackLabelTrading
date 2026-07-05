@@ -622,9 +622,7 @@ class H(BaseHTTPRequestHandler):
             if u.path == "/api/feed/sources":
                 return self._send(200, feed_manager().sources())
             if u.path == "/api/feed/status":
-                mgr = _feed_manager_if_exists()
-                return self._send(200, mgr.status() if mgr else
-                                  {"source": None, "state": "disconnected", "detail": "waiting for webhook data"})
+                return self._send(200, feed_manager().status())
             if u.path == "/api/webhook/info":
                 return self._send(200, _webhook_info(self.headers.get("Host", "")))
             if u.path == "/api/exec/status":

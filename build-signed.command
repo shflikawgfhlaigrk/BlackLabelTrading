@@ -69,14 +69,24 @@ SDK="$(xcrun --sdk macosx --show-sdk-path)"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
-echo "==> Compiling Sources/*.swift (Hardened-Runtime compatible)"
+echo "==> Compiling Sources/*.swift (universal2, Hardened-Runtime compatible)"
 SWIFT_FILES=( "$SRC"/*.swift )
-xcrun --sdk macosx swiftc \
-  -O -sdk "$SDK" -target arm64-apple-macosx13.0 \
-  -framework SwiftUI -framework AppKit -framework Charts \
-  -framework AuthenticationServices -framework CryptoKit -framework UserNotifications \
-  -o "$APP/Contents/MacOS/$BIN_NAME" \
-  "${SWIFT_FILES[@]}"
+TRD_FRAMEWORKS=( -framework SwiftUI -framework AppKit -framework Charts
+  -framework AuthenticationServices -framework CryptoKit -framework UserNotifications )
+build_trd_arch () {
+  local arch="$1"
+  echo "==> Compiling ${arch} (deployment target macOS 13.0)"
+  xcrun --sdk macosx swiftc \
+    -O -sdk "$SDK" -target "${arch}-apple-macosx13.0" \
+    "${TRD_FRAMEWORKS[@]}" \
+    -o "$BUILD/$BIN_NAME-${arch}" \
+    "${SWIFT_FILES[@]}"
+}
+build_trd_arch arm64
+build_trd_arch x86_64
+lipo -create "$BUILD/$BIN_NAME-arm64" "$BUILD/$BIN_NAME-x86_64" -output "$APP/Contents/MacOS/$BIN_NAME"
+rm -f "$BUILD/$BIN_NAME-arm64" "$BUILD/$BIN_NAME-x86_64"
+lipo -archs "$APP/Contents/MacOS/$BIN_NAME"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -93,7 +103,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleName</key><string>Black Label Trading</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>1.0</string>
-  <key>CFBundleVersion</key><string>1</string>
+  <key>CFBundleVersion</key><string>11</string>
   <key>ITSAppUsesNonExemptEncryption</key><false/>
   <key>LSApplicationCategoryType</key><string>public.app-category.finance</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>

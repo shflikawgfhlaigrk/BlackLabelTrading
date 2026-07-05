@@ -1409,6 +1409,7 @@ func testNoAPIWebhookIngestionContract() {
     let chart = source("Sources/ChartScreen.swift")
     let feedTypes = source("Sources/FeedTypes.swift")
     let feedClient = source("Sources/FeedClient.swift")
+    let main = source("Sources/main.swift")
     let settings = source("Sources/Screens.swift")
     let api = source("backend/bltd_api.py")
     let cap = source("backend/bltd_capture.py")
@@ -1416,7 +1417,7 @@ func testNoAPIWebhookIngestionContract() {
     let topstepBridge = source("backend/bltd_topstep_bridge.py")
     let launcher = source("backend/launch-backend.sh")
     let entitlements = source("Sources/app-developerid.entitlements")
-    ok(!ui.isEmpty && !chart.isEmpty && !feedTypes.isEmpty && !feedClient.isEmpty && !settings.isEmpty &&
+    ok(!ui.isEmpty && !chart.isEmpty && !feedTypes.isEmpty && !feedClient.isEmpty && !main.isEmpty && !settings.isEmpty &&
        !api.isEmpty && !cap.isEmpty && !feeds.isEmpty && !topstepBridge.isEmpty &&
        !launcher.isEmpty && !entitlements.isEmpty,
        "no-api webhook-ingestion source loaded")
@@ -1433,6 +1434,16 @@ func testNoAPIWebhookIngestionContract() {
     ok(settings.contains("bundled browser bridge") && !settings.contains("prop-firm API"),
        "settings copy describes no-creds bridge ingestion")
     ok(feedClient.contains("/api/webhook/info"), "feed client fetches webhook receiver details")
+    ok(main.contains(".task(id: session.signedIn ? session.email : \"\")") &&
+       main.contains("already-signed-in restored session"),
+       "root view starts the local backend for restored signed-in sessions")
+    ok(main.contains("BLT_FEED_SMOKE") && main.contains("runFeedSmoke()") &&
+       main.contains("await feed.connect(email: \"local@blacklabel\")"),
+       "installed app exposes a non-destructive feed smoke proof")
+    ok(main.contains("await feed.feedStatus()") && main.contains("await feed.webhookInfo()") &&
+       main.contains("await feed.recentBars(symbol: selected") && main.contains("await feed.liveTick(symbol: selected") &&
+       main.contains("newest_bar_age=") && main.contains("fresh_tick="),
+       "feed smoke proves source/webhook/history/fresh-tick state, not just backend reachability")
     ok(api.contains("_webhook_ingest") && api.contains("\"/webhook/feed\""),
        "backend exposes webhook ingestion route")
     ok(api.contains("cap.on_candle") && api.contains("STORE.record_bars_batch"),
@@ -1708,6 +1719,38 @@ func testLiveBackendIntegration() {
     } else { ok(false, "[integration] /api/fires reachable") }
 }
 
+func testWindowLaunchOrderingContract() {
+    guard let src = try? String(contentsOfFile: "Sources/main.swift", encoding: .utf8) else {
+        ok(false, "[source] main.swift readable for window launch contract"); return
+    }
+    guard let activation = src.range(of: "NSApp.setActivationPolicy(.regular)"),
+          let order = src.range(of: "window.makeKeyAndOrderFront(nil)"),
+          let front = src.range(of: "window.orderFrontRegardless()") else {
+        ok(false, "[source] launch orders app window explicitly"); return
+    }
+    ok(activation.lowerBound < order.lowerBound, "[source] activation policy is regular before ordering the Trading window")
+    ok(order.lowerBound < front.lowerBound, "[source] Trading window is forced front after activation")
+    ok(src.contains("NSScreen.main?.visibleFrame"), "[source] Trading window uses visibleFrame to stay on-screen")
+}
+
+func testBuildNumberContract() {
+    let expectedBuild = "<key>CFBundleVersion</key><string>11</string>"
+    for file in ["build.command", "build-signed.command"] {
+        guard let src = try? String(contentsOfFile: file, encoding: .utf8) else {
+            ok(false, "[source] \(file) readable for build-number contract"); continue
+        }
+        ok(src.contains(expectedBuild), "[source] \(file) stamps Trading build 11")
+        ok(src.contains("universal2") && src.contains("build_trd_arch arm64") &&
+           src.contains("build_trd_arch x86_64") && src.contains("lipo -create"),
+           "[source] \(file) builds a universal2 Trading binary")
+    }
+    if let src = try? String(contentsOfFile: "build-developer-id.sh", encoding: .utf8) {
+        ok(src.contains("BUILD_NUMBER=\"${BUILD_NUMBER:-11}\""), "[source] Developer-ID build defaults to Trading build 11")
+    } else {
+        ok(false, "[source] build-developer-id.sh readable for build-number contract")
+    }
+}
+
 // ChartRender headless engine-trade overlay (edge-gate transparency)
 testChartRenderFireOverlay()
 
@@ -1737,6 +1780,10 @@ testFireFeedDecode()
 
 // In-app auto-updater pure core (version compare, sha256, manifest decode, daily-check window)
 testUpdater()
+
+// Installed-app launch contract: the window must be on-screen and frontmost.
+testWindowLaunchOrderingContract()
+testBuildNumberContract()
 
 // Opt-in live backend integration (locks the end-to-end wire contract on real captured data).
 if ProcessInfo.processInfo.environment["BLT_LIVE_BACKEND"] == "1" {

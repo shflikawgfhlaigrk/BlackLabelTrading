@@ -169,6 +169,26 @@ def test_connect_opens_no_api_browser_capture_tabs():
         C.feeds_available, C.open_feed_login_tabs, C.discover_feed_pages, C.cdp_reachable = saved
 
 
+def test_feed_status_reports_reachable_browser_before_webhook_ticks():
+    saved = C.discover_feed_pages
+    try:
+        C.discover_feed_pages = lambda source=None: [
+            ("wealthcharts", {"url": "https://app.wealthcharts.com/", "webSocketDebuggerUrl": "ws://127.0.0.1:9223/devtools/page/1"})
+        ]
+        srv, port = _start_server()
+        try:
+            h = f"127.0.0.1:{port}"
+            st, o = _req(port, "GET", "/api/feed/status", host=h, token=TOK)
+            assert st == 200
+            assert o["source"] == "wealthcharts"
+            assert o["state"] == "browser"
+            assert "capture browser" in o["detail"]
+        finally:
+            srv.shutdown()
+    finally:
+        C.discover_feed_pages = saved
+
+
 def test_feed_connect_rejects_api_sources():
     srv, port = _start_server()
     try:
