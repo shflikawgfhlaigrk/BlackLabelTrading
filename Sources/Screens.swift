@@ -95,6 +95,7 @@ struct SignalsScreen: View {
     @State private var fleet: [EngineRow] = []
     @State private var backendFires: [FireRow] = []
     @State private var fleetLoading = false
+    @State private var reference = ReferenceReport.empty   // reference OOS verdicts on historical ES
     @State private var dailyLogPath: String? = nil   // path shown after "Export daily logs"
     @State private var tAccount = "50000"             // order-ticket sizing inputs (your own values)
     @State private var tRiskPct = "1"
@@ -121,6 +122,11 @@ struct SignalsScreen: View {
                 // The real edge-gated engine fleet (backend /api/screen + /api/fires) — every
                 // engine's honest OOS verdict on the buyer's OWN captured bars.
                 engineFleet
+
+                // REFERENCE ONLY: the same edge-gate run on Black Label's OWN historical ES bars, so
+                // a cold buyer sees the gate produce a real, earned verdict before they've captured a
+                // single bar. NOT the buyer's account, NOT a promise, no aggregate/equity claim.
+                referenceOOSPanel
 
                 // Hero signal card + composite + consensus + gates. ALL of this is computed from the
                 // live factor inputs, so it renders ONLY when real captured data exists — otherwise a
@@ -308,7 +314,8 @@ struct SignalsScreen: View {
         fleetLoading = true
         let rows = await feed.engineScreen()
         let fires = await feed.recentFires()
-        await MainActor.run { fleet = rows; backendFires = fires; fleetLoading = false }
+        let ref = await feed.referenceReport()
+        await MainActor.run { fleet = rows; backendFires = fires; reference = ref; fleetLoading = false }
     }
 
     // The edge-gated engine fleet, grouped by engine with its real status. NEVER hardcodes a
@@ -363,6 +370,82 @@ struct SignalsScreen: View {
                 }
             }
             StatusPill(text: status, tint: tint)
+        }
+        .padding(12).background(BLTheme.panel2).clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 11, style: .continuous).stroke(BLTheme.stroke, lineWidth: 1))
+    }
+
+    // REFERENCE OOS panel. Renders Black Label's own edge-gate verdicts computed on historical ES
+    // bars by the shipped provers (GET /api/reference). This exists so a cold buyer can see the gate
+    // produce a REAL, earned verdict before they've captured their own bars. HARD RULES honored:
+    // labeled "Reference only — historical ES, NOT your account, NOT a promise"; NO aggregate
+    // win-rate, NO blended equity curve, NO "verified-live" claim; an engine with no edge shows
+    // "NO EDGE" honestly; an absent artifact shows a pending empty state (never a painted number).
+    private var referenceOOSPanel: some View {
+        Panel(title: "Reference edge-gate verdicts", icon: "checkmark.shield.fill", accent: BLTheme.gold) {
+            // The mandatory reference-only label — verbatim, unmistakable, always shown.
+            HStack(spacing: 6) {
+                Image(systemName: "info.circle.fill").font(.system(size: 11)).foregroundColor(BLTheme.gold)
+                Text("Reference only — computed on historical ES data, NOT your account, NOT a promise, no performance guaranteed.")
+                    .font(.system(size: 11, weight: .semibold, design: .rounded)).foregroundColor(BLTheme.gold)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(BLTheme.gold.opacity(0.10))
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(BLTheme.gold.opacity(0.35), lineWidth: 1))
+
+            if !reference.available || reference.engines.isEmpty {
+                EmptyState(icon: "shield.lefthalf.filled", title: "Reference verdicts pending",
+                           hint: reference.reason ?? "Reference verdicts are not bundled in this build.")
+            } else {
+                Text("This is the SAME edge-gate your own engines use, run on Black Label's own historical ES bars. It is how the tool tells you when it has no edge: most engines below show NO EDGE on real data. An engine is a candidate only when it clears out-of-sample statistical significance. Your own fleet above arms only on the bars YOUR feed captures.")
+                    .font(.system(size: 11, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 8) {
+                    StatusPill(text: "\(reference.candidateCount)/\(reference.engineCount) OOS candidates on ES",
+                               tint: reference.candidateCount > 0 ? BLTheme.green : BLTheme.sub)
+                    Spacer()
+                    Text("source: \(reference.source)")
+                        .font(.system(size: 9, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub).lineLimit(1)
+                }
+                VStack(spacing: 8) { ForEach(reference.engines) { referenceRow($0) } }
+                // Provenance line — every number above is reproducible from this.
+                Text("Reproducible: \(reference.engineCount) engines · prover \(reference.proverSHA) · generated \(reference.generatedUTC)")
+                    .font(.system(size: 9, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private func referenceRow(_ e: ReferenceEngine) -> some View {
+        let cand = e.isCandidate
+        let tint = cand ? BLTheme.green : BLTheme.sub
+        // Show the best (most significant) contract verdict; when none is proven, show the first
+        // real contract's honest "no edge" line. NEVER blend contracts into one number.
+        let best = e.contracts.first(where: { $0.proven }) ?? e.contracts.first
+        return HStack(spacing: 12) {
+            Image(systemName: cand ? "checkmark.seal.fill" : "xmark.seal")
+                .font(.system(size: 14, weight: .bold)).foregroundColor(tint)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(EngineRoster.label(for: e.engine)).font(.system(size: 13, weight: .bold, design: .rounded)).foregroundColor(BLTheme.text)
+                if let b = best {
+                    Text("\(b.verdict) · \(b.trades) OOS trades on \(b.symbol)")
+                        .font(.system(size: 10, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub).lineLimit(1)
+                }
+            }
+            Spacer()
+            if let b = best {
+                VStack(alignment: .trailing, spacing: 2) {
+                    Text("\(TradeMath.pct(b.winRate*100)) · \(String(format: "%+.1f", b.netPts)) pts")
+                        .font(.system(size: 11, weight: .bold, design: .rounded)).foregroundColor(BLTheme.text).monospacedDigit()
+                    if let f = b.from, let t = b.to {
+                        Text("ES \(f) → \(t)").font(.system(size: 9, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+                    }
+                }
+            }
+            StatusPill(text: cand ? "OOS CAND" : "NO EDGE", tint: tint)
         }
         .padding(12).background(BLTheme.panel2).clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 11, style: .continuous).stroke(BLTheme.stroke, lineWidth: 1))

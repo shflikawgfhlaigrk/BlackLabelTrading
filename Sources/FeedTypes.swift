@@ -324,6 +324,92 @@ enum EngineRoster {
     }
 }
 
+// MARK: - Reference OOS verdicts from GET /api/reference.
+// Black Label's edge-gate result computed on OUR OWN historical ES bars by the shipped provers —
+// so a cold buyer (no captured bars yet) can see the gate produce a real, earned verdict. This is
+// REFERENCE ONLY: historical ES, NOT the buyer's account, NOT a promise. There is NO aggregate
+// win-rate / blended equity curve / "verified-live" claim — an engine with no edge decodes as
+// status "no_edge". Every field is decoded straight from the artifact; nothing is invented.
+struct ReferenceContract: Equatable {
+    var symbol: String
+    var bars: Int
+    var from: String?
+    var to: String?
+    var proven: Bool
+    var trades: Int
+    var winRate: Double
+    var expectancyR: Double
+    var netPts: Double
+    var verdict: String
+    var reason: String
+}
+
+struct ReferenceEngine: Equatable, Identifiable {
+    var engine: String
+    var status: String            // "candidate" (cleared significance on >=1 contract) | "no_edge"
+    var contracts: [ReferenceContract]
+    var id: String { engine }
+    var isCandidate: Bool { status == "candidate" }
+}
+
+struct ReferenceReport: Equatable {
+    var available: Bool
+    var label: String
+    var disclaimer: String
+    var source: String
+    var generatedUTC: String
+    var proverSHA: String
+    var candidateCount: Int
+    var engineCount: Int
+    var engines: [ReferenceEngine]
+    var reason: String?           // set when available == false (honest pending/empty state)
+
+    static let empty = ReferenceReport(available: false,
+        label: "Reference only — computed on historical ES data, NOT your account, NOT a promise, no performance guaranteed.",
+        disclaimer: "", source: "", generatedUTC: "", proverSHA: "",
+        candidateCount: 0, engineCount: 0, engines: [], reason: "reference verdicts unavailable")
+
+    static func decode(_ obj: [String: Any]) -> ReferenceReport {
+        let available = (obj["available"] as? Bool) ?? false
+        let label = (obj["label"] as? String) ?? ReferenceReport.empty.label
+        if !available {
+            return ReferenceReport(available: false, label: label,
+                disclaimer: (obj["disclaimer"] as? String) ?? "", source: "", generatedUTC: "",
+                proverSHA: "", candidateCount: 0, engineCount: 0, engines: [],
+                reason: (obj["reason"] as? String) ?? "reference verdicts unavailable")
+        }
+        let engines: [ReferenceEngine] = ((obj["engines"] as? [[String: Any]]) ?? []).compactMap { e in
+            guard let id = e["engine"] as? String else { return nil }
+            let contracts: [ReferenceContract] = ((e["contracts"] as? [[String: Any]]) ?? []).compactMap { c in
+                guard let sym = c["symbol"] as? String else { return nil }
+                return ReferenceContract(
+                    symbol: sym,
+                    bars: Int(FeedBars.num(c["bars"] as Any) ?? 0),
+                    from: c["from"] as? String, to: c["to"] as? String,
+                    proven: (c["proven"] as? Bool) ?? false,
+                    trades: Int(FeedBars.num(c["trades"] as Any) ?? 0),
+                    winRate: FeedBars.num(c["winRate"] as Any) ?? 0,
+                    expectancyR: FeedBars.num(c["expectancyR"] as Any) ?? 0,
+                    netPts: FeedBars.num(c["netPts"] as Any) ?? 0,
+                    verdict: (c["verdict"] as? String) ?? "",
+                    reason: (c["reason"] as? String) ?? "")
+            }
+            return ReferenceEngine(engine: id,
+                                   status: (e["status"] as? String) ?? "no_edge",
+                                   contracts: contracts)
+        }
+        return ReferenceReport(
+            available: true, label: label,
+            disclaimer: (obj["disclaimer"] as? String) ?? "",
+            source: (obj["source"] as? String) ?? "",
+            generatedUTC: (obj["generated_utc"] as? String) ?? "",
+            proverSHA: (obj["prover_sha"] as? String) ?? "",
+            candidateCount: Int(FeedBars.num(obj["candidateCount"] as Any) ?? 0),
+            engineCount: Int(FeedBars.num(obj["engineCount"] as Any) ?? 0),
+            engines: engines, reason: nil)
+    }
+}
+
 // MARK: - Signal journal from GET /api/fires.
 // Real recorded (non-synthetic) edge-gated fires, newest first. outcome/pnl are nil until the
 // daemon grades the signal (honest — never an invented result for an open signal). A row with no

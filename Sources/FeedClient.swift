@@ -98,6 +98,30 @@ final class FeedClient: ObservableObject {
         }
     }
 
+    // Unauthenticated GET for PUBLIC routes only (the reference artifact). No Bearer token — a cold
+    // buyer who has not signed in can still read Black Label's reference OOS verdicts.
+    private func getJSONPublic(_ path: String) async -> [String: Any]? {
+        guard let u = url(path) else { return nil }
+        do {
+            let (data, resp) = try await session.data(for: URLRequest(url: u))
+            guard (resp as? HTTPURLResponse)?.statusCode == 200 else { return nil }
+            return try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        } catch {
+            return nil
+        }
+    }
+
+    // MARK: - Reference OOS verdicts (GET /api/reference): Black Label's edge-gate result on OUR OWN
+    // historical ES bars, so a cold buyer sees a real, earned verdict before they've captured a
+    // single bar. REFERENCE ONLY — historical ES, not the buyer's account, not a promise. Public
+    // route (no sign-in needed). Ensures the bundled backend is up first, then decodes; an absent
+    // artifact returns .empty (honest pending state), never a fabricated verdict.
+    func referenceReport() async -> ReferenceReport {
+        await ensureBackendRunning()
+        guard let obj = await getJSONPublic("/api/reference") else { return .empty }
+        return ReferenceReport.decode(obj)
+    }
+
     // MARK: - Execution control plane (default OFF). Thin pass-through to the backend's dedicated,
     // auth-gated /api/exec/* routes. A live order is impossible unless armed+live+own-creds+firm-ToS
     // +risk+edge+kill-clear all hold in the backend engine — the UI cannot bypass that.

@@ -137,6 +137,10 @@ if [ -d "$ROOT/backend" ]; then
   cp -f "$ROOT/backend"/bltd_*.py "$APP/Contents/Resources/backend/"
   cp -f "$ROOT/backend/launch-backend.sh" "$APP/Contents/Resources/backend/"
   chmod +x "$APP/Contents/Resources/backend/launch-backend.sh"
+  # Reference OOS verdicts: Black Label's edge-gate result on OUR OWN historical ES bars (research,
+  # not buyer data) so a cold buyer sees a real earned verdict at /api/reference. NOT the buyer's
+  # account, NOT a promise. gen_reference.py (the build-time generator) is deliberately NOT shipped.
+  [ -f "$ROOT/backend/reference_oos.json" ] && cp -f "$ROOT/backend/reference_oos.json" "$APP/Contents/Resources/backend/"
 
   RUNTIME_SRC=""
   if [ -d "$ROOT/vendor/python-runtime" ]; then

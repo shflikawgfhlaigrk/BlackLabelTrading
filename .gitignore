@@ -17,3 +17,4 @@ build-signed/
 *.log
 # local signing scratch
 /tmp/bl-build/
+backend/__pycache__/

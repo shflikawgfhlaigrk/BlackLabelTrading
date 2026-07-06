@@ -93,6 +93,42 @@ def _heartbeat_fresh(mtime, now, max_age=30.0) -> bool:
     """True iff a heartbeat file's mtime exists and is newer than max_age. Pure (unit-tested)."""
     return mtime is not None and (now - mtime) < max_age
 
+
+# ---------------------------------------------------------------------------
+# REFERENCE OOS artifact (served at GET /api/reference).
+# This is Black Label's edge-gate verdicts computed on our OWN historical ES bars by the shipped
+# provers (see backend/gen_reference.py). It ships as a small static JSON so a cold buyer — who has
+# captured no bars of their own yet — can see the gate produce a real, earned verdict BEFORE weeks
+# of their own capture. It is REFERENCE ONLY: historical ES, NOT the buyer's account, NOT a promise,
+# no aggregate win-rate / equity curve / "verified-live edge" claim. When an engine has no edge it
+# says "no edge". It is read-only, contains NO buyer data, and does not touch the store.
+_REFERENCE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reference_oos.json")
+_reference_cache = {"mtime": None, "payload": None}
+
+
+def _load_reference() -> dict:
+    """Return the bundled reference artifact, or an honest empty/pending state if it is absent.
+    Never fabricates a verdict: a missing artifact yields available:false with a reason, which the
+    Swift panel surfaces as a "pending" empty state rather than a painted number."""
+    try:
+        mt = os.path.getmtime(_REFERENCE_PATH)
+    except OSError:
+        return {"available": False,
+                "reason": "reference verdicts not bundled in this build",
+                "label": ("Reference only — computed on historical ES data, NOT your account, "
+                          "NOT a promise, no performance guaranteed.")}
+    if _reference_cache["mtime"] != mt:
+        try:
+            with open(_REFERENCE_PATH) as f:
+                data = json.load(f)
+            data["available"] = True
+            _reference_cache.update(mtime=mt, payload=data)
+        except Exception as e:  # noqa: BLE001 — a corrupt artifact must never be served as truth
+            return {"available": False, "reason": f"reference artifact unreadable: {type(e).__name__}",
+                    "label": ("Reference only — computed on historical ES data, NOT your account, "
+                              "NOT a promise, no performance guaranteed.")}
+    return _reference_cache["payload"]
+
 # --- store selection ------------------------------------------------------
 # Default: the product's OWN SQLite store. The Utah Postgres DSN is an OPT-IN dev override only:
 # it is used iff BLTD_DSN is set AND a Postgres driver is importable. Anything missing falls back
@@ -598,6 +634,11 @@ class H(BaseHTTPRequestHandler):
         g = lambda k, d="": (q.get(k, [d])[0] or d)  # noqa: E731
         if u.path == "/health":
             return self._send(200, {"ok": True, "ts": time.time(), "store": "pg" if USING_PG else "own"})
+        # Reference OOS verdicts are public research (Black Label's own ES history, no buyer data),
+        # so they are served BEFORE the auth gate — a cold buyer who has not signed in can still see
+        # that the edge-gate produces a real, earned verdict. Read-only static artifact.
+        if u.path == "/api/reference":
+            return self._send(200, _load_reference())
         if not u.path.startswith("/api/"):
             return self._send(404, {"error": "not found"})
         if not self._authed():
