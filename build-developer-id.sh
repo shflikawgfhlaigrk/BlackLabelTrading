@@ -29,7 +29,7 @@ BUNDLE_ID="com.blacklabel.trading"
 TEAM="745ZPGFRA5"
 ENTS="$SRC/app-developerid.entitlements"
 NOTARY_PROFILE="${NOTARY_PROFILE:-BL_NOTARY}"
-BUILD_NUMBER="${BUILD_NUMBER:-12}"
+BUILD_NUMBER="${BUILD_NUMBER:-13}"
 PY_RUNTIME_SRC="${BLTD_PYTHON_RUNTIME:-$ROOT/vendor/python-runtime}"
 SUBMIT="${SUBMIT:-0}"
 INSTALL=0
@@ -144,6 +144,10 @@ mkdir -p "$APP/Contents/Resources/backend"
 cp -f "$ROOT/backend"/bltd_*.py "$APP/Contents/Resources/backend/"
 cp -f "$ROOT/backend/launch-backend.sh" "$APP/Contents/Resources/backend/"
 chmod +x "$APP/Contents/Resources/backend/launch-backend.sh"
+# Reference OOS verdicts — Black Label's edge-gate result on OUR OWN historical ES bars (research,
+# NOT buyer data), served read-only at /api/reference so a cold buyer sees a real earned verdict.
+# The build-time generator gen_reference.py is deliberately NOT shipped.
+[ -f "$ROOT/backend/reference_oos.json" ] && cp -f "$ROOT/backend/reference_oos.json" "$APP/Contents/Resources/backend/"
 
 echo "==> Bundling CPython runtime (fresh Mac: no Terminal/dev-tools prerequisite)"
 if [ ! -x "$PY_RUNTIME_SRC/bin/python3.11" ] && [ ! -x "$PY_RUNTIME_SRC/bin/python3" ]; then
