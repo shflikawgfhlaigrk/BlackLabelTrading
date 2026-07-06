@@ -83,6 +83,7 @@ enum ChartSource: String, CaseIterable, Identifiable {
 struct ChartScreen: View {
     @EnvironmentObject var drawings: DrawingStore
     @EnvironmentObject var feed: FeedClient
+    @EnvironmentObject var nav: Nav
     @State private var source: ChartSource = .live
     @State private var symbol = ""
     @State private var baseBars: [Bar] = []
@@ -190,6 +191,7 @@ struct ChartScreen: View {
                 ProgressView().controlSize(.small).tint(BLTheme.gold)
             }
             if st == .loggedOut || st == .notSignedIn || st == .connecting {
+                GhostButton(label: "Connect", icon: "globe") { nav.section = .feeds }
                 GhostButton(label: "Refresh webhook", icon: "arrow.clockwise") {
                     Task { loadingFeed = true; await refreshFeed(); loadingFeed = false }
                 }
@@ -319,9 +321,17 @@ struct ChartScreen: View {
                 }
             case .loggedOut, .notSignedIn, .connecting:
                 EmptyState(icon: "dot.radiowaves.left.and.right", title: "Waiting for browser feed data",
-                           hint: "Use the bundled browser bridge and sign into your own TopstepX or WealthCharts session in the app-owned browser. The bridge posts observed market data into the local webhook/store. Once real data flows, it appears here. Nothing is ever fabricated.")
-                GoldButton(label: "Refresh webhook", icon: "arrow.clockwise") {
-                    Task { loadingFeed = true; await refreshFeed(); loadingFeed = false }
+                           hint: "One step: sign into your own TopstepX or WealthCharts session in the app-owned browser. The bridge posts observed market data into the local webhook/store. Once real data flows, it appears here. Nothing is ever fabricated.")
+                HStack(spacing: 8) {
+                    // The one action a stranded buyer needs, right here — same call as the Connect
+                    // screen's primary button (backend picks the default platform when source is nil).
+                    GoldButton(label: feed.connecting ? "Opening your platform…" : "Connect — open my platform", icon: "globe") {
+                        Task { loadingFeed = true; await feed.launchCapture(); await refreshFeed(); loadingFeed = false }
+                    }
+                    GhostButton(label: "Connect screen", icon: "antenna.radiowaves.left.and.right") { nav.section = .feeds }
+                    GhostButton(label: "Refresh", icon: "arrow.clockwise") {
+                        Task { loadingFeed = true; await refreshFeed(); loadingFeed = false }
+                    }
                 }
             default:
                 if feed.symbols.pickerList.isEmpty {

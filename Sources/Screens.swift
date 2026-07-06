@@ -84,6 +84,7 @@ struct SignalsScreen: View {
     @EnvironmentObject var model: AppModel
     @EnvironmentObject var wc: WealthChartsStore
     @EnvironmentObject var feed: FeedClient
+    @EnvironmentObject var nav: Nav
     @State private var inp = SignalInputs()
     @State private var committed = false
     @State private var live = LiveFactorSnapshot()
@@ -153,7 +154,8 @@ struct SignalsScreen: View {
                     Panel(title: "Signal", icon: "dot.radiowaves.left.and.right", accent: BLTheme.gold) {
                         EmptyState(icon: "antenna.radiowaves.left.and.right",
                                    title: "Awaiting your live feed",
-                                   hint: "The signal, multi-timeframe consensus, and 13 risk gates compute from your own captured bars. Connect your feed under ‘Connect a feed’ and let bars accumulate — nothing is shown until it's real.")
+                                   hint: "The signal, multi-timeframe consensus, and 13 risk gates compute from your own captured bars. Connect your feed and let bars accumulate — nothing is shown until it's real.")
+                        GoldButton(label: "Connect my feed", icon: "globe") { nav.section = .feeds }
                     }
                 }
 
@@ -236,6 +238,7 @@ struct SignalsScreen: View {
                             Panel(title: "Trade plan", icon: "scope") {
                                 EmptyState(icon: "scope", title: "Awaiting your live feed",
                                            hint: "The factor breakdown and trade plan compute from your own captured bars. Connect your feed and let bars accumulate — nothing is shown until it's real.")
+                                GhostButton(label: "Connect my feed", icon: "globe") { nav.section = .feeds }
                             }
                         }
                     }
@@ -328,6 +331,7 @@ struct SignalsScreen: View {
             if fleet.isEmpty {
                 EmptyState(icon: "cpu", title: fleetLoading ? "Loading engine fleet…" : "Engine fleet idle",
                            hint: "Connect your feed and let bars accumulate — each engine arms only after your own data produces a statistically significant OOS candidate. Nothing is shown until it's real.")
+                GhostButton(label: "Connect my feed", icon: "globe") { nav.section = .feeds }
             } else {
                 VStack(spacing: 8) { ForEach(engines, id: \.self) { e in engineFleetRow(e, byEngine[e] ?? []) } }
             }
