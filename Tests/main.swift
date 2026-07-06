@@ -1734,18 +1734,18 @@ func testWindowLaunchOrderingContract() {
 }
 
 func testBuildNumberContract() {
-    let expectedBuild = "<key>CFBundleVersion</key><string>11</string>"
+    let expectedBuild = "<key>CFBundleVersion</key><string>12</string>"
     for file in ["build.command", "build-signed.command"] {
         guard let src = try? String(contentsOfFile: file, encoding: .utf8) else {
             ok(false, "[source] \(file) readable for build-number contract"); continue
         }
-        ok(src.contains(expectedBuild), "[source] \(file) stamps Trading build 11")
+        ok(src.contains(expectedBuild), "[source] \(file) stamps Trading build 12")
         ok(src.contains("universal2") && src.contains("build_trd_arch arm64") &&
            src.contains("build_trd_arch x86_64") && src.contains("lipo -create"),
            "[source] \(file) builds a universal2 Trading binary")
     }
     if let src = try? String(contentsOfFile: "build-developer-id.sh", encoding: .utf8) {
-        ok(src.contains("BUILD_NUMBER=\"${BUILD_NUMBER:-11}\""), "[source] Developer-ID build defaults to Trading build 11")
+        ok(src.contains("BUILD_NUMBER=\"${BUILD_NUMBER:-12}\""), "[source] Developer-ID build defaults to Trading build 12")
     } else {
         ok(false, "[source] build-developer-id.sh readable for build-number contract")
     }
