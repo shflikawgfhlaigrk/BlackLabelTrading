@@ -119,17 +119,23 @@ final class HoloThemeController: ObservableObject {
 
 // Inject `\.blMotion` from the controller + the live system Reduce-Motion setting + app
 // activity: ambient FX pause when the app is backgrounded (an idle window burned ~20% CPU
-// on TimelineView/repeatForever layers that never slept — same gate as Marketing).
+// on TimelineView/repeatForever layers that never slept — same gate as Marketing) AND when
+// the displays sleep (a frontmost app on a dark/locked screen otherwise keeps ticking its
+// 30fps timelines — measured ~40% CPU rendering to a screen nobody can see). Screen sleep
+// posts on NSWorkspace.shared.notificationCenter, not the default center.
 struct HoloEnvironment: ViewModifier {
     @ObservedObject var controller: HoloThemeController
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var appActive = true
+    @State private var screenAwake = true
     func body(content: Content) -> some View {
         content
             .environment(\.holoTheme, controller.theme)
-            .environment(\.blMotion, controller.motionEnabled && !reduceMotion && appActive)
+            .environment(\.blMotion, controller.motionEnabled && !reduceMotion && appActive && screenAwake)
             .onReceive(NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)) { _ in appActive = false }
             .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in appActive = true }
+            .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.screensDidSleepNotification)) { _ in screenAwake = false }
+            .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.screensDidWakeNotification)) { _ in screenAwake = true }
     }
 }
 extension View {
