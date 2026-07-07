@@ -201,7 +201,7 @@ enum FeedReconnect {
 struct ConnectFeedScreen: View {
     @EnvironmentObject var feed: FeedClient
     @State private var sources: [FeedSourceInfo] = []
-    @State private var selected: String = FeedCredStore.lastSource ?? "webhook"
+    @State private var selected: String = FeedCredStore.lastSource ?? "wealthcharts"
     @State private var inputs: [String: String] = [:]
     @State private var status = ApiFeedStatus()
     @State private var webhook = WebhookInfo()
@@ -238,9 +238,17 @@ struct ConnectFeedScreen: View {
                     }
                 }
                 if sources.isEmpty {
-                    EmptyState(icon: "bolt.horizontal.circle",
-                               title: "Connecting to the local backend…",
-                               hint: "Black Label Trading runs its own data backend on this Mac. If this persists, open Settings and Retry connection.")
+                    VStack(alignment: .center, spacing: 12) {
+                        EmptyState(icon: "bolt.horizontal.circle",
+                                   title: "Connecting to the local backend…",
+                                   hint: "Black Label Trading runs its own data backend on this Mac. If this persists, retry the local connection.")
+                        GoldButton(label: feed.connecting ? "Retrying…" : "Retry connection",
+                                   icon: "arrow.clockwise") {
+                            Task { await loadSources(forceSignIn: true) }
+                        }
+                        .disabled(feed.connecting)
+                    }
+                    .frame(maxWidth: .infinity)
                 } else {
                     sourcePicker
                     if let src = current { credentialCard(src) }
@@ -367,17 +375,36 @@ struct ConnectFeedScreen: View {
 
     // MARK: - actions
     private func initialLoad() async {
-        if loaded { await refresh(); return }
-        loaded = true
-        await feed.ensureBackendRunning()
-        if feed.state == .offline || feed.state == .notSignedIn {
-            await feed.connect(email: "local@blacklabel")
+        if loaded {
+            if sources.isEmpty { await loadSources(forceSignIn: true) }
+            await refresh()
+            return
         }
-        sources = await feed.feedSources()
-        webhook = await feed.webhookInfo() ?? WebhookInfo()
+        loaded = true
+        await loadSources(forceSignIn: true)
+        await refresh()
+    }
+
+    private func loadSources(forceSignIn: Bool = false) async {
+        for attempt in 0..<5 {
+            _ = await feed.ensureBackendRunning()
+            if forceSignIn || feed.state == .offline || feed.state == .notSignedIn {
+                await feed.connect(email: "local@blacklabel")
+            }
+            let loadedSources = await feed.feedSources()
+            if !loadedSources.isEmpty {
+                sources = loadedSources
+                webhook = await feed.webhookInfo() ?? WebhookInfo()
+                if !sources.contains(where: { $0.key == selected }) { selected = sources.first?.key ?? selected }
+                if let src = current { inputs = mergedInputs(for: src) }
+                return
+            }
+            let delay = UInt64(300_000_000 * (attempt + 1))
+            try? await Task.sleep(nanoseconds: delay)
+        }
+        webhook = await feed.webhookInfo() ?? webhook
         if !sources.contains(where: { $0.key == selected }) { selected = sources.first?.key ?? selected }
         if let src = current { inputs = mergedInputs(for: src) }
-        await refresh()
     }
 
     private func mergedInputs(for src: FeedSourceInfo) -> [String: String] {

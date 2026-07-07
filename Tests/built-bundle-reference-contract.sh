@@ -8,9 +8,9 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 APP="${1:-$ROOT/build/Black Label Trading.app}"
-PORT="${BLT_REFERENCE_TEST_PORT:-8794}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/blt-ref.XXXXXX")"
-trap 'pkill -f "bltd_api.py '"$PORT"'" 2>/dev/null || true; rm -rf "$WORK"' EXIT
+TEST_HOME="$WORK/home"
+mkdir -p "$TEST_HOME"
 
 fail() {
   echo "FAIL: $*" >&2
@@ -27,6 +27,19 @@ PY="$APP/Contents/Resources/backend/python3"
 [ -x "$LAUNCH" ] || fail "missing executable bundled backend launcher at $LAUNCH"
 [ -x "$PY" ] || fail "missing executable bundled python wrapper at $PY"
 
+PORT="${BLT_REFERENCE_TEST_PORT:-}"
+if [ -z "$PORT" ]; then
+  PORT="$("$PY" - <<'PY'
+import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()
+PY
+)"
+fi
+trap 'pkill -f "bltd_api.py '"$PORT"'" 2>/dev/null || true; pkill -f "'"$TEST_HOME"'/Library/Application Support/Black Label Trading" 2>/dev/null || true; rm -rf "$WORK"' EXIT
+
 "$PY" - "$BUNDLE_REF" <<'PY'
 import json, sys
 path = sys.argv[1]
@@ -42,6 +55,7 @@ assert any(e.get("status") == "no_edge" for e in d["engines"]), "expected honest
 assert "disclaimer" in d and "not your results" in d["disclaimer"], d.get("disclaimer", "")
 PY
 
+HOME="$TEST_HOME" \
 BLTD_PORT="$PORT" \
 BLTD_STORE="$WORK/trading.sqlite3" \
 BLTD_CONFIG="$WORK/config.json" \

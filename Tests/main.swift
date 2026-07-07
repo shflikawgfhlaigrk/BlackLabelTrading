@@ -1424,9 +1424,12 @@ func testNoAPIWebhookIngestionContract() {
 
     ok(ui.contains("bundled browser bridge") && ui.contains("TopstepX or WealthCharts") && ui.contains("webhook URL"),
        "feed UI explicitly says bundled browser bridge/webhook")
-    ok(ui.contains("FeedCredStore.lastSource ?? \"webhook\""), "feed UI defaults to webhook receiver")
+    ok(ui.contains("FeedCredStore.lastSource ?? \"wealthcharts\""), "feed UI defaults fresh buyers to WealthCharts")
     ok(ui.contains("Copy curl") && ui.contains("webhookInfo()"),
        "feed UI exposes copyable webhook setup")
+    ok(ui.contains("loadSources(forceSignIn: true)") && ui.contains("for attempt in 0..<5") &&
+       ui.contains("Retry connection"),
+       "feed UI retries first-run backend sign-in/source loading and exposes a visible retry")
     ok(chart.contains("Waiting for browser feed data") && chart.contains("Refresh webhook"),
        "chart waits for browser bridge data instead of asking for broker credentials")
     ok(feedTypes.contains("No webhook data") && feedTypes.contains("your WealthCharts webhook feed"),
@@ -1734,29 +1737,29 @@ func testWindowLaunchOrderingContract() {
 }
 
 func testBuildNumberContract() {
-    let expectedBuild = "<key>CFBundleVersion</key><string>14</string>"
+    let expectedBuild = "<key>CFBundleVersion</key><string>15</string>"
     for file in ["build.command", "build-signed.command"] {
         guard let src = try? String(contentsOfFile: file, encoding: .utf8) else {
             ok(false, "[source] \(file) readable for build-number contract"); continue
         }
-        ok(src.contains(expectedBuild), "[source] \(file) stamps Trading build 14")
+        ok(src.contains(expectedBuild), "[source] \(file) stamps Trading build 15")
         ok(src.contains("universal2") && src.contains("build_trd_arch arm64") &&
            src.contains("build_trd_arch x86_64") && src.contains("lipo -create"),
            "[source] \(file) builds a universal2 Trading binary")
     }
     if let src = try? String(contentsOfFile: "build-developer-id.sh", encoding: .utf8) {
-        ok(src.contains("BUILD_NUMBER=\"${BUILD_NUMBER:-14}\""), "[source] Developer-ID build defaults to Trading build 14")
+        ok(src.contains("BUILD_NUMBER=\"${BUILD_NUMBER:-15}\""), "[source] Developer-ID build defaults to Trading build 15")
     } else {
         ok(false, "[source] build-developer-id.sh readable for build-number contract")
     }
     if let plist = try? String(contentsOfFile: "Sources/Info.plist", encoding: .utf8) {
-        ok(plist.contains("<key>CFBundleVersion</key>\n\t<string>14</string>"),
-           "[source] Sources/Info.plist CFBundleVersion is 14")
+        ok(plist.contains("<key>CFBundleVersion</key>\n\t<string>15</string>"),
+           "[source] Sources/Info.plist CFBundleVersion is 15")
     } else {
         ok(false, "[source] Sources/Info.plist readable for build-number contract")
     }
     if let project = try? String(contentsOfFile: "project.yml", encoding: .utf8) {
-        ok(project.contains("CFBundleVersion: \"14\""), "[source] project.yml CFBundleVersion is 14")
+        ok(project.contains("CFBundleVersion: \"15\""), "[source] project.yml CFBundleVersion is 15")
     } else {
         ok(false, "[source] project.yml readable for build-number contract")
     }
