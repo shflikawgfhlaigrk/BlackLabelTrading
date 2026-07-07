@@ -7,6 +7,7 @@
 #   1. Swift pure-logic engine tests    — Tests/run-tests.sh           (headless swiftc, no Xcode)
 #   2. Backend engine + edge-gate tests — backend/run-tests.sh         (pytest if present, else stdlib)
 #   3. Offline submission contract      — Tests/submission-contract.sh (macOS AppIcon/CFBundleIconName guard)
+#   4. Built bundle Reference contract  — Tests/built-bundle-reference-contract.sh (when build app exists)
 #
 # Each sub-runner stays the source of truth for its own suite; this script only orchestrates
 # them and aggregates the result. The real gate is the sub-runners' EXIT CODES — the printed
@@ -68,6 +69,13 @@ echo "==> Black Label Trading :: combined test gate"
 run_suite "swift-logic"    bash "$ROOT/Tests/run-tests.sh"
 run_suite "backend-engine" bash "$ROOT/backend/run-tests.sh"
 run_suite "submission-contract" bash "$ROOT/Tests/submission-contract.sh"
+if [ -d "$ROOT/build/Black Label Trading.app" ]; then
+  run_suite "bundle-reference" bash "$ROOT/Tests/built-bundle-reference-contract.sh" "$ROOT/build/Black Label Trading.app"
+else
+  echo ""
+  echo "──────────────────────────────────────────────────────────────"
+  echo "==> [bundle-reference] skipped: no built app at $ROOT/build/Black Label Trading.app"
+fi
 
 echo ""
 echo "═══════════════════════════════════════════════════════════════"
