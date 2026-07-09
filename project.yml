@@ -45,7 +45,7 @@ targets:
       properties:
         CFBundleDisplayName: "Black Label Trading"
         CFBundleShortVersionString: "1.0"
-        CFBundleVersion: "15"
+        CFBundleVersion: "16"
         LSMinimumSystemVersion: "13.0"
         ITSAppUsesNonExemptEncryption: false
         LSApplicationCategoryType: public.app-category.finance
