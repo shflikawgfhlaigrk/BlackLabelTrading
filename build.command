@@ -3,13 +3,15 @@
 # Compiles Sources/*.swift with swiftc into a signed .app bundle.
 #
 #   ./build.command            -> builds into ./build/Black Label Trading.app
-#   ./build.command --install  -> also installs into /Applications and adhoc re-signs it
+#   ./build.command --devid --install  -> Developer-ID build + guarded production install
 #
 # Signals-only product. Ships NO data. Entitlements applied at sign time.
 set -euo pipefail
 
 cd "$(dirname "$0")"
 ROOT="$(pwd)"
+# shellcheck source=scripts/production-install-guard.sh
+source "$ROOT/scripts/production-install-guard.sh"
 SRC="$ROOT/Sources"
 BUILD="$ROOT/build"
 APPNAME="Black Label Trading"
@@ -24,6 +26,10 @@ BUNDLE_ID="com.blacklabel.trading"
 # --install : after building, install the fresh bundle into /Applications (atomic swap).
 DEVID=0; INSTALL=0
 for a in "$@"; do case "$a" in --devid) DEVID=1;; --install) INSTALL=1;; esac; done
+if [[ "$INSTALL" == "1" && "$DEVID" != "1" ]]; then
+  echo "ABORT: --install requires --devid; ad-hoc builds remain in ./build." >&2
+  exit 64
+fi
 
 DEVID_ENTITLEMENTS="$SRC/app-devid.entitlements"
 ADHOC_ENTITLEMENTS="$SRC/app-developerid.entitlements"
@@ -197,6 +203,7 @@ if [ "$DEVID" = "1" ]; then
 fi
 
 if [ "$INSTALL" = "1" ]; then
+  production_install_guard "$DEVID" "$APP"
   echo "==> Installing into /Applications/$APPNAME.app (atomic stage → verify → swap)"
   DEST="/Applications/$APPNAME.app"
   # §5.9 ATOMIC install (was: cp -Rf "$APP" "$DEST" straight into the live path on
