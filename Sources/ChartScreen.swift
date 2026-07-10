@@ -311,8 +311,8 @@ struct ChartScreen: View {
             Spacer()
             switch feed.state {
             case .offline:
-                EmptyState(icon: "wifi.slash", title: "Your data backend isn't running",
-                           hint: "Black Label Trading ships its own data backend inside the app. It receives webhook-pushed ticks or bars into a local store on this Mac and serves them here. Start it, then refresh - or switch to Import to chart a CSV.")
+                EmptyState(icon: "wifi.slash", title: "Your data service isn't running",
+                           hint: "Black Label runs its own small data service inside the app, here on your Mac. Start it, then refresh — or switch to Import to chart a CSV file.")
                 HStack(spacing: 8) {
                     GoldButton(label: "Start my backend", icon: "bolt.fill") {
                         Task { loadingFeed = true; await feed.ensureBackendRunning(); await reconnectFeed(); loadingFeed = false }
@@ -321,7 +321,7 @@ struct ChartScreen: View {
                 }
             case .loggedOut, .notSignedIn, .connecting:
                 EmptyState(icon: "dot.radiowaves.left.and.right", title: "Waiting for browser feed data",
-                           hint: "One step: sign into your own TopstepX or WealthCharts session in the app-owned browser. The bridge posts observed market data into the local webhook/store. Once real data flows, it appears here. Nothing is ever fabricated.")
+                           hint: "One step: open your platform (TopstepX or WealthCharts) and sign in the way you always do. Black Label reads the live prices from your charts and shows them here. Nothing is ever made up.")
                 HStack(spacing: 8) {
                     // The one action a stranded buyer needs, right here — same call as the Connect
                     // screen's primary button (backend picks the default platform when source is nil).

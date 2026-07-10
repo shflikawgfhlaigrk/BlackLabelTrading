@@ -182,7 +182,7 @@ struct SignalsScreen: View {
                             ForEach(SignalFactor.allCases) { f in liveFactorRow(f) }
                         } else {
                             EmptyState(icon: "antenna.radiowaves.left.and.right",
-                                       title: factorsLoading ? "Reading your live bars…" : "Awaiting webhook data",
+                                       title: factorsLoading ? "Reading your live bars…" : "Waiting for your live prices",
                                        hint: "Factors compute automatically once your own captured bars are available (≥\(LiveFactorEngine.minBars) bars). Read-only by design — nothing is shown until it's real.")
                         }
                     }

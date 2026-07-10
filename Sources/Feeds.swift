@@ -97,6 +97,16 @@ struct ApiFeedStatus: Equatable {
     }
 
     var isLive: Bool { state == "live" }
+    // Plain-language version of the backend's status detail. Known jargon phrases are humanized for a
+    // non-technical buyer; anything else (a real error, a symbol note) passes through unchanged.
+    var friendlyDetail: String {
+        switch detail {
+        case "waiting for webhook data":
+            return "Not connected yet. Open your platform above and sign in — your live prices flow in here automatically."
+        default:
+            return detail
+        }
+    }
     var tint: Color {
         switch state {
         case "live": return BLTheme.green
@@ -207,18 +217,19 @@ struct ConnectFeedScreen: View {
     @State private var webhook = WebhookInfo()
     @State private var busy = false
     @State private var loaded = false
+    @State private var showAdvanced = false   // hides the developer webhook URL/token/curl by default
 
     private var current: FeedSourceInfo? { sources.first { $0.key == selected } }
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
-                ScreenTitle(title: "Connect a feed",
-                            subtitle: "Use the bundled browser bridge and local webhook URL to capture your own TopstepX or WealthCharts chart data. No API key is requested; sign into your own session in the app-owned browser and the bridge posts observed bars into this Mac.",
+                ScreenTitle(title: "Connect your platform",
+                            subtitle: "Connect the trading platform you already use — like TopstepX or WealthCharts. The app opens it in its own window; you sign in the way you always do, and Black Label reads the live prices straight from your charts. Your password is never stored, and the app only reads prices — it can never place a trade.",
                             icon: "antenna.radiowaves.left.and.right")
 
                 if let pre = feed.prereq {
-                    Panel(title: "One-time setup required", icon: "exclamationmark.triangle.fill", accent: BLTheme.gold) {
+                    Panel(title: "Reinstall to fix this", icon: "exclamationmark.triangle.fill", accent: BLTheme.gold) {
                         Text(pre.reason).font(.system(size: 13, weight: .bold, design: .rounded))
                             .foregroundColor(BLTheme.text).fixedSize(horizontal: false, vertical: true)
                         if !pre.detail.isEmpty {
@@ -226,10 +237,19 @@ struct ConnectFeedScreen: View {
                                 .foregroundColor(BLTheme.sub).fixedSize(horizontal: false, vertical: true)
                         }
                         if !pre.fix.isEmpty {
-                            Stat(label: "Run in Terminal", value: pre.fix)
-                            GhostButton(label: "Copy command", icon: "doc.on.doc") {
-                                NSPasteboard.general.clearContents()
-                                NSPasteboard.general.setString(pre.fix, forType: .string)
+                            // The fix here is a reinstall — NOT a Terminal command. Present it as plain
+                            // guidance with a one-tap way to get a fresh copy, never a scary "run this".
+                            Stat(label: "How to fix", value: pre.fix)
+                            HStack(spacing: 8) {
+                                GoldButton(label: "Get the latest version", icon: "arrow.down.circle") {
+                                    if let url = URL(string: "https://blacklabelbots.com/dashboard") {
+                                        NSWorkspace.shared.open(url)
+                                    }
+                                }
+                                GhostButton(label: "Copy", icon: "doc.on.doc") {
+                                    NSPasteboard.general.clearContents()
+                                    NSPasteboard.general.setString(pre.fix, forType: .string)
+                                }
                             }
                         }
                         GhostButton(label: "Retry", icon: "arrow.clockwise") {
@@ -291,11 +311,19 @@ struct ConnectFeedScreen: View {
                     .font(.system(size: 11.5, design: .rounded)).foregroundColor(BLTheme.sub)
                     .fixedSize(horizontal: false, vertical: true)
             } else if src.isWebhook {
-                Text("The bundled browser bridge opens your selected platform in a product-owned browser profile and posts observed market data to the local webhook/store. The webhook URL and curl below are copyable for inspection or a custom sender; your platform password is never stored.")
+                // Plain-language first: three simple steps + the primary action, so a non-technical
+                // buyer knows exactly what to do. The developer webhook details move into an optional
+                // "Advanced" drawer (hidden by default) instead of confronting everyone with a curl.
+                Text("Three steps, nothing to set up:")
+                    .font(.system(size: 12.5, weight: .bold, design: .rounded)).foregroundColor(BLTheme.text)
+                VStack(alignment: .leading, spacing: 5) {
+                    connectStep(1, "Click “Connect — open my platform”.")
+                    connectStep(2, "Sign into your platform the way you always do.")
+                    connectStep(3, "Open a chart — your live prices start flowing into the app.")
+                }
+                Text("Black Label only reads the prices on your charts. It never stores your password and can never place a trade.")
                     .font(.system(size: 11.5, design: .rounded)).foregroundColor(BLTheme.sub)
                     .fixedSize(horizontal: false, vertical: true)
-                webhookLine("Webhook URL", webhook.url)
-                webhookLine("Token", webhook.token.isEmpty ? "local backend has not reported a token yet" : webhook.token)
                 HStack(spacing: 8) {
                     GoldButton(label: busy ? "Opening your platform…" : "Connect — open my platform", icon: "globe") {
                         Task {
@@ -307,11 +335,24 @@ struct ConnectFeedScreen: View {
                             busy = false
                         }
                     }
-                    GhostButton(label: "Copy curl", icon: "doc.on.doc") { Task { if let w = await feed.webhookInfo() { copy(w.curl) } } }
                     GhostButton(label: "Refresh", icon: "arrow.clockwise") { Task { await refresh() } }
                 }
+                // Optional developer details — hidden by default so a non-technical buyer never sees a
+                // webhook URL / token / curl they don't need.
+                GhostButton(label: showAdvanced ? "Hide developer details" : "Advanced — developer details",
+                            icon: showAdvanced ? "chevron.up" : "chevron.down") {
+                    withAnimation(.easeOut(duration: 0.15)) { showAdvanced.toggle() }
+                }
+                if showAdvanced {
+                    Text("For a custom sender: the bundled browser bridge posts the observed market data to this local webhook URL on your Mac. The webhook URL, token, and a ready-made curl example are below — your platform password is never stored.")
+                        .font(.system(size: 11, design: .rounded)).foregroundColor(BLTheme.sub)
+                        .fixedSize(horizontal: false, vertical: true)
+                    webhookLine("Webhook URL", webhook.url)
+                    webhookLine("Token", webhook.token.isEmpty ? "local backend has not reported a token yet" : webhook.token)
+                    GhostButton(label: "Copy curl", icon: "doc.on.doc") { Task { if let w = await feed.webhookInfo() { copy(w.curl) } } }
+                }
             } else if src.isBrowser {
-                Text("Selecting \(src.label) opens it in the capture browser. Sign in and the app reads the same live market data feeding your charts and posts those bars into the local backend — no broker API key, no stored platform credentials.")
+                Text("Opens \(src.label) in its own window. Sign in the way you always do, and Black Label reads the same live prices feeding your charts. No broker key, and your password is never stored.")
                     .font(.system(size: 11.5, design: .rounded)).foregroundColor(BLTheme.sub)
                     .fixedSize(horizontal: false, vertical: true)
                 HStack(spacing: 8) {
@@ -325,6 +366,18 @@ struct ConnectFeedScreen: View {
                     .font(.system(size: 11.5, design: .rounded)).foregroundColor(BLTheme.sub)
                     .fixedSize(horizontal: false, vertical: true)
             }
+        }
+    }
+
+    // Numbered plain-language step for the "how to connect" list.
+    private func connectStep(_ n: Int, _ text: String) -> some View {
+        HStack(alignment: .top, spacing: 9) {
+            Text("\(n)")
+                .font(.system(size: 11, weight: .heavy, design: .rounded)).foregroundColor(Color(hex: 0x1A1305))
+                .frame(width: 20, height: 20).background(BLTheme.goldGrad).clipShape(Circle())
+            Text(text)
+                .font(.system(size: 12, weight: .medium, design: .rounded)).foregroundColor(BLTheme.text)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
@@ -362,8 +415,8 @@ struct ConnectFeedScreen: View {
             if let age = status.lastTickAge {
                 Stat(label: "Last tick", value: age < 1 ? "just now" : "\(Int(age))s ago")
             }
-            if !status.detail.isEmpty {
-                Text(status.detail).font(.system(size: 11.5, design: .rounded))
+            if !status.friendlyDetail.isEmpty {
+                Text(status.friendlyDetail).font(.system(size: 11.5, design: .rounded))
                     .foregroundColor(BLTheme.sub).fixedSize(horizontal: false, vertical: true)
             }
             HStack {
