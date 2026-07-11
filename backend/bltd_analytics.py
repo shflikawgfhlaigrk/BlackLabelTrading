@@ -323,6 +323,104 @@ def gate_rerun(store, symbols, engines, cfg=None) -> dict:
     }
 
 
+def _lab_fold(engine, ohlc, cfg, lookback, index, start_ts=None, end_ts=None) -> dict:
+    """Run the SHIPPED prover on ONE contiguous fold of bars and surface only honest OOS statistics:
+    the trade count n, wins/losses, net points, max-drawdown-R and the one-sided binomial p-value.
+    A fold with < SIG_MIN_N OOS trades is 'insufficient' — significance is NOT assessed and it is
+    never 'proven'. NO aggregate win-rate/$ headline is derived here."""
+    bars = len(ohlc)
+    base = {"fold": index, "bars": bars, "startTs": start_ts, "endTs": end_ts,
+            "trades": 0, "wins": 0, "losses": 0, "winRate": 0.0, "netPts": 0.0,
+            "expectancyR": 0.0, "maxDrawdownR": 0.0, "pEdge": 1.0,
+            "proven": False, "insufficient": True, "reason": ""}
+    if bars < lookback + 2:
+        base["reason"] = (f"insufficient bars — {bars} in this fold, prover arms at "
+                          f"{lookback + 2}")
+        return base
+    v = S.PROVERS[engine](ohlc, cfg)
+    trades = int(v.get("trades", 0))
+    insufficient = trades < S.SIG_MIN_N
+    proven = (not insufficient) and bool(v.get("edgeProven")) and bool(v.get("ok"))
+    win_rate = round(float(v.get("winRate", 0.0)), 4)
+    net_pts = round(float(v.get("netPts", 0.0)), 4)
+    p_edge = v.get("pEdge", 1.0)
+    if insufficient:
+        reason = (f"insufficient sample — {trades} OOS trades, need ≥{S.SIG_MIN_N} before "
+                  f"significance can be assessed")
+    elif proven:
+        reason = (f"OOS candidate — win {win_rate * 100:.1f}% / net {net_pts:+.2f} pts on "
+                  f"{trades} trades (p={p_edge:.3f}); research only, live verification required")
+    else:
+        reason = (f"no edge — win {win_rate * 100:.1f}% / net {net_pts:+.2f} pts on {trades} "
+                  f"OOS trades (p={p_edge:.3f}, need p<{S.SIG_ALPHA})")
+    base.update({"trades": trades, "wins": int(v.get("wins", 0)), "losses": int(v.get("losses", 0)),
+                 "winRate": win_rate, "netPts": net_pts,
+                 "expectancyR": round(float(v.get("expectancyR", 0.0)), 4),
+                 "maxDrawdownR": round(float(v.get("maxDrawdownR", 0.0)), 4), "pEdge": p_edge,
+                 "proven": proven, "insufficient": insufficient, "reason": reason})
+    return base
+
+
+def backtest_lab(store, engine: str, symbol: str, start_ts=None, end_ts=None,
+                 folds: int = 1, cfg=None) -> dict:
+    """No-code backtest lab (item 10): run the SAME SHIPPED prover (bltd_store.PROVERS[engine]) on
+    ONE (engine, symbol) over the buyer's OWN captured bars, optionally restricted to the epoch-second
+    window [start_ts, end_ts] and split into `folds` contiguous, non-overlapping folds. Returns per
+    fold the OOS trade count n / wins / losses / net points / max-drawdown-R / one-sided binomial
+    p-value, plus one whole-range row, stamped with the prover-source sha256 so the buyer can
+    reproduce it (`shasum -a 256 bltd_store.py`). A fold with < SIG_MIN_N OOS trades is reported
+    honestly as 'insufficient' (significance not assessed, never 'proven'). NO aggregate win-rate /
+    equity / $ figure is produced — this is the buyer's own edge math on their own chosen slice.
+    Nothing is downloaded or invented; an empty / too-thin store yields an honest empty verdict."""
+    cfg = cfg or store.config()
+    lookback = cfg.get("lookback", S.LOOKBACK)
+    label = "Run of the SHIPPED edge-gate prover on YOUR captured bars only — reproducible, not a promise, no performance guaranteed."
+    head = {"kind": "backtest_lab", "available": False, "engine": engine, "symbol": symbol,
+            "label": label, "source": "your own captured bars (this Mac's store)",
+            "prover_sha": S.prover_source_sha(), "sigMinN": S.SIG_MIN_N, "alpha": S.SIG_ALPHA,
+            "test": "one-sided binomial vs R-geometry breakeven",
+            "startTs": start_ts, "endTs": end_ts, "folds": [], "whole": None, "reason": ""}
+    if engine not in S.PROVERS:
+        head["reason"] = f"unknown engine '{engine}'"
+        return head
+    if not S.in_scope(symbol):
+        head["reason"] = f"'{symbol}' is not a recognized instrument"
+        return head
+    try:
+        nfolds = max(1, min(8, int(folds)))
+    except (TypeError, ValueError):
+        nfolds = 1
+    ohlc = store.ohlc_between(symbol, start_ts, end_ts)
+    total = len(ohlc)
+    head["totalBars"] = total
+    head["foldCount"] = nfolds
+    if total < lookback + 2:
+        head["reason"] = (f"insufficient bars — only {total} captured for {symbol} in this range "
+                          f"(prover arms at {lookback + 2}); connect your feed and let bars accumulate")
+        return head
+    head["available"] = True
+    # Whole-range row (one fold spanning everything the buyer selected).
+    head["whole"] = _lab_fold(engine, ohlc, cfg, lookback, 0, start_ts, end_ts)
+    # Contiguous, non-overlapping folds across the selected range.
+    size = total // nfolds
+    fold_rows = []
+    if nfolds == 1 or size < lookback + 2:
+        # Too few bars to split meaningfully — one honest fold rather than a wall of 'insufficient'.
+        fold_rows.append(dict(head["whole"], fold=1))
+        head["foldCount"] = 1
+    else:
+        for i in range(nfolds):
+            lo = i * size
+            hi = total if i == nfolds - 1 else (i + 1) * size
+            fold_rows.append(_lab_fold(engine, ohlc[lo:hi], cfg, lookback, i + 1))
+    head["folds"] = fold_rows
+    provenN = sum(1 for f in fold_rows if f["proven"])
+    head["provenFolds"] = provenN
+    head["status"] = ("candidate" if head["whole"]["proven"] else
+                      ("insufficient" if head["whole"]["insufficient"] else "no_edge"))
+    return head
+
+
 # ===========================================================================
 # chart studies — EMA / VWAP / RSI / Bollinger from real OHLC bars
 # ===========================================================================

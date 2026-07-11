@@ -1775,6 +1775,54 @@ func testGateRerunDecodeAndStatFormatting() {
     ok(!empty.available && empty.reason == "no bars captured yet", "empty rerun decode honest")
 }
 
+// ===== No-code backtest lab (item 10): BacktestLabReport.decode + per-fold stat formatting =====
+// The lab runs the SAME shipped prover on the buyer's OWN captured bars, date-scoped, split into
+// folds. These lock the decode contract + honest 'insufficient'/'no aggregate figure' guarantees.
+func testBacktestLabDecodeAndFolds() {
+    let obj: [String: Any] = [
+        "available": true, "engine": "meanrev", "symbol": "CM.ESU6",
+        "prover_sha": "3e818b54f842ebcf", "sigMinN": 30, "alpha": 0.05,
+        "test": "one-sided binomial vs R-geometry breakeven", "source": "your own captured bars",
+        "generatedUTC": "2026-07-11T04:00:00Z", "totalBars": 600, "status": "no_edge",
+        "whole": ["fold": 0, "bars": 600, "trades": 51, "wins": 24, "losses": 27,
+                  "winRate": 0.4706, "netPts": -6.5, "expectancyR": -0.05, "maxDrawdownR": 8.0,
+                  "pEdge": 0.61, "proven": false, "insufficient": false,
+                  "reason": "no edge — win 47.1% / net -6.50 pts on 51 OOS trades (p=0.610, need p<0.05)"],
+        "folds": [
+            ["fold": 1, "bars": 300, "trades": 34, "wins": 15, "losses": 19,
+             "winRate": 0.44, "netPts": -4.0, "expectancyR": -0.08, "maxDrawdownR": 6.0,
+             "pEdge": 0.72, "proven": false, "insufficient": false, "reason": "no edge"],
+            ["fold": 2, "bars": 300, "trades": 12, "wins": 6, "losses": 6,
+             "winRate": 0.5, "netPts": 1.0, "expectancyR": 0.03, "maxDrawdownR": 2.0,
+             "pEdge": 1.0, "proven": false, "insufficient": true,
+             "reason": "insufficient sample — 12 OOS trades, need ≥30"],
+        ],
+    ]
+    let r = BacktestLabReport.decode(obj)
+    ok(r.available, "lab decode available")
+    ok(r.engine == "meanrev" && r.symbol == "CM.ESU6", "engine + instrument decoded")
+    ok(r.proverSHA == "3e818b54f842ebcf", "lab prover_sha decoded")
+    eqi(r.minTrades, 30, "lab sigMinN decoded")
+    eqi(r.totalBars, 600, "lab totalBars decoded")
+    eqi(r.folds.count, 2, "both folds decoded")
+    // Whole-range stat line shows n / W/L / net / maxDD / p — reproducible numbers, no headline metric.
+    let w = r.whole!
+    let line = w.statLine(minTrades: r.minTrades)
+    ok(line.contains("n=51"), "lab whole-range shows n")
+    ok(line.contains("24W/27L"), "lab whole-range shows W/L")
+    ok(line.contains("maxDD 8.00R"), "lab whole-range shows max drawdown in R")
+    ok(line.contains("p=0.610"), "lab whole-range shows p for a sufficient sample")
+    // Thin fold: p is n/a (never a misleading p-value on < min-n), and it is never 'proven'.
+    let thin = r.folds[1]
+    ok(thin.insufficient && !thin.proven, "thin fold flagged insufficient, never proven")
+    ok(thin.statLine(minTrades: r.minTrades).contains("p n/a (n<30)"), "thin fold hides untrustworthy p")
+    ok(r.proverLine.contains("3e818b54f842ebcf") && r.proverLine.contains("min n 30"), "lab prover line reproducible")
+    // Honest empty decode — an unavailable report carries no fabricated numbers.
+    let empty = BacktestLabReport.decode(["available": false, "reason": "insufficient bars — only 4 captured"])
+    ok(!empty.available && empty.whole == nil && empty.folds.isEmpty, "empty lab decode honest")
+    ok(empty.reason.contains("insufficient bars"), "empty lab keeps honest reason")
+}
+
 // ===== In-app auto-updater (pure core: version compare, sha256, manifest decode, check window) =====
 // Mirrors the proven Black Label Real Estate testUpdater(). App-shell updater only — it never
 // touches the engines, the feed, the edge-gate, or any signal; these are the headless-verifiable
@@ -1962,6 +2010,9 @@ testGateVerdictNoEdgeAndReasons()
 testGateVerdictAllNoEdgeHeadline()
 testGateVerdictEmptyStoreHonest()
 testGateRerunDecodeAndStatFormatting()
+
+// No-code backtest lab (item 10): decode + per-fold honest stat formatting on the buyer's own bars.
+testBacktestLabDecodeAndFolds()
 
 // Prop-firm rule profiles (item 7): the profile-gating decision on the buyer's own caps.
 testRuleProfileGateWithinLimitsAndMax()

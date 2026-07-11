@@ -356,6 +356,53 @@ def test_exec_creds_route_records_nonsecret_account():
         srv.shutdown()
 
 
+def test_backtest_lab_route_seeds_bars_and_returns_provenance():
+    """The no-code lab route runs the SHIPPED prover on the buyer's OWN captured bars and returns
+    per-fold n/W/L/max-drawdown-R/p + prover_sha — honest 'insufficient' on a thin seed, never a
+    fabricated aggregate headline."""
+    srv, port = _start_server()
+    try:
+        h = f"127.0.0.1:{port}"
+        now = int(time.time())
+        # Seed a real series of bars via the webhook (the buyer's own data path).
+        bars = [[100.0 + i * 0.25, 100.0 + i * 0.25, 100.0 + i * 0.25, 100.0 + i * 0.25, now + i]
+                for i in range(80)]
+        st, o = _req(port, "POST", "/webhook/feed", host=h, token=TOK,
+                     body={"symbol": "LABX6", "bars": bars})
+        assert st == 200 and o["ok"] is True
+
+        st, bnd = _req(port, "GET", "/api/backtest/bounds?symbol=LABX6", host=h, token=TOK)
+        assert st == 200 and bnd["count"] == 80
+        assert bnd["firstTs"] == now and bnd["lastTs"] == now + 79
+
+        st, r = _req(port, "GET", "/api/backtest/run?engine=meanrev&symbol=LABX6&folds=2",
+                     host=h, token=TOK)
+        assert st == 200
+        assert r["engine"] == "meanrev" and r["symbol"] == "LABX6"
+        assert len(r["prover_sha"]) == 16 and r["sigMinN"] == S.SIG_MIN_N
+        assert r["available"] is True and r["whole"] is not None
+        for f in r["folds"]:
+            assert f["wins"] + f["losses"] == f["trades"]          # honest W/L split
+            if f["trades"] < S.SIG_MIN_N:
+                assert f["insufficient"] is True and f["proven"] is False
+        # never a fabricated aggregate win-rate / $ headline
+        assert "winRateAll" not in r and "netPnlDollars" not in r
+    finally:
+        srv.shutdown()
+
+
+def test_backtest_run_host_and_auth_gated():
+    srv, port = _start_server()
+    try:
+        h = f"127.0.0.1:{port}"
+        st, _ = _req(port, "GET", "/api/backtest/run?engine=meanrev&symbol=LABX6", host="attacker.com")
+        assert st == 403                                          # host allowlist before anything
+        st, _ = _req(port, "GET", "/api/backtest/run?engine=meanrev&symbol=LABX6", host=h)
+        assert st == 401                                          # auth required (no token)
+    finally:
+        srv.shutdown()
+
+
 if __name__ == "__main__":
     import sys
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

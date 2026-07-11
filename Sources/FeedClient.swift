@@ -35,6 +35,8 @@ final class FeedClient: ObservableObject {
     }
     private var token: String? = nil
     private var signedIn: Bool { token != nil }
+    // Public read of the session state for view gating (the token itself stays private).
+    var isSignedIn: Bool { signedIn }
 
     private static let urlKey = "com.blacklabel.trading.feedURL"
     static let defaultURL = "http://127.0.0.1:8787"
@@ -246,6 +248,33 @@ final class FeedClient: ObservableObject {
     func rerunGate() async -> GateRerunReport {
         guard signedIn, let obj = await getJSON("/api/gate/rerun") else { return .empty }
         return GateRerunReport.decode(obj)
+    }
+
+    // MARK: - No-code backtest lab (GET /api/backtest/run): runs the SHIPPED prover on ONE
+    // (engine, symbol) over the buyer's OWN captured bars, optionally date-scoped, split into folds.
+    // Returns per-fold n / W / L / max-drawdown-R / p + prover_sha — never a fabricated headline.
+    // Signed-out or unreachable backend -> honest empty report (available == false).
+    func runBacktestLab(engine: String, symbol: String,
+                        startTs: Int? = nil, endTs: Int? = nil, folds: Int = 1) async -> BacktestLabReport {
+        let s = symbol.trimmingCharacters(in: .whitespaces)
+        guard signedIn, !s.isEmpty, !engine.isEmpty else { return .empty }
+        var path = "/api/backtest/run?engine=\(enc(engine))&symbol=\(enc(s))&folds=\(max(1, folds))"
+        if let a = startTs { path += "&start=\(a)" }
+        if let b = endTs { path += "&end=\(b)" }
+        guard let obj = await getJSON(path) else { return .empty }
+        return BacktestLabReport.decode(obj)
+    }
+
+    // First/last captured epoch + count for a symbol (GET /api/backtest/bounds) — the lab's honest
+    // date-range default (the real span of the buyer's OWN data). Empty store -> zeros.
+    func barBounds(symbol: String) async -> (count: Int, firstTs: Int?, lastTs: Int?) {
+        let s = symbol.trimmingCharacters(in: .whitespaces)
+        guard signedIn, !s.isEmpty, let obj = await getJSON("/api/backtest/bounds?symbol=\(enc(s))") else {
+            return (0, nil, nil)
+        }
+        let first = FeedBars.num(obj["firstTs"] as Any).map { Int($0) }
+        let last = FeedBars.num(obj["lastTs"] as Any).map { Int($0) }
+        return (Int(FeedBars.num(obj["count"] as Any) ?? 0), first, last)
     }
 
     // MARK: - Signal journal (GET /api/fires): real edge-gated fires recorded from the live feed.

@@ -1133,6 +1133,87 @@ def test_gate_rerun_labels_thin_sample_insufficient():
         assert "insufficient" in c["reason"].lower()
 
 
+# ===========================================================================
+# No-code backtest lab (bltd_analytics.backtest_lab) — SHIPPED prover, date-scoped, per-fold,
+# honest 'insufficient', no aggregate win-rate/$ figure.
+# ===========================================================================
+class _LabStore:
+    def __init__(self, series):
+        self._series = series          # {symbol: [(o,h,l,c), ...]}
+
+    def config(self):
+        return S.CONFIG_DEFAULTS
+
+    def ohlc_between(self, symbol, start_ts=None, end_ts=None, limit=20000):
+        return self._series.get(symbol, [])
+
+
+def test_backtest_lab_unknown_engine_and_symbol_are_honest():
+    import bltd_analytics as A
+    r1 = A.backtest_lab(_LabStore({}), "not_an_engine", "CM.ESU6")
+    assert r1["available"] is False and "unknown engine" in r1["reason"]
+    assert len(r1["prover_sha"]) == 16                     # sha stamped even on the error path
+    orig_scope = S.INSTRUMENT_SCOPE
+    try:
+        S.INSTRUMENT_SCOPE = "es"                           # narrow scope rejects a junk instrument
+        r2 = A.backtest_lab(_LabStore({}), "meanrev", "NOTASYMBOL@@")
+    finally:
+        S.INSTRUMENT_SCOPE = orig_scope
+    assert r2["available"] is False and "not a recognized instrument" in r2["reason"]
+
+
+def test_backtest_lab_thin_range_reports_insufficient_not_fabricated():
+    import bltd_analytics as A
+    orig_scope = S.INSTRUMENT_SCOPE
+    try:
+        S.INSTRUMENT_SCOPE = "all"
+        series = {"CM.ESU6": [(100.0 + (1.0 if i % 2 else -1.0),) * 4 for i in range(60)]}
+        rep = A.backtest_lab(_LabStore(series), "meanrev", "CM.ESU6", folds=1)
+    finally:
+        S.INSTRUMENT_SCOPE = orig_scope
+    assert rep["available"] is True
+    w = rep["whole"]
+    if w["trades"] < S.SIG_MIN_N:
+        assert w["insufficient"] is True and w["proven"] is False
+        assert "insufficient" in w["reason"].lower()
+    # never a fabricated aggregate headline
+    assert "winRateAll" not in rep and "netPnlDollars" not in rep
+
+
+def test_backtest_lab_runs_shipped_prover_per_fold_with_provenance():
+    import bltd_analytics as A
+    orig_scope = S.INSTRUMENT_SCOPE
+    try:
+        S.INSTRUMENT_SCOPE = "all"
+        series = {"CM.ESU6": [(100.0 + i * 0.3,) * 4 for i in range(600)]}
+        rep = A.backtest_lab(_LabStore(series), "meanrev", "CM.ESU6", folds=3)
+    finally:
+        S.INSTRUMENT_SCOPE = orig_scope
+    assert rep["available"] is True
+    assert rep["prover_sha"] == S.prover_source_sha() and rep["sigMinN"] == S.SIG_MIN_N
+    assert rep["whole"] is not None
+    assert 1 <= len(rep["folds"]) <= 3
+    for f in rep["folds"]:
+        for k in ("fold", "bars", "trades", "wins", "losses", "maxDrawdownR", "pEdge",
+                  "proven", "insufficient", "reason"):
+            assert k in f, k
+        assert f["wins"] + f["losses"] == f["trades"]          # honest W/L split
+        if f["trades"] < S.SIG_MIN_N:
+            assert f["insufficient"] is True and f["proven"] is False
+
+
+def test_backtest_lab_empty_store_is_honest_pending():
+    import bltd_analytics as A
+    orig_scope = S.INSTRUMENT_SCOPE
+    try:
+        S.INSTRUMENT_SCOPE = "all"
+        rep = A.backtest_lab(_LabStore({"CM.ESU6": []}), "meanrev", "CM.ESU6")
+    finally:
+        S.INSTRUMENT_SCOPE = orig_scope
+    assert rep["available"] is False and "insufficient bars" in rep["reason"]
+    assert rep["folds"] == [] and rep["whole"] is None
+
+
 if __name__ == "__main__":
     import sys
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

@@ -618,6 +618,102 @@ struct GateRerunReport: Equatable {
     }
 }
 
+// MARK: - No-code backtest lab from GET /api/backtest/run.
+// The buyer picks ONE engine + ONE instrument + an optional date range; the backend runs the SAME
+// shipped prover (bltd_store.PROVERS) on their OWN captured bars, split into contiguous folds, and
+// returns per-fold n / W / L / max-drawdown-R / p-value + the prover sha256. NO aggregate win-rate,
+// NO equity, NO $ figure, NO promise — the buyer's own edge math on their own chosen slice. A fold
+// with fewer than minTrades OOS trades decodes as `insufficient` (significance not assessed).
+struct BacktestLabFold: Equatable, Identifiable {
+    var fold: Int
+    var bars: Int
+    var trades: Int          // n — OOS trades
+    var wins: Int
+    var losses: Int
+    var winRate: Double
+    var netPts: Double
+    var expectancyR: Double
+    var maxDrawdownR: Double
+    var pEdge: Double
+    var proven: Bool
+    var insufficient: Bool
+    var reason: String
+    var id: Int { fold }
+
+    // Raw, reproducible stat line — no interpretation, no headline metric.
+    func statLine(minTrades: Int) -> String {
+        if trades == 0 { return "n=0 · no trades triggered on your bars" }
+        let base = "n=\(trades) · \(wins)W/\(losses)L · net \(String(format: "%+.2f", netPts)) pts · maxDD \(String(format: "%.2f", maxDrawdownR))R"
+        if insufficient { return base + " · p n/a (n<\(minTrades))" }
+        return base + " · p=\(String(format: "%.3f", pEdge))"
+    }
+}
+
+struct BacktestLabReport: Equatable {
+    var available: Bool
+    var engine: String
+    var symbol: String
+    var label: String
+    var source: String
+    var proverSHA: String
+    var minTrades: Int
+    var alpha: Double
+    var test: String
+    var generatedUTC: String
+    var totalBars: Int
+    var status: String       // "candidate" | "no_edge" | "insufficient"
+    var whole: BacktestLabFold?
+    var folds: [BacktestLabFold]
+    var reason: String
+
+    static let empty = BacktestLabReport(
+        available: false, engine: "", symbol: "",
+        label: "Run of the SHIPPED edge-gate prover on YOUR captured bars only — reproducible, not a promise, no performance guaranteed.",
+        source: "", proverSHA: "", minTrades: 30, alpha: 0.05, test: "", generatedUTC: "",
+        totalBars: 0, status: "insufficient", whole: nil, folds: [], reason: "")
+
+    var proverLine: String {
+        "prover \(proverSHA.isEmpty ? "—" : proverSHA) · one-sided binomial p<\(String(format: "%.2f", alpha)) · min n \(minTrades)"
+    }
+
+    private static func decodeFold(_ f: [String: Any]) -> BacktestLabFold {
+        BacktestLabFold(
+            fold: Int(FeedBars.num(f["fold"] as Any) ?? 0),
+            bars: Int(FeedBars.num(f["bars"] as Any) ?? 0),
+            trades: Int(FeedBars.num(f["trades"] as Any) ?? 0),
+            wins: Int(FeedBars.num(f["wins"] as Any) ?? 0),
+            losses: Int(FeedBars.num(f["losses"] as Any) ?? 0),
+            winRate: FeedBars.num(f["winRate"] as Any) ?? 0,
+            netPts: FeedBars.num(f["netPts"] as Any) ?? 0,
+            expectancyR: FeedBars.num(f["expectancyR"] as Any) ?? 0,
+            maxDrawdownR: FeedBars.num(f["maxDrawdownR"] as Any) ?? 0,
+            pEdge: FeedBars.num(f["pEdge"] as Any) ?? 1.0,
+            proven: (f["proven"] as? Bool) ?? false,
+            insufficient: (f["insufficient"] as? Bool) ?? false,
+            reason: (f["reason"] as? String) ?? "")
+    }
+
+    static func decode(_ obj: [String: Any]) -> BacktestLabReport {
+        var out = BacktestLabReport.empty
+        out.available = (obj["available"] as? Bool) ?? false
+        out.engine = (obj["engine"] as? String) ?? ""
+        out.symbol = (obj["symbol"] as? String) ?? ""
+        out.label = (obj["label"] as? String) ?? out.label
+        out.source = (obj["source"] as? String) ?? ""
+        out.proverSHA = (obj["prover_sha"] as? String) ?? ""
+        out.minTrades = Int(FeedBars.num(obj["sigMinN"] as Any) ?? 30)
+        out.alpha = FeedBars.num(obj["alpha"] as Any) ?? 0.05
+        out.test = (obj["test"] as? String) ?? ""
+        out.generatedUTC = (obj["generatedUTC"] as? String) ?? ""
+        out.totalBars = Int(FeedBars.num(obj["totalBars"] as Any) ?? 0)
+        out.status = (obj["status"] as? String) ?? "insufficient"
+        out.reason = (obj["reason"] as? String) ?? ""
+        if let w = obj["whole"] as? [String: Any] { out.whole = decodeFold(w) }
+        out.folds = ((obj["folds"] as? [[String: Any]]) ?? []).map { decodeFold($0) }
+        return out
+    }
+}
+
 // MARK: - Signal journal from GET /api/fires.
 // Real recorded (non-synthetic) edge-gated fires, newest first. outcome/pnl are nil until the
 // daemon grades the signal (honest — never an invented result for an open signal). A row with no

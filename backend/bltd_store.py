@@ -1464,6 +1464,33 @@ class Store:
         return [((o if o is not None else c), (h if h is not None else c),
                  (l if l is not None else c), c) for (o, h, l, c) in rows]
 
+    def ohlc_between(self, symbol: str, start_ts=None, end_ts=None, limit: int = 20000):
+        """A symbol's bars as [(o,h,l,c), ...] oldest->newest, optionally restricted to the closed
+        epoch-second window [start_ts, end_ts] — the date-scoped input for the no-code backtest lab.
+        Same null-tolerant close fallback as ohlc(). Out-of-scope symbol -> [] (honest)."""
+        if not in_scope(symbol):
+            return []
+        clauses = ["symbol=?"]
+        params: list = [symbol]
+        if start_ts is not None:
+            clauses.append("ts>=?"); params.append(int(start_ts))
+        if end_ts is not None:
+            clauses.append("ts<=?"); params.append(int(end_ts))
+        params.append(int(limit))
+        rows = self._q("SELECT o,h,l,c FROM bars WHERE " + " AND ".join(clauses)
+                       + " ORDER BY ts LIMIT ?", tuple(params))
+        return [((o if o is not None else c), (h if h is not None else c),
+                 (l if l is not None else c), c) for (o, h, l, c) in rows]
+
+    def bar_bounds(self, symbol: str) -> dict:
+        """First/last captured epoch-second timestamp + bar count for a symbol — so the lab can show
+        the buyer the real span of their OWN data and default the date range to it. Empty -> zeros."""
+        if not in_scope(symbol):
+            return {"symbol": symbol, "count": 0, "firstTs": None, "lastTs": None}
+        r = self._q("SELECT COUNT(*), MIN(ts), MAX(ts) FROM bars WHERE symbol=?", (symbol,))
+        n, lo, hi = (r[0] if r else (0, None, None))
+        return {"symbol": symbol, "count": int(n or 0), "firstTs": lo, "lastTs": hi}
+
     def config(self) -> dict:
         """The current buyer config (defaults + persisted overrides, range-clamped)."""
         return load_config(self.config_path)
