@@ -23,6 +23,7 @@ Endpoints (Bearer token from /auth/signin required on /api/*):
   GET  /api/studies?symbol=&limit=300     -> {symbol, studies:{ema/vwap/rsi/bollinger...}}
   GET  /api/backtest?engine=&symbol=      -> {ok, stats:{...}, curve:[...], reason}
   GET  /api/screen?symbols=&engines=      -> {rows:[{engine,symbol,edge,winRate,netPts...}]}
+  GET  /api/gate/rerun?symbols=&engines=  -> {available,prover_sha,sigMinN,alpha,engines:[{engine,status,contracts:[{n,wins,losses,maxDrawdownR,pEdge...}]}], ...}
   GET  /api/fires?limit=&symbol=&engine=  -> {fires:[{...}]}   (the signal journal)
   GET  /api/journal?symbol=&engine=       -> {graded, winRate, netPnl, byEngine}
   GET  /api/feed/sources                  -> {sources:[{key,label,kind,credFields,note}], active}
@@ -689,6 +690,17 @@ class H(BaseHTTPRequestHandler):
                 syms = bltd_store.scoped_symbols(requested_syms) if requested_syms else STORE.symbols().get("backtestable", [])
                 engs = [e for e in g("engines").split(",") if e] or cfg.get("engines", [])
                 return self._send(200, {"rows": bltd_analytics.screen(STORE, syms, engs, cfg)})
+            if u.path == "/api/gate/rerun":
+                # Buyer-triggered one-click re-run of the SHIPPED edge-gate over their OWN captured
+                # bars — full n/W/L/drawdown/p-value per (engine, contract) + prover_sha. Every scoped
+                # symbol × every engine (no cherry-picking); honest 'insufficient' under SIG_MIN_N.
+                cfg = STORE.config()
+                requested_syms = [s for s in g("symbols").split(",") if s]
+                syms = bltd_store.scoped_symbols(requested_syms) if requested_syms else STORE.symbols().get("backtestable", [])
+                engs = [e for e in g("engines").split(",") if e] or cfg.get("engines", [])
+                report = bltd_analytics.gate_rerun(STORE, syms, engs, cfg)
+                report["generatedUTC"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                return self._send(200, report)
             if u.path == "/api/fires":
                 return self._send(200, STORE.fires(int(g("limit", "200")),
                                                    g("symbol") or None, g("engine") or None))

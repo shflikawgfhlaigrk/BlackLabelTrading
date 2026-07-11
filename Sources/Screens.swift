@@ -96,6 +96,8 @@ struct SignalsScreen: View {
     @State private var backendFires: [FireRow] = []
     @State private var fleetLoading = false
     @State private var reference = ReferenceReport.empty   // reference OOS verdicts on historical ES
+    @State private var rerun: GateRerunReport? = nil       // buyer-triggered re-run of the gate on own bars
+    @State private var rerunning = false
     @State private var dailyLogPath: String? = nil   // path shown after "Export daily logs"
     @State private var tAccount = "50000"             // order-ticket sizing inputs (your own values)
     @State private var tRiskPct = "1"
@@ -116,12 +118,22 @@ struct SignalsScreen: View {
                     StatusPill(text: live.hasData ? "Live" : "Awaiting feed", tint: live.hasData ? BLTheme.green : BLTheme.gold)
                 }
 
+                // FIRST-CLASS "NO EDGE TODAY" verdict — the buyer's live gate result on THEIR OWN
+                // captured bars, promoted to the top of the dashboard with per-engine reject reasons
+                // front-and-center. This is the honesty wedge: the tool tells you plainly when none
+                // of your engines has an edge today, rather than manufacturing a signal.
+                noEdgeHero
+
                 // Reachable local account-reference entry point from the main dashboard.
                 wealthChartsBanner
 
                 // The real edge-gated engine fleet (backend /api/screen + /api/fires) — every
                 // engine's honest OOS verdict on the buyer's OWN captured bars.
                 engineFleet
+
+                // One-click reproducible re-run of the SAME edge-gate over the buyer's own bars —
+                // prover_sha + full n / W / L / max-drawdown / p-value. Buyer-verifiable, no cherry-picking.
+                rerunGatePanel
 
                 // REFERENCE ONLY: the same edge-gate run on Black Label's OWN historical ES bars, so
                 // a cold buyer sees the gate produce a real, earned verdict before they've captured a
@@ -316,6 +328,130 @@ struct SignalsScreen: View {
         let fires = await feed.recentFires()
         let ref = await feed.referenceReport()
         await MainActor.run { fleet = rows; backendFires = fires; reference = ref; fleetLoading = false }
+    }
+
+    // FIRST-CLASS "NO EDGE TODAY" hero. A pure roll-up (GateVerdict.compute) of the SAME engine
+    // fleet rows the panel below shows — promoted to the top so the honest verdict is the first
+    // thing a buyer reads. Empty store => honest "no bars captured yet" (never a manufactured
+    // signal). NO aggregate win-rate / P&L / promise — just how many engines have no edge today.
+    private var noEdgeHero: some View {
+        let v = GateVerdict.compute(fleet)
+        let accent = v.candidates > 0 ? BLTheme.green : BLTheme.gold
+        return VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 14) {
+                Image(systemName: !v.hasData ? "antenna.radiowaves.left.and.right"
+                      : (v.candidates > 0 ? "checkmark.seal.fill" : "shield.lefthalf.filled"))
+                    .font(.system(size: 21, weight: .black)).foregroundColor(Color(hex: 0x1A1305))
+                    .frame(width: 46, height: 46)
+                    .background(v.candidates > 0
+                                ? AnyShapeStyle(LinearGradient(colors: [BLTheme.green, BLTheme.green.opacity(0.7)], startPoint: .top, endPoint: .bottom))
+                                : AnyShapeStyle(BLTheme.goldGrad))
+                    .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
+                    .shadow(color: accent.opacity(0.35), radius: 8, y: 2)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(v.headline).font(.system(size: 18, weight: .heavy, design: .rounded)).foregroundColor(BLTheme.text)
+                    Text(v.subline).font(.system(size: 11.5, weight: .medium, design: .rounded))
+                        .foregroundColor(BLTheme.sub).fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer()
+                if v.hasData {
+                    StatusPill(text: v.isNoEdge ? "NO EDGE TODAY" : "\(v.candidates) OOS CAND",
+                               tint: v.isNoEdge ? BLTheme.gold : BLTheme.green)
+                }
+            }
+            if !v.hasData {
+                Text("The gate verdict is computed only from your own captured bars — nothing is shown until it's real.")
+                    .font(.system(size: 11.5, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+                    .fixedSize(horizontal: false, vertical: true)
+                GoldButton(label: "Connect my feed", icon: "globe") { nav.section = .feeds }
+            } else if !v.rejects.isEmpty {
+                Divider().background(BLTheme.stroke).padding(.vertical, 1)
+                Text("WHY — PER-ENGINE, ON YOUR BARS")
+                    .font(.system(size: 9.5, weight: .bold, design: .rounded)).foregroundColor(BLTheme.sub).tracking(0.5)
+                VStack(spacing: 6) { ForEach(v.rejects) { rejectRow($0) } }
+            }
+        }
+        .padding(18)
+        .holoCard(radius: 16)
+    }
+
+    private func rejectRow(_ r: GateReject) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "xmark.seal").font(.system(size: 12, weight: .bold)).foregroundColor(BLTheme.sub).padding(.top, 1)
+            Text(EngineRoster.label(for: r.engine)).font(.system(size: 11.5, weight: .bold, design: .rounded))
+                .foregroundColor(BLTheme.text).frame(width: 118, alignment: .leading)
+            Text(r.reason).font(.system(size: 10.5, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+        }
+        .padding(.vertical, 6).padding(.horizontal, 10).background(BLTheme.bg2).clipShape(RoundedRectangle(cornerRadius: 9))
+    }
+
+    // One-click, buyer-reproducible re-run of the edge-gate over the buyer's OWN captured bars.
+    // Reuses the SHIPPED provers via GET /api/gate/rerun and shows prover_sha + n / W / L /
+    // max-drawdown / p-value per engine. NO cherry-picking, NO $ figures, NO win-rate marketing.
+    private var rerunGatePanel: some View {
+        Panel(title: "Re-run the edge gate on my bars", icon: "arrow.clockwise.circle.fill", accent: BLTheme.gold) {
+            Text("Runs the SAME shipped provers over YOUR captured bars — every engine, every instrument you stream, no cherry-picking. Shows the prover fingerprint (sha256 of the gate source), the OOS trade count, wins / losses, max drawdown in R, and the one-sided binomial p-value. Reproducible by you: shasum -a 256 bltd_store.py.")
+                .font(.system(size: 11, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 10) {
+                GoldButton(label: rerunning ? "Re-running the gate…" : "Re-run the edge gate on my bars",
+                           icon: "arrow.clockwise") { Task { await runRerun() } }
+                    .disabled(rerunning)
+                if let r = rerun, r.available {
+                    Spacer()
+                    StatusPill(text: "\(r.candidateCount) cand · \(r.noEdgeCount) no edge · \(r.insufficientCount) thin",
+                               tint: r.candidateCount > 0 ? BLTheme.green : BLTheme.gold)
+                }
+            }
+            if let r = rerun {
+                if !r.available {
+                    EmptyState(icon: "shield.lefthalf.filled", title: "Nothing to re-run yet",
+                               hint: r.reason ?? "Connect your feed and let bars accumulate, then re-run the gate on your own data.")
+                } else {
+                    Divider().background(BLTheme.stroke).padding(.vertical, 2)
+                    VStack(spacing: 8) { ForEach(r.engines) { rerunRow($0, minTrades: r.minTrades) } }
+                    rerunProvenance(r)
+                }
+            }
+        }
+    }
+
+    private func rerunRow(_ e: GateRerunEngine, minTrades: Int) -> some View {
+        let cand = e.isCandidate
+        let tint = cand ? BLTheme.green : (e.isInsufficient ? BLTheme.sub : BLTheme.gold)
+        let status = cand ? "OOS CAND" : (e.isInsufficient ? "THIN" : "NO EDGE")
+        return HStack(spacing: 12) {
+            Image(systemName: cand ? "checkmark.seal.fill" : "xmark.seal")
+                .font(.system(size: 14, weight: .bold)).foregroundColor(tint)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(EngineRoster.label(for: e.engine)).font(.system(size: 13, weight: .bold, design: .rounded)).foregroundColor(BLTheme.text)
+                if let b = e.best {
+                    Text(b.statLine(minTrades: minTrades))
+                        .font(.system(size: 10, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+                        .monospacedDigit().lineLimit(1)
+                }
+            }
+            Spacer()
+            StatusPill(text: status, tint: tint)
+        }
+        .padding(12).background(BLTheme.panel2).clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 11, style: .continuous).stroke(BLTheme.stroke, lineWidth: 1))
+    }
+
+    private func rerunProvenance(_ r: GateRerunReport) -> some View {
+        let ran = r.generatedUTC.isEmpty ? "" : " · ran " + r.generatedUTC
+        let syms = r.symbols.isEmpty ? "" : " · your symbols: " + r.symbols.joined(separator: ", ")
+        return Text("Reproducible: " + r.proverLine + ran + syms)
+            .font(.system(size: 9, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private func runRerun() async {
+        rerunning = true
+        let r = await feed.rerunGate()
+        await MainActor.run { rerun = r; rerunning = false }
     }
 
     // The edge-gated engine fleet, grouped by engine with its real status. NEVER hardcodes a

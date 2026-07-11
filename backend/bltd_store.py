@@ -575,19 +575,38 @@ def _edge_proven(trades, wins, n, expectancy, min_trades, target_r=None):
     return _edge_pvalue(trades, wins, n, expectancy, min_trades, target_r) < SIG_ALPHA
 
 
+def _max_drawdown_r(trades):
+    """Peak-to-trough drawdown of the cumulative-R equity curve over the OOS trade sequence, in R
+    units (>=0). Honest worst-case pain, not a return claim — computed straight from the same trade
+    R's the edge stat uses, in chronological order. 0.0 for an empty/monotonic-up series."""
+    peak = 0.0
+    cum = 0.0
+    max_dd = 0.0
+    for t in trades:
+        cum += t["r"]
+        if cum > peak:
+            peak = cum
+        dd = peak - cum
+        if dd > max_dd:
+            max_dd = dd
+    return round(max_dd, 4)
+
+
 def _summarize(trades, min_trades=MIN_TRADES, target_r=None):
     n = len(trades)
     if n == 0:
-        return {"trades": 0, "wins": 0, "winRate": 0.0, "expectancyR": 0.0, "netPts": 0.0,
-                "edgeProven": False, "pEdge": 1.0, "reason": "no trades triggered on this series"}
+        return {"trades": 0, "wins": 0, "losses": 0, "winRate": 0.0, "expectancyR": 0.0,
+                "netPts": 0.0, "maxDrawdownR": 0.0, "edgeProven": False, "pEdge": 1.0,
+                "reason": "no trades triggered on this series"}
     rs = [t["r"] for t in trades]
     wins = sum(1 for r in rs if r > 0)
     total_r = sum(rs)
     expectancy = total_r / n
     net_pts = sum((t["exit"] - t["entry"]) if t["dir"] == "long" else (t["entry"] - t["exit"]) for t in trades)
     p_edge = _edge_pvalue(trades, wins, n, expectancy, min_trades, target_r)
-    return {"trades": n, "wins": wins, "winRate": round(wins / n, 4),
+    return {"trades": n, "wins": wins, "losses": n - wins, "winRate": round(wins / n, 4),
             "expectancyR": round(expectancy, 4), "netPts": round(net_pts, 4),
+            "maxDrawdownR": _max_drawdown_r(trades),
             "edgeProven": p_edge < SIG_ALPHA, "pEdge": round(p_edge, 6), "reason": ""}
 
 
@@ -1054,6 +1073,20 @@ def engine_trades(engine, oos_ohlc, lookback, cfg=None):
 PROVERS = {"meanrev": prove_meanrev, "breakout": prove_breakout, "research": prove_research,
            "momentum": prove_momentum, "structure": prove_structure, "regime": prove_regime,
            "channel": prove_channel, "context_a": prove_context_a, "context_b": prove_context_b}
+
+
+def prover_source_sha() -> str:
+    """sha256 (16-hex) of THIS prover module's source — the exact edge-gate math a verdict was
+    computed with. Reproducible by the buyer: `shasum -a 256 bltd_store.py`. So a re-run the buyer
+    triggers on their own bars carries the fingerprint of the code that produced it, and any change
+    to the gate math changes the fingerprint. Same computation gen_reference.py stamps onto the
+    reference artifact, exposed here so the live re-run endpoint can stamp it identically."""
+    import hashlib
+    try:
+        with open(__file__, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()[:16]
+    except OSError:
+        return "unknown"
 
 
 # ===========================================================================

@@ -208,6 +208,121 @@ def screen(store, symbols, engines, cfg=None) -> list[dict]:
     return rows
 
 
+def gate_rerun(store, symbols, engines, cfg=None) -> dict:
+    """Re-run the SHIPPED edge-gate provers (bltd_store.PROVERS, SIG_MIN_N=30, one-sided binomial
+    p<0.05) over the buyer's OWN captured bars, on demand, and return a fully reproducible verdict:
+    per (engine, contract) the OOS trade count n, wins/losses, net points, max-drawdown-R, and the
+    binomial p-value, stamped with the prover-source sha256 so the buyer can reproduce it with
+    `shasum -a 256 bltd_store.py`. NO cherry-picking (every scoped symbol × every engine is run and
+    reported), NO aggregate win-rate / equity / $ claim, NO performance promise. When a series has
+    < SIG_MIN_N OOS trades it is reported honestly as 'insufficient' — significance is NOT assessed
+    and the engine is never 'proven'. Same math the reference artifact and the live fleet use; this
+    just runs it live on the buyer's data and surfaces the underlying statistics.
+
+    An engine's status is honest: 'candidate' only if it clears the prover floor, per-test binomial
+    significance AND a grid-wide Benjamini–Hochberg FDR correction across every (engine,contract)
+    cell (the SAME family-wide guard the live fleet applies, so a re-run can never surface more
+    spurious 'candidates' than the fleet does); else 'no_edge' if any contract had a sufficient
+    sample; else 'insufficient' (not enough bars/trades to judge)."""
+    cfg = cfg or store.config()
+    lookback = cfg.get("lookback", S.LOOKBACK)
+    q = cfg.get("fdrQ", 0.10)
+    syms = S.scoped_symbols(symbols)
+    engine_reports = []
+    testable = []                       # (contract_dict, pEdge) across the whole grid, for BH-FDR
+    for eng in engines:
+        if eng not in S.PROVERS:
+            continue
+        contracts = []
+        for sym in syms:
+            ohlc = store.ohlc(sym)
+            bars = len(ohlc)
+            if bars < lookback + 2:
+                contracts.append({
+                    "symbol": sym, "bars": bars, "trades": 0, "wins": 0, "losses": 0,
+                    "winRate": 0.0, "netPts": 0.0, "expectancyR": 0.0, "maxDrawdownR": 0.0,
+                    "pEdge": 1.0, "proven": False, "insufficient": True,
+                    "reason": f"warming — only {bars} bars captured (arms at {lookback + 2})"})
+                continue
+            v = S.PROVERS[eng](ohlc, cfg)
+            trades = int(v.get("trades", 0))
+            insufficient = trades < S.SIG_MIN_N
+            # Per-test candidacy: clears the binomial significance gate (p<alpha, n>=SIG_MIN_N) AND
+            # the prover's own edge floor. Family-wide FDR (below) can only DEMOTE this, never add.
+            per_test = bool(v.get("edgeProven")) and bool(v.get("ok"))
+            c = {
+                "symbol": sym, "bars": bars, "trades": trades,
+                "wins": int(v.get("wins", 0)), "losses": int(v.get("losses", 0)),
+                "winRate": round(float(v.get("winRate", 0.0)), 4),
+                "netPts": round(float(v.get("netPts", 0.0)), 4),
+                "expectancyR": round(float(v.get("expectancyR", 0.0)), 4),
+                "maxDrawdownR": round(float(v.get("maxDrawdownR", 0.0)), 4),
+                "pEdge": v.get("pEdge", 1.0), "proven": per_test, "insufficient": insufficient,
+                "reason": ""}
+            contracts.append(c)
+            if trades > 0:
+                testable.append((c, v.get("pEdge", 1.0)))
+        if contracts:
+            engine_reports.append({"engine": eng, "status": None, "contracts": contracts})
+
+    # Grid-wide FDR control across every testable cell — a per-test candidate that does not survive
+    # the family-wide correction is demoted to no-edge, honestly labeled.
+    survivors = _benjamini_hochberg([p for (_, p) in testable], q)
+    kept = {id(testable[i][0]) for i in survivors}
+    m = len(testable)
+    for c in (c for (c, _) in testable):
+        if c["proven"] and id(c) not in kept:
+            c["proven"] = False
+            c["fdrRejected"] = True
+
+    # Finalize each contract's honest reason string + roll up each engine's status.
+    candidate_n = no_edge_n = insufficient_n = 0
+    for e in engine_reports:
+        for c in e["contracts"]:
+            if c["insufficient"]:
+                c["reason"] = (f"insufficient sample — {c['trades']} OOS trades, need ≥{S.SIG_MIN_N} "
+                               f"before significance can be assessed")
+            elif c["proven"]:
+                c["reason"] = (f"OOS candidate — win {c['winRate'] * 100:.1f}% / net "
+                               f"{c['netPts']:+.2f} pts on {c['trades']} trades (p={c['pEdge']:.3f}); "
+                               f"research only, live verification required")
+            elif c.get("fdrRejected"):
+                c["reason"] = (f"per-test significant (p={c['pEdge']:.3f}) but rejected by grid-wide "
+                               f"FDR control across {m} tests (q={q:.2f})")
+            else:
+                c["reason"] = (f"no edge — win {c['winRate'] * 100:.1f}% / net {c['netPts']:+.2f} pts "
+                               f"on {c['trades']} OOS trades (p={c['pEdge']:.3f}, need p<{S.SIG_ALPHA})")
+        any_proven = any(c["proven"] for c in e["contracts"])
+        any_sufficient = any(not c["insufficient"] for c in e["contracts"])
+        e["status"] = "candidate" if any_proven else ("no_edge" if any_sufficient else "insufficient")
+        if e["status"] == "candidate":
+            candidate_n += 1
+        elif e["status"] == "no_edge":
+            no_edge_n += 1
+        else:
+            insufficient_n += 1
+
+    return {
+        "kind": "gate_rerun",
+        "available": bool(engine_reports),
+        "label": ("Re-run of the edge-gate on YOUR captured bars — reproducible, not a promise, no "
+                  "performance guaranteed."),
+        "source": "your own captured bars (this Mac's store)",
+        "prover_sha": S.prover_source_sha(),
+        "sigMinN": S.SIG_MIN_N,
+        "alpha": S.SIG_ALPHA,
+        "test": "one-sided binomial vs R-geometry breakeven",
+        "symbols": syms,
+        "engineCount": len(engine_reports),
+        "candidateCount": candidate_n,
+        "noEdgeCount": no_edge_n,
+        "insufficientCount": insufficient_n,
+        "engines": engine_reports,
+        "reason": (None if engine_reports else
+                   "no bars captured yet — connect your feed and let bars accumulate, then re-run"),
+    }
+
+
 # ===========================================================================
 # chart studies — EMA / VWAP / RSI / Bollinger from real OHLC bars
 # ===========================================================================

@@ -239,6 +239,15 @@ final class FeedClient: ObservableObject {
         return EngineRoster.decode(obj)
     }
 
+    // MARK: - Buyer-triggered gate re-run (GET /api/gate/rerun): re-runs the SHIPPED edge-gate
+    // provers over the buyer's OWN captured bars on demand and returns the full reproducible
+    // statistics (n / W / L / max-drawdown-R / p-value per engine + prover_sha). Empty store or a
+    // signed-out session -> honest empty report (available == false), never a fabricated verdict.
+    func rerunGate() async -> GateRerunReport {
+        guard signedIn, let obj = await getJSON("/api/gate/rerun") else { return .empty }
+        return GateRerunReport.decode(obj)
+    }
+
     // MARK: - Signal journal (GET /api/fires): real edge-gated fires recorded from the live feed.
     func recentFires(limit: Int = 50) async -> [FireRow] {
         guard signedIn, let obj = await getJSON("/api/fires?limit=\(limit)") else { return [] }

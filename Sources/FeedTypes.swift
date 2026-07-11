@@ -324,6 +324,91 @@ enum EngineRoster {
     }
 }
 
+// MARK: - Live gate verdict for the buyer's OWN bars (the "NO EDGE TODAY" hero).
+// A pure roll-up of the engine fleet (decoded EngineRows from GET /api/screen) into the single
+// honest headline a buyer needs first: how many of their engines have NO edge on their captured
+// bars today, how many are still warming, and how many (if any) cleared an OOS candidate. It
+// NEVER fabricates — an empty fleet (no captured bars) is `hasData == false`, and the counts are
+// grouped straight from the real per-engine rows. No aggregate win-rate, no P&L, no promise.
+struct GateReject: Equatable, Identifiable {
+    var engine: String       // engine id (label via EngineRoster.label)
+    var reason: String       // the engine's honest reject/why-no-edge line
+    var id: String { engine }
+}
+
+struct GateVerdict: Equatable {
+    var hasData: Bool        // false when no bars captured yet (fleet empty)
+    var evaluated: Int       // engines actually evaluated on the buyer's bars
+    var candidates: Int      // engines with >=1 OOS candidate (edge cleared significance)
+    var warming: Int         // engines still warming (insufficient bars)
+    var noEdge: Int          // engines evaluated with a sufficient sample but no edge
+    var rejects: [GateReject]   // per no-edge/warming engine, the honest reason (candidates excluded)
+
+    // Headline: the blunt truth first. Zero proven edges is the norm and the tool says so plainly.
+    var headline: String {
+        if !hasData { return "No bars captured yet" }
+        if candidates > 0 {
+            return "\(candidates) of \(evaluated) engine\(evaluated == 1 ? "" : "s"): OOS candidate on your bars today"
+        }
+        return "\(noEdge + warming) of \(evaluated) engine\(evaluated == 1 ? "" : "s"): no edge on your bars today"
+    }
+
+    var subline: String {
+        if !hasData {
+            return "Connect your feed and let bars accumulate — the gate verdict is computed only from your own captured bars."
+        }
+        var parts: [String] = []
+        if candidates > 0 { parts.append("\(candidates) OOS candidate\(candidates == 1 ? "" : "s") (research only, not proven live)") }
+        if noEdge > 0 { parts.append("\(noEdge) no edge") }
+        if warming > 0 { parts.append("\(warming) still warming") }
+        return parts.joined(separator: " · ")
+    }
+
+    // True when the honest verdict is "no engine has an edge on your bars right now".
+    var isNoEdge: Bool { hasData && candidates == 0 }
+
+    // Group the fleet by engine and roll each up to a single honest status. `fleet` is the decoded
+    // /api/screen rows for the buyer's own bars; an engine "has edge" if ANY of its symbol rows
+    // cleared the gate, is "warming" if all its rows are warming, else "no edge".
+    static func compute(_ fleet: [EngineRow]) -> GateVerdict {
+        if fleet.isEmpty {
+            return GateVerdict(hasData: false, evaluated: 0, candidates: 0, warming: 0, noEdge: 0, rejects: [])
+        }
+        // Preserve roster order for a stable, non-arbitrary reject list.
+        var order: [String] = []
+        var byEngine: [String: [EngineRow]] = [:]
+        for r in fleet {
+            if byEngine[r.engine] == nil { order.append(r.engine) }
+            byEngine[r.engine, default: []].append(r)
+        }
+        let ordered = EngineRoster.order.filter { byEngine[$0] != nil }
+            + order.filter { !EngineRoster.order.contains($0) }
+        var candidates = 0, warming = 0, noEdge = 0
+        var rejects: [GateReject] = []
+        for eng in ordered {
+            let rows = byEngine[eng] ?? []
+            let hasEdge = rows.contains { $0.edge }
+            let allWarming = !rows.isEmpty && rows.allSatisfy { $0.warming }
+            if hasEdge {
+                candidates += 1
+                continue                       // candidates are surfaced elsewhere, not as "rejects"
+            } else if allWarming {
+                warming += 1
+            } else {
+                noEdge += 1
+            }
+            // Best reason to show: the row with the largest OOS sample (most trades) is the most
+            // informative "why no edge"; fall back to the first row's reason.
+            let best = rows.max(by: { $0.trades < $1.trades }) ?? rows.first
+            let reason = best?.reason.isEmpty == false ? best!.reason
+                : (allWarming ? "warming — not enough of your bars yet" : "no edge on your captured bars")
+            rejects.append(GateReject(engine: eng, reason: reason))
+        }
+        return GateVerdict(hasData: true, evaluated: ordered.count,
+                           candidates: candidates, warming: warming, noEdge: noEdge, rejects: rejects)
+    }
+}
+
 // MARK: - Reference OOS verdicts from GET /api/reference.
 // Black Label's edge-gate result computed on OUR OWN historical ES bars by the shipped provers —
 // so a cold buyer (no captured bars yet) can see the gate produce a real, earned verdict. This is
@@ -407,6 +492,129 @@ struct ReferenceReport: Equatable {
             candidateCount: Int(FeedBars.num(obj["candidateCount"] as Any) ?? 0),
             engineCount: Int(FeedBars.num(obj["engineCount"] as Any) ?? 0),
             engines: engines, reason: nil)
+    }
+}
+
+// MARK: - Buyer-triggered gate re-run from GET /api/gate/rerun.
+// The one-click "re-run the edge gate on MY bars" result: the SAME shipped provers (SIG_MIN_N=30,
+// one-sided binomial p<0.05, grid-wide FDR) run live over the buyer's OWN captured bars, stamped
+// with the prover-source sha256 so it is reproducible (`shasum -a 256 bltd_store.py`). Every field
+// is decoded straight from the artifact — no aggregate win-rate, no equity, no $ claim, no promise.
+// A thin sample decodes as `insufficient` (n < minTrades); an empty store as `available == false`.
+struct GateRerunContract: Equatable, Identifiable {
+    var symbol: String
+    var bars: Int
+    var trades: Int          // n — OOS trades
+    var wins: Int
+    var losses: Int
+    var winRate: Double
+    var netPts: Double
+    var expectancyR: Double
+    var maxDrawdownR: Double
+    var pEdge: Double
+    var proven: Bool
+    var insufficient: Bool
+    var fdrRejected: Bool
+    var reason: String
+    var id: String { symbol }
+
+    // Reproducible one-line stat block for the UI — the raw numbers, no interpretation.
+    // e.g. "n=51 · 33W/18L · net +12.30 pts · maxDD 4.00R · p=0.001". When insufficient, n is shown
+    // honestly with the "< min" note instead of a p-value that can't be trusted.
+    func statLine(minTrades: Int) -> String {
+        if trades == 0 { return "n=0 · no trades triggered on your bars" }
+        let base = "n=\(trades) · \(wins)W/\(losses)L · net \(String(format: "%+.2f", netPts)) pts · maxDD \(String(format: "%.2f", maxDrawdownR))R"
+        if insufficient { return base + " · p n/a (n<\(minTrades))" }
+        return base + " · p=\(String(format: "%.3f", pEdge))"
+    }
+}
+
+struct GateRerunEngine: Equatable, Identifiable {
+    var engine: String
+    var status: String       // "candidate" | "no_edge" | "insufficient"
+    var contracts: [GateRerunContract]
+    var id: String { engine }
+    var isCandidate: Bool { status == "candidate" }
+    var isInsufficient: Bool { status == "insufficient" }
+    // The contract to headline: the proven one if any, else the largest real sample, else the first.
+    var best: GateRerunContract? {
+        contracts.first(where: { $0.proven })
+            ?? contracts.max(by: { $0.trades < $1.trades })
+            ?? contracts.first
+    }
+}
+
+struct GateRerunReport: Equatable {
+    var available: Bool
+    var label: String
+    var source: String
+    var proverSHA: String
+    var minTrades: Int
+    var alpha: Double
+    var test: String
+    var generatedUTC: String
+    var symbols: [String]
+    var engineCount: Int
+    var candidateCount: Int
+    var noEdgeCount: Int
+    var insufficientCount: Int
+    var engines: [GateRerunEngine]
+    var reason: String?
+
+    static let empty = GateRerunReport(
+        available: false,
+        label: "Re-run of the edge-gate on YOUR captured bars — reproducible, not a promise, no performance guaranteed.",
+        source: "", proverSHA: "", minTrades: 30, alpha: 0.05, test: "", generatedUTC: "",
+        symbols: [], engineCount: 0, candidateCount: 0, noEdgeCount: 0, insufficientCount: 0,
+        engines: [], reason: nil)
+
+    // Provenance line — the whole run is reproducible from this.
+    var proverLine: String {
+        "prover \(proverSHA.isEmpty ? "—" : proverSHA) · one-sided binomial p<\(String(format: "%.2f", alpha)) · min n \(minTrades)"
+    }
+
+    static func decode(_ obj: [String: Any]) -> GateRerunReport {
+        let available = (obj["available"] as? Bool) ?? false
+        var out = GateRerunReport.empty
+        out.available = available
+        out.label = (obj["label"] as? String) ?? out.label
+        out.source = (obj["source"] as? String) ?? ""
+        out.proverSHA = (obj["prover_sha"] as? String) ?? ""
+        out.minTrades = Int(FeedBars.num(obj["sigMinN"] as Any) ?? 30)
+        out.alpha = FeedBars.num(obj["alpha"] as Any) ?? 0.05
+        out.test = (obj["test"] as? String) ?? ""
+        out.generatedUTC = (obj["generatedUTC"] as? String) ?? ""
+        out.symbols = (obj["symbols"] as? [String]) ?? []
+        out.engineCount = Int(FeedBars.num(obj["engineCount"] as Any) ?? 0)
+        out.candidateCount = Int(FeedBars.num(obj["candidateCount"] as Any) ?? 0)
+        out.noEdgeCount = Int(FeedBars.num(obj["noEdgeCount"] as Any) ?? 0)
+        out.insufficientCount = Int(FeedBars.num(obj["insufficientCount"] as Any) ?? 0)
+        out.reason = obj["reason"] as? String
+        out.engines = ((obj["engines"] as? [[String: Any]]) ?? []).compactMap { e in
+            guard let id = e["engine"] as? String else { return nil }
+            let contracts: [GateRerunContract] = ((e["contracts"] as? [[String: Any]]) ?? []).compactMap { c in
+                guard let sym = c["symbol"] as? String, TradingSymbolScope.inScope(sym) else { return nil }
+                return GateRerunContract(
+                    symbol: sym,
+                    bars: Int(FeedBars.num(c["bars"] as Any) ?? 0),
+                    trades: Int(FeedBars.num(c["trades"] as Any) ?? 0),
+                    wins: Int(FeedBars.num(c["wins"] as Any) ?? 0),
+                    losses: Int(FeedBars.num(c["losses"] as Any) ?? 0),
+                    winRate: FeedBars.num(c["winRate"] as Any) ?? 0,
+                    netPts: FeedBars.num(c["netPts"] as Any) ?? 0,
+                    expectancyR: FeedBars.num(c["expectancyR"] as Any) ?? 0,
+                    maxDrawdownR: FeedBars.num(c["maxDrawdownR"] as Any) ?? 0,
+                    pEdge: FeedBars.num(c["pEdge"] as Any) ?? 1.0,
+                    proven: (c["proven"] as? Bool) ?? false,
+                    insufficient: (c["insufficient"] as? Bool) ?? false,
+                    fdrRejected: (c["fdrRejected"] as? Bool) ?? false,
+                    reason: (c["reason"] as? String) ?? "")
+            }
+            return GateRerunEngine(engine: id,
+                                   status: (e["status"] as? String) ?? "no_edge",
+                                   contracts: contracts)
+        }
+        return out
     }
 }
 

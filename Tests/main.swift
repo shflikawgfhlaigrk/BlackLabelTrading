@@ -1608,6 +1608,95 @@ func testFireFeedDecode() {
     eqi(FireFeed.decode(["fires": []]).count, 0, "empty fires honest")
 }
 
+// ===== "NO EDGE TODAY" hero verdict + buyer-triggered gate re-run (own bars) =====
+func testGateVerdictNoEdgeAndReasons() {
+    // 3 engines on the buyer's bars: one no-edge (sufficient sample), one warming, one candidate.
+    let fleet = [
+        EngineRow(engine: "meanrev", symbol: "CM.ESU6", edge: false, warming: false,
+                  winRate: 0.5, netPts: -3.0, expectancyR: -0.1, trades: 44, bars: 300,
+                  reason: "no edge — win 50.0% / net -3.00 pts on 44 OOS trades (p=0.610)"),
+        EngineRow(engine: "breakout", symbol: "CM.ESU6", edge: false, warming: true,
+                  winRate: 0.0, netPts: 0.0, expectancyR: 0.0, trades: 0, bars: 20, reason: "warming (20 bars)"),
+        EngineRow(engine: "momentum", symbol: "CM.ESU6", edge: true, warming: false,
+                  winRate: 0.7, netPts: 12.0, expectancyR: 0.4, trades: 40, bars: 300, reason: "OOS candidate"),
+    ]
+    let v = GateVerdict.compute(fleet)
+    ok(v.hasData, "verdict has data when fleet non-empty")
+    eqi(v.evaluated, 3, "verdict evaluated engine count")
+    eqi(v.candidates, 1, "verdict candidate count")
+    eqi(v.warming, 1, "verdict warming count")
+    eqi(v.noEdge, 1, "verdict no-edge count")
+    ok(!v.isNoEdge, "candidate present -> not a blanket no-edge verdict")
+    // candidate engine is NOT listed as a reject; the no-edge + warming ones are, in roster order.
+    eqi(v.rejects.count, 2, "rejects exclude candidate engines")
+    ok(v.rejects.first?.engine == "meanrev", "rejects preserve roster order (meanrev first)")
+    ok(v.rejects.contains { $0.engine == "meanrev" && $0.reason.contains("no edge") }, "reject carries honest reason")
+    ok(v.headline.contains("OOS candidate"), "headline surfaces the candidate")
+}
+
+func testGateVerdictAllNoEdgeHeadline() {
+    let fleet = [
+        EngineRow(engine: "meanrev", symbol: "CM.ESU6", edge: false, warming: false,
+                  winRate: 0.5, netPts: -1.0, expectancyR: 0.0, trades: 50, bars: 300, reason: "no edge"),
+        EngineRow(engine: "regime", symbol: "CM.ESU6", edge: false, warming: false,
+                  winRate: 0.48, netPts: -2.0, expectancyR: 0.0, trades: 60, bars: 300, reason: "no edge"),
+    ]
+    let v = GateVerdict.compute(fleet)
+    ok(v.isNoEdge, "no candidates -> blanket no-edge verdict")
+    ok(v.headline.contains("no edge on your bars today"), "no-edge headline is blunt and honest")
+    eqi(v.candidates, 0, "no-edge verdict has zero candidates")
+}
+
+func testGateVerdictEmptyStoreHonest() {
+    let v = GateVerdict.compute([])
+    ok(!v.hasData, "empty fleet -> hasData false (no fabricated verdict)")
+    eqi(v.evaluated, 0, "empty fleet evaluates zero engines")
+    ok(v.headline == "No bars captured yet", "empty headline is honest")
+    ok(v.rejects.isEmpty, "empty fleet has no reject rows")
+}
+
+func testGateRerunDecodeAndStatFormatting() {
+    let obj: [String: Any] = [
+        "available": true, "prover_sha": "3e818b54f842ebcf", "sigMinN": 30, "alpha": 0.05,
+        "test": "one-sided binomial vs R-geometry breakeven", "source": "your own captured bars",
+        "generatedUTC": "2026-07-11T04:00:00Z", "symbols": ["CM.ESU6"],
+        "engineCount": 2, "candidateCount": 0, "noEdgeCount": 1, "insufficientCount": 1,
+        "engines": [
+            ["engine": "meanrev", "status": "no_edge", "contracts": [
+                ["symbol": "CM.ESU6", "bars": 400, "trades": 51, "wins": 24, "losses": 27,
+                 "winRate": 0.4706, "netPts": -6.5, "expectancyR": -0.05, "maxDrawdownR": 8.0,
+                 "pEdge": 0.61, "proven": false, "insufficient": false,
+                 "reason": "no edge — win 47.1% / net -6.50 pts on 51 OOS trades (p=0.610, need p<0.05)"]]],
+            ["engine": "channel", "status": "insufficient", "contracts": [
+                ["symbol": "CM.ESU6", "bars": 60, "trades": 8, "wins": 4, "losses": 4,
+                 "winRate": 0.5, "netPts": 1.0, "expectancyR": 0.05, "maxDrawdownR": 2.0,
+                 "pEdge": 1.0, "proven": false, "insufficient": true,
+                 "reason": "insufficient sample — 8 OOS trades, need ≥30"]]],
+        ],
+    ]
+    let r = GateRerunReport.decode(obj)
+    ok(r.available, "rerun decode available")
+    ok(r.proverSHA == "3e818b54f842ebcf", "prover_sha decoded")
+    eqi(r.minTrades, 30, "sigMinN decoded")
+    eqi(r.engines.count, 2, "both engines decoded")
+    eqi(r.candidateCount, 0, "zero candidates decoded")
+    // no_edge engine best contract stat line shows n / W/L / net / maxDD / p — reproducible numbers.
+    let mr = r.engines[0].best!
+    let line = mr.statLine(minTrades: r.minTrades)
+    ok(line.contains("n=51"), "stat line shows n")
+    ok(line.contains("24W/27L"), "stat line shows W/L")
+    ok(line.contains("maxDD 8.00R"), "stat line shows max drawdown in R")
+    ok(line.contains("p=0.610"), "stat line shows p-value for a sufficient sample")
+    // insufficient engine: p is shown as n/a (not a misleading p-value on a thin sample).
+    let ch = r.engines[1].best!
+    ok(ch.insufficient, "thin sample flagged insufficient")
+    ok(ch.statLine(minTrades: r.minTrades).contains("p n/a (n<30)"), "thin sample hides untrustworthy p")
+    ok(r.proverLine.contains("3e818b54f842ebcf") && r.proverLine.contains("min n 30"), "prover line is reproducible")
+    // Honest empty decode.
+    let empty = GateRerunReport.decode(["available": false, "reason": "no bars captured yet"])
+    ok(!empty.available && empty.reason == "no bars captured yet", "empty rerun decode honest")
+}
+
 // ===== In-app auto-updater (pure core: version compare, sha256, manifest decode, check window) =====
 // Mirrors the proven Black Label Real Estate testUpdater(). App-shell updater only — it never
 // touches the engines, the feed, the edge-gate, or any signal; these are the headless-verifiable
@@ -1737,29 +1826,29 @@ func testWindowLaunchOrderingContract() {
 }
 
 func testBuildNumberContract() {
-    let expectedBuild = "<key>CFBundleVersion</key><string>16</string>"
+    let expectedBuild = "<key>CFBundleVersion</key><string>17</string>"
     for file in ["build.command", "build-signed.command"] {
         guard let src = try? String(contentsOfFile: file, encoding: .utf8) else {
             ok(false, "[source] \(file) readable for build-number contract"); continue
         }
-        ok(src.contains(expectedBuild), "[source] \(file) stamps Trading build 16")
+        ok(src.contains(expectedBuild), "[source] \(file) stamps Trading build 17")
         ok(src.contains("universal2") && src.contains("build_trd_arch arm64") &&
            src.contains("build_trd_arch x86_64") && src.contains("lipo -create"),
            "[source] \(file) builds a universal2 Trading binary")
     }
     if let src = try? String(contentsOfFile: "build-developer-id.sh", encoding: .utf8) {
-        ok(src.contains("BUILD_NUMBER=\"${BUILD_NUMBER:-16}\""), "[source] Developer-ID build defaults to Trading build 16")
+        ok(src.contains("BUILD_NUMBER=\"${BUILD_NUMBER:-17}\""), "[source] Developer-ID build defaults to Trading build 17")
     } else {
         ok(false, "[source] build-developer-id.sh readable for build-number contract")
     }
     if let plist = try? String(contentsOfFile: "Sources/Info.plist", encoding: .utf8) {
-        ok(plist.contains("<key>CFBundleVersion</key>\n\t<string>16</string>"),
-           "[source] Sources/Info.plist CFBundleVersion is 16")
+        ok(plist.contains("<key>CFBundleVersion</key>\n\t<string>17</string>"),
+           "[source] Sources/Info.plist CFBundleVersion is 17")
     } else {
         ok(false, "[source] Sources/Info.plist readable for build-number contract")
     }
     if let project = try? String(contentsOfFile: "project.yml", encoding: .utf8) {
-        ok(project.contains("CFBundleVersion: \"16\""), "[source] project.yml CFBundleVersion is 16")
+        ok(project.contains("CFBundleVersion: \"17\""), "[source] project.yml CFBundleVersion is 17")
     } else {
         ok(false, "[source] project.yml readable for build-number contract")
     }
@@ -1791,6 +1880,10 @@ testNoAPIWebhookIngestionContract()
 testEngineRosterDecode()
 testEngineLabels()
 testFireFeedDecode()
+testGateVerdictNoEdgeAndReasons()
+testGateVerdictAllNoEdgeHeadline()
+testGateVerdictEmptyStoreHonest()
+testGateRerunDecodeAndStatFormatting()
 
 // In-app auto-updater pure core (version compare, sha256, manifest decode, daily-check window)
 testUpdater()

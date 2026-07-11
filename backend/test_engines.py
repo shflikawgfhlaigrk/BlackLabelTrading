@@ -1046,6 +1046,93 @@ def test_screen_fdr_suppresses_grid_inflation():
     assert all(not r["edge"] and "FDR" in r["reason"] for r in demoted)
 
 
+# ===========================================================================
+# maxDrawdownR + the buyer-triggered gate re-run (bltd_analytics.gate_rerun)
+# ===========================================================================
+def test_max_drawdown_r_empty_and_monotonic():
+    assert S._max_drawdown_r([]) == 0.0
+    assert S._max_drawdown_r([{"r": 1.0}, {"r": 2.0}, {"r": 0.5}]) == 0.0  # never dips below peak
+
+
+def test_max_drawdown_r_peak_to_trough():
+    # cum: +2, -1, +0 -> peak 2, trough -1 => max drawdown 3R
+    dd = S._max_drawdown_r([{"r": 2.0}, {"r": -3.0}, {"r": 1.0}])
+    assert approx(dd, 3.0), dd
+
+
+def test_summary_reports_wins_losses_and_drawdown():
+    trades = [{"dir": "long", "entry": 100.0, "exit": 102.0, "r": 2.0},
+              {"dir": "long", "entry": 100.0, "exit": 99.0, "r": -1.0},
+              {"dir": "long", "entry": 100.0, "exit": 99.0, "r": -1.0}]
+    s = S._summarize(trades, min_trades=1)
+    assert s["trades"] == 3 and s["wins"] == 1 and s["losses"] == 2
+    assert "maxDrawdownR" in s and s["maxDrawdownR"] >= 0.0
+
+
+def test_prover_source_sha_is_16hex():
+    sha = S.prover_source_sha()
+    assert len(sha) == 16 and all(ch in "0123456789abcdef" for ch in sha), sha
+
+
+class _RerunStore:
+    def __init__(self, series):
+        self._series = series
+
+    def config(self):
+        return S.CONFIG_DEFAULTS
+
+    def ohlc(self, symbol):
+        return self._series.get(symbol, [])
+
+
+def test_gate_rerun_empty_store_is_honest_not_fabricated():
+    import bltd_analytics as A
+    rep = A.gate_rerun(_RerunStore({}), [], list(S.PROVERS.keys()))
+    assert rep["available"] is False
+    assert rep["engineCount"] == 0 and rep["candidateCount"] == 0
+    assert rep["reason"] and "no bars" in rep["reason"].lower()
+    # prover_sha is always stamped so the buyer can reproduce even the empty verdict
+    assert len(rep["prover_sha"]) == 16 and rep["sigMinN"] == S.SIG_MIN_N
+
+
+def test_gate_rerun_runs_every_engine_and_stamps_prover_sha():
+    import bltd_analytics as A
+    orig_scope = S.INSTRUMENT_SCOPE
+    try:
+        S.INSTRUMENT_SCOPE = "all"
+        series = {"CM.ESU6": [(100.0 + i * 0.3,) * 4 for i in range(400)]}
+        rep = A.gate_rerun(_RerunStore(series), ["CM.ESU6"], list(S.PROVERS.keys()))
+    finally:
+        S.INSTRUMENT_SCOPE = orig_scope
+    assert rep["available"] is True
+    assert rep["prover_sha"] == S.prover_source_sha()
+    assert rep["engineCount"] == len(S.PROVERS)                       # no cherry-picking: all engines
+    assert rep["candidateCount"] + rep["noEdgeCount"] + rep["insufficientCount"] == rep["engineCount"]
+    for e in rep["engines"]:
+        assert e["status"] in ("candidate", "no_edge", "insufficient")
+        for c in e["contracts"]:
+            for k in ("trades", "wins", "losses", "maxDrawdownR", "pEdge", "reason"):
+                assert k in c
+            assert c["wins"] + c["losses"] == c["trades"]            # honest W/L split
+
+
+def test_gate_rerun_labels_thin_sample_insufficient():
+    import bltd_analytics as A
+    orig_scope = S.INSTRUMENT_SCOPE
+    try:
+        S.INSTRUMENT_SCOPE = "all"
+        # just above the warming floor but far below SIG_MIN_N trades -> insufficient, never proven
+        series = {"CM.ESU6": [(100.0 + (1.0 if i % 2 else -1.0),) * 4 for i in range(60)]}
+        rep = A.gate_rerun(_RerunStore(series), ["CM.ESU6"], ["meanrev"])
+    finally:
+        S.INSTRUMENT_SCOPE = orig_scope
+    e = rep["engines"][0]
+    c = e["contracts"][0]
+    if c["trades"] < S.SIG_MIN_N:
+        assert c["insufficient"] is True and c["proven"] is False
+        assert "insufficient" in c["reason"].lower()
+
+
 if __name__ == "__main__":
     import sys
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
