@@ -812,6 +812,96 @@ def test_evaluate_all_fires_off_read_loop_from_store():
                 pass
 
 
+# ---- TR-13 NON-REPAINT: a signal is only emitted on a CLOSED bar, and no prior bar/signal
+# revises when a new tick arrives. This is the runnable proof behind the "does it repaint?"
+# (LuxAlgo-style) takedown: our bar aggregation excludes the still-forming bucket, a closed
+# bar is frozen once closed, and the roster fires only on appear/flip off the CLOSED series.
+def test_ohlc_bars_excludes_forming_bucket_and_never_repaints_closed():
+    # bar_seconds=15 -> buckets k0={0,1}, k1={15,16}, k2={30 (still forming)}.
+    ticks = [(0, 100.0), (1, 101.0), (15, 102.0), (16, 103.0), (30, 104.0)]
+    closed = S.ohlc_bars(ticks, 15)
+    assert [b[0] for b in closed] == [0, 1], "only fully-closed buckets are emitted (k2 is forming)"
+    assert closed[0] == (0, 100.0, 101.0, 100.0, 101.0)   # o,h,l,c from the two k0 tick-closes
+    # A new tick INSIDE the still-forming bucket must not revise ANY closed bar (non-repaint).
+    closed_more_forming = S.ohlc_bars(ticks + [(31, 999.0)], 15)
+    assert closed_more_forming == closed, "a forming-bar tick revises no CLOSED bar"
+    # A tick that OPENS the next bucket promotes k2 to closed but freezes the earlier closed bars.
+    closed_rolled = S.ohlc_bars(ticks + [(45, 50.0)], 15)
+    assert closed_rolled[:2] == closed, "earlier closed bars stay byte-identical once closed"
+    assert len(closed_rolled) == 3 and closed_rolled[2][0] == 2, "exactly one newly-closed bar (k2)"
+    assert closed_rolled[2] == (2, 104.0, 104.0, 104.0, 104.0), "k2 closes on its own tick, unaffected by k3"
+
+
+def test_ohlcv_bars_closed_bar_close_is_frozen_against_forming_ticks():
+    # The specific repaint concern: the LAST closed bar's close must not change when a later,
+    # still-forming tick prints a wild price. ohlcv variant (carries volume/delta).
+    ticks = [(0, 100.0, 5.0, 0.0), (1, 101.0, 6.0, 0.0),      # k0 closes at 101
+             (15, 200.0, 7.0, 0.0)]                            # k1 forming (not emitted)
+    closed = S.ohlcv_bars(ticks, 15)
+    assert len(closed) == 1 and closed[0][4] == 101.0, "closed bar close is the last tick of its bucket"
+    # Add more forming k1 ticks: the closed k0 bar is untouched, k1 is still excluded.
+    closed2 = S.ohlcv_bars(ticks + [(16, 9_999.0, 8.0, 0.0)], 15)
+    assert closed2 == closed, "closed bar frozen; forming bucket still excluded despite an outlier tick"
+
+
+def test_capture_forming_ticks_never_close_a_bar_or_repaint_a_closed_one():
+    # End-to-end through Capture: ticks inside one bucket queue NO closed bar; only a boundary
+    # crossing closes the prior bucket; and further ticks in the new forming bucket do not repaint
+    # the already-closed bar in the store.
+    import bltd_capture as C
+    store, path, cfg = _temp_store()
+    try:
+        cap = C.Capture(store, bar_seconds=15, lookback=20, edge_gate=False)
+        cap.on_candle({"symbol": "CM.ESU6", "close": 100.0, "epoch": None}, arrival=1_700_000_000.0)
+        cap.on_candle({"symbol": "CM.ESU6", "close": 101.0, "epoch": None}, arrival=1_700_000_005.0)
+        assert cap.pending_bars == {}, "no bar closes while the bucket is still forming"
+        cap.flush()
+        assert store.bars("CM.ESU6", 10, newest=False)["bars"] == [], "a forming bucket persists no closed bar"
+        # Cross into the next bucket -> the first bucket closes (o=100, c=101), frozen.
+        cap.on_candle({"symbol": "CM.ESU6", "close": 102.0, "epoch": None}, arrival=1_700_000_015.0)
+        cap.flush()
+        closed = [[100.0, 101.0, 100.0, 101.0, 1_700_000_010.0, 0.0, 0.0]]
+        assert store.bars("CM.ESU6", 10, newest=False)["bars"] == closed
+        # A wild tick in the NEW forming bucket must not repaint the already-closed bar.
+        cap.on_candle({"symbol": "CM.ESU6", "close": 250.0, "epoch": None}, arrival=1_700_000_020.0)
+        cap.flush()
+        assert store.bars("CM.ESU6", 10, newest=False)["bars"] == closed, "closed bar frozen while a new bucket forms"
+    finally:
+        for p in (path, cfg):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
+def test_evaluate_does_not_re_emit_or_revise_a_prior_signal_on_unchanged_bars():
+    # A prior signal must not be revised/re-emitted when a new tick arrives but the CLOSED-bar
+    # series is unchanged: the roster fires on appear/flip only (direction unchanged -> no fire).
+    import bltd_capture as C
+    store, path, cfg = _temp_store()
+    try:
+        rows = [(1_700_000_000 + i * 15, 100.0 + i * 0.9, 100.0 + i * 0.9,
+                 100.0 + i * 0.9, 100.0 + i * 0.9) for i in range(80)]
+        assert store.record_bars("CM.ESU6", rows) == 80
+        cap = C.Capture(store, bar_seconds=15, lookback=20, edge_gate=False)
+        cap.evaluate_all()
+        first = store.latest_fire()["fire"]
+        assert first is not None, "a signal fires from the CLOSED-bar series"
+        n1 = len(store.fires(500)["fires"])
+        # Re-evaluate the SAME closed series (as a new tick's forming bucket would trigger): the
+        # engine direction is unchanged, so NO new fire is recorded and the prior one is not revised.
+        cap.evaluate_all()
+        n2 = len(store.fires(500)["fires"])
+        assert n2 == n1, "unchanged closed series does not re-fire (no repaint of the prior signal)"
+        assert store.latest_fire()["fire"]["direction"] == first["direction"], "prior signal direction is stable"
+    finally:
+        for p in (path, cfg):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
 def test_freshness_watchdog_wedge_decision():
     # PURE wedge decision behind _freshness_watchdog: seed grace, reset on advance, and trip only
     # after the store's newest tick has stalled for stale_after seconds (then the daemon os._exit's

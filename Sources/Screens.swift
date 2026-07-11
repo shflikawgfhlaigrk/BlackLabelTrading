@@ -85,6 +85,7 @@ struct SignalsScreen: View {
     @EnvironmentObject var wc: WealthChartsStore
     @EnvironmentObject var feed: FeedClient
     @EnvironmentObject var nav: Nav
+    @EnvironmentObject var book: PaperBook          // the buyer's own paper ledger feeds the discipline cockpit
     @State private var inp = SignalInputs()
     @State private var committed = false
     @State private var live = LiveFactorSnapshot()
@@ -105,6 +106,18 @@ struct SignalsScreen: View {
     @State private var ticketCopied = false
 
     private var result: SignalResult { SignalEngine.evaluate(inp) }
+    // Discipline cockpit computed from the buyer's OWN closed paper trades against their active
+    // rule profile's caps. Pure compliance math (no aggregate win-rate/$/performance claim).
+    private func cockpitFills() -> [DisciplineFill] {
+        book.closed.compactMap { p in
+            guard let d = p.realizedDollars(), let dt = p.exitDate else { return nil }
+            return DisciplineFill(date: dt, pnl: d, contracts: p.quantity)
+        }
+    }
+    private var cockpit: DisciplineCockpit {
+        DisciplineCockpit.compute(fills: cockpitFills(), profile: model.activeProfile,
+                                  startingBalance: book.startingBalance, now: Date())
+    }
     private var gates: [GateCheck] { GateEngine.evaluate(inp, result) }
     private var tfVotes: [TimeframeVote] { ConsensusEngine.votes(inp) }
     private var tfAgree: Int { ConsensusEngine.agreeing(tfVotes, with: result.direction) }
@@ -128,6 +141,12 @@ struct SignalsScreen: View {
                 // Reachable local account-reference entry point from the main dashboard.
                 wealthChartsBanner
 
+                // DISCIPLINE COCKPIT — live daily-loss + trailing-drawdown meters, a Tiltmeter, and
+                // risk-of-ruin, all computed from the buyer's OWN paper ledger against the caps THEY
+                // entered. When a hard cap is breached it AUTO-MUTES the signal display below. Pure
+                // compliance math on the buyer's own numbers — zero aggregate win-rate/$/P&L claim.
+                DisciplineCockpitPanel(cockpit: cockpit) { nav.section = .firms }
+
                 // The real edge-gated engine fleet (backend /api/screen + /api/fires) — every
                 // engine's honest OOS verdict on the buyer's OWN captured bars.
                 engineFleet
@@ -145,7 +164,11 @@ struct SignalsScreen: View {
                 // live factor inputs, so it renders ONLY when real captured data exists — otherwise a
                 // cold-start buyer would see a fabricated default plan (ES @ 5000, $50/pt). Honest
                 // empty state until the buyer's own feed produces bars.
-                if live.hasData {
+                if live.hasData && cockpit.muteSignals {
+                    // AUTO-MUTE: the buyer breached a hard cap they set — hide the trade plan for the
+                    // session. Their own rule profile enforcing itself; never places or blocks an order.
+                    signalsMutedCard
+                } else if live.hasData {
                     signalCard
 
                     // Prop-firm rule gate — annotates THIS trade plan against the buyer's active
@@ -708,6 +731,28 @@ struct SignalsScreen: View {
                     .font(.system(size: 10, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
                     .fixedSize(horizontal: false, vertical: true)
             }
+        }
+    }
+
+    // Shown INSTEAD of the trade plan when the discipline cockpit auto-mutes (a hard cap breached).
+    private var signalsMutedCard: some View {
+        Panel(title: "Signal display muted", icon: "bell.slash.fill", accent: BLTheme.red) {
+            HStack(spacing: 10) {
+                Image(systemName: "exclamationmark.octagon.fill").font(.system(size: 16, weight: .bold)).foregroundColor(BLTheme.red)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Discipline stop — you hit a cap you set")
+                        .font(.system(size: 13, weight: .bold, design: .rounded)).foregroundColor(BLTheme.text)
+                    Text(cockpit.muteReason)
+                        .font(.system(size: 11.5, weight: .semibold, design: .rounded)).foregroundColor(BLTheme.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer()
+                StatusPill(text: "Muted", tint: BLTheme.red)
+            }
+            Text("The trade plan is intentionally hidden until your next session. This is your own rule profile enforcing itself — it never places or blocks an order.")
+                .font(.system(size: 10.5, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+                .fixedSize(horizontal: false, vertical: true)
+            GhostButton(label: "Review profile", icon: "building.columns.fill") { nav.section = .firms }
         }
     }
 
@@ -1303,11 +1348,24 @@ struct CalculatorsScreen: View {
 // MARK: - Firms (prop firm reference)
 struct FirmsScreen: View {
     @EnvironmentObject var model: AppModel
+    @EnvironmentObject var book: PaperBook
+    private var cockpit: DisciplineCockpit {
+        let fills: [DisciplineFill] = book.closed.compactMap { p in
+            guard let d = p.realizedDollars(), let dt = p.exitDate else { return nil }
+            return DisciplineFill(date: dt, pnl: d, contracts: p.quantity)
+        }
+        return DisciplineCockpit.compute(fills: fills, profile: model.activeProfile,
+                                         startingBalance: book.startingBalance, now: Date())
+    }
     var body: some View {
         ScrollView { VStack(alignment: .leading, spacing: 16) {
             ScreenTitle(title: "Prop-firm rule profiles",
                         subtitle: "Enter YOUR funded-eval firm's limits — then Signals annotates and gates every trade plan against them. We ship no firm numbers: confirm current terms on the firm's site and enter them yourself.",
                         icon: "building.columns.fill")
+
+            // Live discipline cockpit for the active profile — meters, Tiltmeter, risk of ruin, all
+            // computed from the buyer's own paper ledger against the caps they entered.
+            DisciplineCockpitPanel(cockpit: cockpit)
 
             // Active profile — the one gating displayed signals.
             Panel(title: "Active profile", icon: "shield.lefthalf.filled") {
@@ -1448,6 +1506,159 @@ struct ProfileEditorCard: View {
 
 enum RuleProfileCardFmt {
     static func num(_ v: Double) -> String { v == v.rounded() ? String(Int(v)) : String(v) }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DISCIPLINE COCKPIT UI — renders the pure-logic DisciplineCockpit (RuleProfile.swift) as live
+// gauges. Every value is the buyer's own compliance math against caps THEY entered: NO aggregate
+// win-rate / P&L / performance figure is shown (§5.1 / H1). Shared by Signals + Firms screens.
+struct DisciplineMeterBar: View {
+    let label: String
+    let meter: DisciplineCockpit.Meter
+    private var tint: Color {
+        if meter.isBreached { return BLTheme.red }
+        return meter.fraction >= 0.75 ? BLTheme.gold : BLTheme.green
+    }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack {
+                Text(label).font(.system(size: 11.5, weight: .semibold, design: .rounded)).foregroundColor(BLTheme.sub)
+                Spacer()
+                if meter.isSet {
+                    Text("\(RuleProfileGate.money(meter.used)) / \(RuleProfileGate.money(meter.limit))")
+                        .font(.system(size: 12, weight: .bold, design: .rounded)).foregroundColor(tint)
+                } else {
+                    Text("not set").font(.system(size: 11, weight: .semibold, design: .rounded)).foregroundColor(BLTheme.sub)
+                }
+            }
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(BLTheme.bg2).frame(height: 8)
+                    Capsule().fill(tint)
+                        .frame(width: max(0, min(1, meter.isSet ? meter.fraction : 0)) * geo.size.width, height: 8)
+                }
+            }.frame(height: 8)
+            if meter.isBreached {
+                Text("Cap breached").font(.system(size: 10, weight: .bold, design: .rounded)).foregroundColor(BLTheme.red)
+            } else if meter.isSet {
+                Text("\(RuleProfileGate.money(max(0, meter.remaining))) of room left")
+                    .font(.system(size: 10, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+            } else {
+                Text("Enter this cap on your active profile to gauge it")
+                    .font(.system(size: 10, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+            }
+        }
+    }
+}
+
+struct DisciplineCockpitPanel: View {
+    let cockpit: DisciplineCockpit
+    var onManageProfile: () -> Void = {}
+
+    private var accent: Color {
+        if cockpit.muteSignals { return BLTheme.red }
+        if cockpit.tilt.level == .high || cockpit.dailyLoss.fraction >= 0.75 || cockpit.trailingDrawdown.fraction >= 0.75 {
+            return BLTheme.gold
+        }
+        return BLTheme.green
+    }
+    private var tiltTint: Color {
+        switch cockpit.tilt.level {
+        case .high: return BLTheme.red
+        case .elevated: return BLTheme.gold
+        default: return BLTheme.green
+        }
+    }
+
+    var body: some View {
+        Panel(title: "Discipline cockpit", icon: "gauge.with.dots.needle.bottom.50percent", accent: accent) {
+            if !cockpit.hasData {
+                EmptyState(icon: "gauge.with.dots.needle.bottom.50percent",
+                           title: "No trades to grade yet",
+                           hint: "Log trades in Paper Trade and the cockpit grades your discipline live — daily-loss and trailing-drawdown meters, a Tiltmeter, and risk of ruin, all against your active rule profile's caps. Nothing is shown until it's your own real data.")
+            } else {
+                if cockpit.muteSignals {
+                    HStack(spacing: 9) {
+                        Image(systemName: "bell.slash.fill").font(.system(size: 13, weight: .bold)).foregroundColor(BLTheme.red)
+                        Text(cockpit.muteReason)
+                            .font(.system(size: 11.5, weight: .bold, design: .rounded)).foregroundColor(BLTheme.red)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Spacer()
+                    }
+                    .padding(10).frame(maxWidth: .infinity, alignment: .leading)
+                    .background(BLTheme.red.opacity(0.10)).clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(BLTheme.red.opacity(0.4), lineWidth: 1))
+                }
+                if !cockpit.hasProfile {
+                    HStack(spacing: 8) {
+                        Text("No active profile caps — enter your funded-eval firm's daily-loss and trailing-drawdown limits to arm the meters.")
+                            .font(.system(size: 11, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Spacer()
+                        GhostButton(label: "Set caps", icon: "building.columns.fill", action: onManageProfile)
+                    }
+                }
+                DisciplineMeterBar(label: "Daily loss used", meter: cockpit.dailyLoss)
+                DisciplineMeterBar(label: "Trailing drawdown", meter: cockpit.trailingDrawdown)
+
+                Divider().background(BLTheme.stroke).padding(.vertical, 2)
+                // Tiltmeter — behavioral escalation vs the buyer's OWN baseline (frequency + size).
+                HStack {
+                    Text("Tiltmeter").font(.system(size: 11.5, weight: .semibold, design: .rounded)).foregroundColor(BLTheme.sub)
+                    Spacer()
+                    StatusPill(text: cockpit.tilt.level.rawValue, tint: cockpit.tilt.level == .insufficient ? BLTheme.sub : tiltTint)
+                }
+                if cockpit.tilt.level == .insufficient {
+                    Text("Needs at least \(DisciplineCockpit.minBaselineDays) prior trading days to set your baseline — no invented tilt until then.")
+                        .font(.system(size: 10, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    GeometryReader { geo in
+                        ZStack(alignment: .leading) {
+                            Capsule().fill(BLTheme.bg2).frame(height: 8)
+                            Capsule().fill(tiltTint).frame(width: max(0, min(1, cockpit.tilt.gauge)) * geo.size.width, height: 8)
+                        }
+                    }.frame(height: 8)
+                    ForEach(cockpit.tilt.reasons, id: \.self) { reason in
+                        HStack(spacing: 6) {
+                            Image(systemName: "arrow.up.right").font(.system(size: 10, weight: .bold)).foregroundColor(tiltTint)
+                            Text(reason).font(.system(size: 10.5, weight: .medium, design: .rounded)).foregroundColor(BLTheme.text)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                    if cockpit.tilt.reasons.isEmpty {
+                        Text("Trading in line with your own baseline pace and size.")
+                            .font(.system(size: 10, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+                    }
+                }
+
+                Divider().background(BLTheme.stroke).padding(.vertical, 2)
+                // Risk of ruin — probability of hitting the buyer's OWN floor at their current risk.
+                switch cockpit.ruin.state {
+                case .computed:
+                    Stat(label: "Risk of ruin (your numbers)",
+                         value: String(format: "%.1f%%", cockpit.ruin.probability * 100),
+                         tint: cockpit.ruin.probability >= 0.25 ? BLTheme.red : (cockpit.ruin.probability >= 0.05 ? BLTheme.gold : BLTheme.green))
+                    Text(cockpit.ruin.note)
+                        .font(.system(size: 10, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+                        .fixedSize(horizontal: false, vertical: true)
+                case .noEdge:
+                    Stat(label: "Risk of ruin (your numbers)", value: "≈ 100%", tint: BLTheme.red)
+                    Text(cockpit.ruin.note)
+                        .font(.system(size: 10, weight: .medium, design: .rounded)).foregroundColor(BLTheme.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                case .insufficient:
+                    Text("Risk of ruin: " + cockpit.ruin.note)
+                        .font(.system(size: 10.5, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Text("All figures are computed from your own paper ledger against the caps you entered — a compliance/risk view, not a performance record. Never auto-trades.")
+                    .font(.system(size: 9.5, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
 }
 
 struct FirmRow: View {

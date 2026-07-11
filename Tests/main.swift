@@ -1733,6 +1733,139 @@ func testRuleProfileGateEmptyNoProfileNoSignal() {
     eqi(dsc.maxContracts, 3, "scaling-plan cap sets the max contracts")
 }
 
+// ===== TR-18 Discipline cockpit (pure compliance math on the buyer's OWN fills) =====
+// A deterministic UTC calendar so startOfDay bucketing is timezone-independent in the test.
+let cockpitCal: Calendar = { var c = Calendar(identifier: .gregorian); c.timeZone = TimeZone(identifier: "UTC")!; return c }()
+
+func testDisciplineCockpitMetersAndMute() {
+    // now = day(0). "today" fills sit a few hours earlier the SAME UTC day.
+    let now = day(0)
+    // --- within limits: one −$400 loss today, no drawdown breach ---
+    let pA = RuleProfile(name: "Topstep 50K", dailyLossLimit: 1000, trailingDrawdown: 2000, pointValue: 50)
+    let a = DisciplineCockpit.compute(
+        fills: [DisciplineFill(date: now.addingTimeInterval(-3600), pnl: -400, contracts: 1)],
+        profile: pA, startingBalance: 50_000, now: now, calendar: cockpitCal)
+    ok(a.hasData && a.hasProfile, "cockpit sees the buyer's data + active profile")
+    eq(a.dailyLoss.used, 400, "daily-loss meter = today's realized loss")
+    eq(a.dailyLoss.limit, 1000, "daily-loss cap is the buyer's own number")
+    eq(a.dailyLoss.fraction, 0.4, "daily-loss fraction")
+    eq(a.trailingDrawdown.used, 400, "trailing DD = peak−equity on the buyer's own curve")
+    ok(!a.muteSignals, "within limits -> signals not muted")
+
+    // --- daily-loss BREACH: two −$600 losses same day = −$1200 > $1000 cap ---
+    let b = DisciplineCockpit.compute(
+        fills: [DisciplineFill(date: now.addingTimeInterval(-7200), pnl: -600, contracts: 1),
+                DisciplineFill(date: now.addingTimeInterval(-3600), pnl: -600, contracts: 1)],
+        profile: pA, startingBalance: 50_000, now: now, calendar: cockpitCal)
+    ok(b.dailyLoss.isBreached, "daily-loss cap breached at −$1200")
+    ok(b.muteSignals && b.muteReason.contains("Daily-loss limit"), "daily breach mutes the signal display")
+
+    // --- trailing-drawdown BREACH isolated (no daily cap set): +3000 then −2100 => DD 2100 > 2000 ---
+    let pT = RuleProfile(name: "Apex", dailyLossLimit: 0, trailingDrawdown: 2000, pointValue: 50)
+    let t = DisciplineCockpit.compute(
+        fills: [DisciplineFill(date: day(-1), pnl: 3000, contracts: 1),
+                DisciplineFill(date: now.addingTimeInterval(-3600), pnl: -2100, contracts: 1)],
+        profile: pT, startingBalance: 50_000, now: now, calendar: cockpitCal)
+    eq(t.trailingDrawdown.used, 2100, "trailing DD tracks the running peak (53000) minus equity (50900)")
+    ok(!t.dailyLoss.isSet, "unset daily-loss cap is honestly not gating")
+    ok(t.muteSignals && t.muteReason.contains("Trailing drawdown"), "trailing DD breach mutes signals")
+}
+
+func testDisciplineCockpitTiltmeter() {
+    let now = day(0)
+    var fills: [DisciplineFill] = []
+    // 3 prior active days, 2 trades each (baseline count = 2, baseline size = 1 contract).
+    for d in [-3, -2, -1] {
+        fills.append(DisciplineFill(date: day(d), pnl: 10, contracts: 1))
+        fills.append(DisciplineFill(date: day(d).addingTimeInterval(60), pnl: -10, contracts: 1))
+    }
+    // Today: 5 trades at 3 contracts each -> freq 5/2 = 2.5×, size 3/1 = 3× -> HIGH tilt.
+    for i in 0..<5 { fills.append(DisciplineFill(date: now.addingTimeInterval(Double(-i) * 600 - 600), pnl: 5, contracts: 3)) }
+    let c = DisciplineCockpit.compute(fills: fills, profile: nil, startingBalance: 50_000, now: now, calendar: cockpitCal)
+    eqi(c.tilt.tradeCountToday, 5, "today trade count")
+    eq(c.tilt.baselineTradesPerDay, 2, "baseline = median prior active-day count")
+    eq(c.tilt.freqRatio, 2.5, "frequency escalation ratio")
+    eq(c.tilt.baselineContracts, 1, "baseline contract size = median prior size")
+    eq(c.tilt.sizeRatio, 3, "size escalation ratio")
+    ok(c.tilt.level == .high, "2.5× freq / 3× size -> HIGH tilt")
+    eq(c.tilt.gauge, 1, "gauge caps at 1 for >=2× escalation")
+    ok(c.tilt.reasons.count == 2, "both frequency and size escalation are called out")
+    // Fewer than 2 prior active days -> honestly insufficient (never a fabricated baseline).
+    let thin = DisciplineCockpit.compute(fills: [DisciplineFill(date: day(-1), pnl: 5, contracts: 1),
+                                                 DisciplineFill(date: now, pnl: 5, contracts: 1)],
+                                         profile: nil, startingBalance: 50_000, now: now, calendar: cockpitCal)
+    ok(thin.tilt.level == .insufficient, "one prior day -> insufficient baseline, no invented tilt")
+}
+
+func testDisciplineCockpitRiskOfRuin() {
+    let now = day(0)
+    // Even-money system: reduces EXACTLY to the classic gambler's ruin (q/p)^U.
+    // 4 losses then 6 wins of ±$100 (net +$200): equity ends at its peak -> currentDD = 0.
+    let seq: [Double] = [-100, -100, -100, -100, 100, 100, 100, 100, 100, 100]
+    let fills = seq.enumerated().map { DisciplineFill(date: day(-10 + $0.offset), pnl: $0.element, contracts: 1) }
+    let p = RuleProfile(name: "eval", dailyLossLimit: 0, trailingDrawdown: 400, pointValue: 50)
+    let c = DisciplineCockpit.compute(fills: fills, profile: p, startingBalance: 50_000, now: now, calendar: cockpitCal)
+    ok(c.trailingDrawdown.used == 0, "equity ends at peak -> no live drawdown")
+    ok(c.ruin.state == .computed, "risk of ruin computed on the buyer's own 10 decided trades")
+    eq(c.ruin.unitsToFloor, 4, "buffer $400 / avg loss $100 = 4 units to floor")
+    // W=0.6, b=1 -> z=0.2 -> (0.8/1.2)^4 = (2/3)^4 = 16/81.
+    eq(c.ruin.probability, 16.0/81.0, "even-money RoR reduces to (q/p)^U", tol: 1e-9)
+
+    // No positive edge -> ruin is certain over time (probability 1), honestly labeled.
+    let losing = ([100.0, 100, 100] + Array(repeating: -100.0, count: 7)).enumerated()
+        .map { DisciplineFill(date: day(-10 + $0.offset), pnl: $0.element, contracts: 1) }
+    let cl = DisciplineCockpit.compute(fills: losing, profile: p, startingBalance: 50_000, now: now, calendar: cockpitCal)
+    ok(cl.ruin.state == .noEdge && cl.ruin.probability == 1.0, "non-positive edge -> RoR = 1 (no fabricated hope)")
+
+    // Fewer than the minimum decided trades -> honestly insufficient.
+    let few = (0..<5).map { DisciplineFill(date: day(-5 + $0), pnl: $0 % 2 == 0 ? 100 : -100, contracts: 1) }
+    let cf = DisciplineCockpit.compute(fills: few, profile: p, startingBalance: 50_000, now: now, calendar: cockpitCal)
+    ok(cf.ruin.state == .insufficient, "thin sample -> insufficient, never an invented ruin number")
+}
+
+func testDisciplineCockpitEmptyHonest() {
+    let c = DisciplineCockpit.compute(fills: [], profile: nil, startingBalance: 50_000, now: day(0), calendar: cockpitCal)
+    ok(!c.hasData, "empty ledger -> hasData false")
+    ok(!c.hasProfile, "no profile -> hasProfile false")
+    ok(!c.dailyLoss.isSet && !c.trailingDrawdown.isSet, "no caps -> meters honestly not set")
+    ok(!c.muteSignals, "nothing to breach -> signals not muted")
+    ok(c.tilt.level == .insufficient, "no history -> tilt insufficient")
+    ok(c.ruin.state == .insufficient, "no trades -> ruin insufficient")
+}
+
+// ===== TR-13 non-repaint (client mirror): a live tick folds ONLY into the forming bar =====
+func testNonRepaintClosedBarsSwiftMirror() {
+    // The backend emits CLOSED buckets only (ohlc_bars drops the still-forming bucket). The client
+    // decodes that closed series and a live last-price folds into the FORMING (last) bar alone —
+    // never repainting a prior closed bar and never fabricating a future candle. This mirrors the
+    // backend non-repaint test and answers the "does it repaint?" takedown on the client side.
+    let obj: [String: Any] = ["symbol": "CM.ESU6", "bars": [
+        [100.0, 101.0, 99.0, 100.5, 1_700_000_000.0],
+        [100.5, 102.0, 100.0, 101.5, 1_700_000_015.0],
+        [101.5, 103.0, 101.0, 102.5, 1_700_000_030.0],
+    ]]
+    let bars = FeedBars.decode(obj)
+    eqi(bars.count, 3, "closed bars decode (forming bucket already excluded server-side)")
+
+    // A newer tick moves only the last (forming) bar; count never grows -> no invented future candle.
+    let tick = LiveTick(symbol: "CM.ESU6", price: 104, ts: Date(timeIntervalSince1970: 1_700_000_040))
+    let folded = LiveFold.apply(tick, to: bars)
+    eqi(folded.count, bars.count, "a live tick never fabricates a new bar")
+    ok(folded[0] == bars[0] && folded[1] == bars[1], "prior CLOSED bars do not repaint on a new tick")
+    eq(folded.last!.close, 104, "only the forming bar's close revises")
+    eq(folded.last!.high, 104, "forming bar high widens to the tick")
+
+    // A tick OLDER than the forming bar never rewrites history.
+    let stale = LiveFold.apply(LiveTick(symbol: "CM.ESU6", price: 1, ts: Date(timeIntervalSince1970: 1_700_000_020)), to: bars)
+    ok(stale == bars, "older tick is ignored — the closed series is frozen")
+
+    // Re-decoding the SAME closed payload is field-for-field identical: a prior signal's bars never revise.
+    let bars2 = FeedBars.decode(obj)
+    ok(bars2.count == bars.count && zip(bars, bars2).allSatisfy {
+        $0.date == $1.date && $0.open == $1.open && $0.high == $1.high && $0.low == $1.low && $0.close == $1.close
+    }, "closed-bar decode is deterministic (non-repainting)")
+}
+
 func testGateRerunDecodeAndStatFormatting() {
     let obj: [String: Any] = [
         "available": true, "prover_sha": "3e818b54f842ebcf", "sigMinN": 30, "alpha": 0.05,
@@ -2019,6 +2152,14 @@ testRuleProfileGateWithinLimitsAndMax()
 testRuleProfileGateBreach()
 testRuleProfileGateEdgeOfCap()
 testRuleProfileGateEmptyNoProfileNoSignal()
+
+// TR-18 discipline cockpit (live compliance gauges on the buyer's own fills) + TR-13 client-side
+// non-repaint mirror (a live tick folds only into the forming bar; closed bars never repaint).
+testDisciplineCockpitMetersAndMute()
+testDisciplineCockpitTiltmeter()
+testDisciplineCockpitRiskOfRuin()
+testDisciplineCockpitEmptyHonest()
+testNonRepaintClosedBarsSwiftMirror()
 
 // In-app auto-updater pure core (version compare, sha256, manifest decode, daily-check window)
 testUpdater()
