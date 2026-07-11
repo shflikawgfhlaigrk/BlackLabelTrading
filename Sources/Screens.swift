@@ -1693,6 +1693,9 @@ struct SettingsScreen: View {
     @State private var googleSaved = false
     @State private var feedURLDraft = ""
     @State private var feedSaved = false
+    // TR-17: neutral, honest refund line until a founder-ratified refund policy exists. NO invented
+    // guarantee ships here (§5.1) — swap this string for the ratified policy copy once Michael sets one.
+    static let refundPolicyLine = "Refunds: if something isn't right, email us — we handle billing issues case by case with a human, not an auto-decline."
     var body: some View {
         ScrollView { VStack(alignment: .leading, spacing: 20) {
             ScreenTitle(title: "Settings", subtitle: "Account, connections, and app info.", icon: "gearshape.fill")
@@ -1775,6 +1778,28 @@ struct SettingsScreen: View {
                 productRow("Outbound", "see blacklabelbots.com", "Lead gen and outreach — scoped intro before a monthly lane opens.", BLTheme.sub, "Intro")
                 Text("Current pricing lives on blacklabelbots.com (kept there so it's never stale in the app). This app is a scenario-scoring dashboard for the engine method — it scores factors you set, runs the 13 gates, and keeps an honestly-graded session ledger on this Mac. It is not a broker execution record or track record.")
                     .font(.system(size: 11.5, design: .rounded)).foregroundColor(BLTheme.sub).fixedSize(horizontal: false, vertical: true).padding(.top, 4)
+            }
+            // TR-17 — HONEST renewal / refund / support posture, in-app. Answers the BBB-documented
+            // subscription-renewal-trap pain (TradingView/LuxAlgo/TrendSpider/Tickeron) with the plain
+            // truth, and deliberately makes NO refund PROMISE the company has not ratified.
+            // ⚠️ FOUNDER INPUT NEEDED: replace `refundPolicyLine` below with ratified refund-policy copy
+            // once Michael decides one (30-day? pro-rata? none?). Until then it stays a neutral,
+            // reachable "email a human" — never an invented guarantee (§5.1).
+            Panel(title: "Billing, renewal & support", icon: "creditcard") {
+                Text("Cancel anytime. Your plan does not roll you into a renewal trap — manage or cancel it yourself; there is no phone maze and no retention gauntlet.")
+                    .font(.system(size: 12.5, design: .rounded)).foregroundColor(BLTheme.text).fixedSize(horizontal: false, vertical: true)
+                Text(Self.refundPolicyLine)
+                    .font(.system(size: 12, design: .rounded)).foregroundColor(BLTheme.sub).fixedSize(horizontal: false, vertical: true)
+                Text("Billing questions go to a real person, not a chatbot wall: info@blacklabelbots.com.")
+                    .font(.system(size: 12, design: .rounded)).foregroundColor(BLTheme.sub).fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 8) {
+                    GhostButton(label: "Manage / cancel plan", icon: "arrow.up.right.square") {
+                        if let url = URL(string: "https://blacklabelbots.com/dashboard") { NSWorkspace.shared.open(url) }
+                    }
+                    GhostButton(label: "Email support", icon: "envelope") {
+                        if let url = URL(string: "mailto:info@blacklabelbots.com") { NSWorkspace.shared.open(url) }
+                    }
+                }
             }
             Panel(title: "About", icon: "info.circle") {
                 Text("Black Label Trading v1.0").font(.system(size: 13, weight: .bold, design: .rounded)).foregroundColor(BLTheme.text)

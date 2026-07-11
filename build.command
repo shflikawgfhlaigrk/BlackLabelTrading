@@ -88,6 +88,17 @@ lipo -create "$BUILD/$BIN_NAME-arm64" "$BUILD/$BIN_NAME-x86_64" -output "$APP/Co
 rm -f "$BUILD/$BIN_NAME-arm64" "$BUILD/$BIN_NAME-x86_64"
 echo "==> Linked executable: $APP/Contents/MacOS/$BIN_NAME (lipo -archs: $(lipo -archs "$APP/Contents/MacOS/$BIN_NAME"))"
 
+# --- TR-10 PERMANENT zero-claims linter (⛔H1 mechanism) ----------------------
+# Fail the build if any fabricated win-rate / P&L / return / track-record claim is present in the
+# shipped source surface OR the freshly-linked binary. This is the standing mechanism that keeps a
+# fabricated number from ever reaching a buyer through the app (CHARTER §5.1 / §5.7); the same
+# linter runs in Tests/run-all.sh. Scans the compiled binary that will actually ship.
+echo "==> Zero-claims linter (source surface + fresh binary)"
+if ! python3 "$ROOT/backend/claim_linter.py" --binary "$APP/Contents/MacOS/$BIN_NAME"; then
+  echo "ABORT: claim_linter found a forbidden performance claim — build fails (§5.1/§5.7)." >&2
+  exit 65
+fi
+
 # --- Info.plist (includes GoogleClientID key, default empty; URL scheme; finance category) ---
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

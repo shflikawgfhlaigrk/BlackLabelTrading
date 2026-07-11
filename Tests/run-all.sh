@@ -69,6 +69,25 @@ echo "==> Black Label Trading :: combined test gate"
 run_suite "swift-logic"    bash "$ROOT/Tests/run-tests.sh"
 run_suite "backend-engine" bash "$ROOT/backend/run-tests.sh"
 run_suite "submission-contract" bash "$ROOT/Tests/submission-contract.sh"
+
+# TR-10 PERMANENT zero-claims linter — scans the shipped source surface, and the built binary too
+# when present. This is the standing mechanism (⛔H1): no fabricated win-rate / P&L / return / track-
+# record claim may reach a buyer. build.command runs the same linter to fail the build at compile.
+LINTER_ARGS=()
+if [ -x "$ROOT/build/Black Label Trading.app/Contents/MacOS/Black Label Trading" ]; then
+  LINTER_ARGS=(--binary "$ROOT/build/Black Label Trading.app/Contents/MacOS/Black Label Trading")
+fi
+# Wrap the linter so it emits the "N passed, M failed" summary line run_suite's parser expects
+# (the linter itself prints "clean —", which would otherwise hit run_suite's PARSE_FAIL path).
+claim_linter_suite() {
+  if python3 "$ROOT/backend/claim_linter.py" ${LINTER_ARGS[@]+"${LINTER_ARGS[@]}"}; then
+    echo "1 passed, 0 failed"
+  else
+    echo "0 passed, 1 failed"; return 1
+  fi
+}
+run_suite "claim-linter" claim_linter_suite
+
 if [ -d "$ROOT/build/Black Label Trading.app" ]; then
   run_suite "bundle-reference" bash "$ROOT/Tests/built-bundle-reference-contract.sh" "$ROOT/build/Black Label Trading.app"
 else

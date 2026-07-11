@@ -7,6 +7,6 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 if python3 -c "import pytest" 2>/dev/null; then
-  exec python3 -m pytest test_engines.py test_feeds.py test_api.py test_exec.py test_topstep_bridge.py test_store_scope.py -q
+  exec python3 -m pytest test_engines.py test_feeds.py test_api.py test_exec.py test_topstep_bridge.py test_store_scope.py test_claim_linter.py -q
 fi
-python3 test_engines.py && python3 test_feeds.py && python3 test_api.py && python3 test_exec.py && python3 test_topstep_bridge.py && python3 test_store_scope.py
+python3 test_engines.py && python3 test_feeds.py && python3 test_api.py && python3 test_exec.py && python3 test_topstep_bridge.py && python3 test_store_scope.py && python3 test_claim_linter.py
