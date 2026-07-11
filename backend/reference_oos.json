@@ -3,9 +3,9 @@
   "label": "Reference only \u2014 computed on historical ES data, NOT your account, NOT a promise, no performance guaranteed.",
   "disclaimer": "These verdicts are the edge-gate's honest out-of-sample result on Black Label's own historical ES bars. They are reference research, not your results, not live, and not a guarantee. Your own engine fleet arms only on the bars YOUR feed captures.",
   "source": "Black Label historical ES bars (WealthCharts-captured)",
-  "generated_utc": "2026-07-06T14:35:55Z",
-  "prover_sha": "092c4bea95ec0717",
-  "git_sha": "e680342",
+  "generated_utc": "2026-07-11T18:45:39Z",
+  "prover_sha": "5ebd7543c1b22280",
+  "git_sha": "96d1bb7",
   "significance": {
     "alpha": 0.05,
     "minTrades": 30,
