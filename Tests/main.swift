@@ -1655,6 +1655,84 @@ func testGateVerdictEmptyStoreHonest() {
     ok(v.rejects.isEmpty, "empty fleet has no reject rows")
 }
 
+// ===== Prop-firm rule profiles (item 7) — the profile-gating decision =====
+// A signal with a 2-pt stop at $50/pt/contract => $100 risk per contract.
+func testRuleProfileGateWithinLimitsAndMax() {
+    let p = RuleProfile(name: "Topstep 50K", dailyLossLimit: 500, trailingDrawdown: 2000,
+                        maxPositionSize: 5, contractScaling: 0, pointValue: 50, sourceURL: "")
+    let d = RuleProfileGate.evaluate(riskPoints: 2, pointValue: 50, contracts: 1, profile: p)
+    ok(d.verdict == .withinLimits, "1 contract respects every cap -> within limits")
+    ok(d.reasons.isEmpty, "within limits has no breach reasons")
+    eq(d.dollarRiskAtSize, 100, "one stop-out risk = 2pt * $50 * 1")
+    // maxContracts = min(maxPos 5, floor(dailyLoss 500/100)=5, floor(trailing 2000/100)=20) = 5
+    eqi(d.maxContracts, 5, "max contracts within all set limits")
+    ok(d.annotation.contains("Within limits") && d.annotation.contains("max 5"), "annotation states within + max")
+    ok(!d.isBreach, "within limits is not a breach")
+}
+
+func testRuleProfileGateBreach() {
+    let p = RuleProfile(name: "Topstep 50K", dailyLossLimit: 500, trailingDrawdown: 2000,
+                        maxPositionSize: 5, contractScaling: 0, pointValue: 50, sourceURL: "")
+    // 6 contracts => $600 (> $500 daily-loss) AND position 6 > max 5 => two breach reasons.
+    let d = RuleProfileGate.evaluate(riskPoints: 2, pointValue: 50, contracts: 6, profile: p)
+    ok(d.verdict == .breach, "over-cap size is a breach")
+    ok(d.isBreach, "isBreach true on breach")
+    eqi(d.reasons.count, 2, "both the position and daily-loss caps are breached")
+    ok(d.reasons.contains { $0.contains("max position") }, "position-cap breach reason present")
+    ok(d.reasons.contains { $0.contains("daily-loss") }, "daily-loss breach reason present")
+    eqi(d.maxContracts, 5, "breach still reports the largest within-limits size")
+    ok(d.annotation.hasPrefix("Breach:"), "breach annotation is prefixed Breach:")
+    // A stop-out big enough that even one contract breaches -> maxContracts 0.
+    let tight = RuleProfile(name: "tight", dailyLossLimit: 50, trailingDrawdown: 0,
+                            maxPositionSize: 0, contractScaling: 0, pointValue: 50, sourceURL: "")
+    let d0 = RuleProfileGate.evaluate(riskPoints: 2, pointValue: 50, contracts: 1, profile: tight)
+    ok(d0.verdict == .breach, "1 contract over the daily-loss cap is a breach")
+    eqi(d0.maxContracts, 0, "no contract count fits an over-tight cap")
+    ok(d0.annotation.contains("0 contracts"), "annotation states 0 contracts fit")
+}
+
+func testRuleProfileGateEdgeOfCap() {
+    let p = RuleProfile(name: "edge", dailyLossLimit: 500, trailingDrawdown: 2000,
+                        maxPositionSize: 5, contractScaling: 0, pointValue: 50, sourceURL: "")
+    // Exactly at the caps: $500 == daily-loss and 5 == max position -> within (uses > for breach).
+    let d = RuleProfileGate.evaluate(riskPoints: 2, pointValue: 50, contracts: 5, profile: p)
+    ok(d.verdict == .withinLimits, "hitting the cap exactly is within limits, not a breach")
+    eq(d.dollarRiskAtSize, 500, "edge-of-cap dollar risk equals the daily-loss limit")
+    eqi(d.maxContracts, 5, "edge-of-cap max contracts = the cap")
+    // One more contract tips it over.
+    let over = RuleProfileGate.evaluate(riskPoints: 2, pointValue: 50, contracts: 6, profile: p)
+    ok(over.verdict == .breach, "one contract past the cap breaches")
+}
+
+func testRuleProfileGateEmptyNoProfileNoSignal() {
+    // Empty profile: selected but no caps entered -> honest emptyProfile, never a fake pass.
+    let blank = RuleProfilePresets.profile(for: "Apex Trader Funding")
+    ok(!blank.hasLimits, "a blank firm template ships with no limits set")
+    let de = RuleProfileGate.evaluate(riskPoints: 2, pointValue: 50, contracts: 1, profile: blank)
+    ok(de.verdict == .emptyProfile, "profile with no caps -> emptyProfile verdict")
+    ok(de.annotation.contains("no limits set"), "empty-profile annotation is honest")
+    // No profile selected at all.
+    let dn = RuleProfileGate.evaluate(riskPoints: 2, pointValue: 50, contracts: 1, profile: nil)
+    ok(dn.verdict == .noProfile, "nil profile -> noProfile verdict")
+    // A real profile but no computable signal (flat / zero stop distance).
+    let p = RuleProfile(name: "x", dailyLossLimit: 500, trailingDrawdown: 0,
+                        maxPositionSize: 0, contractScaling: 0, pointValue: 50, sourceURL: "")
+    let ds = RuleProfileGate.evaluate(riskPoints: 0, pointValue: 50, contracts: 1, profile: p)
+    ok(ds.verdict == .noSignal, "no stop distance -> noSignal (never a fabricated pass)")
+    // $/pt falls back to the signal's when the profile leaves it unset.
+    let noPV = RuleProfile(name: "noPV", dailyLossLimit: 500, trailingDrawdown: 0,
+                           maxPositionSize: 0, contractScaling: 0, pointValue: 0, sourceURL: "")
+    let dfb = RuleProfileGate.evaluate(riskPoints: 2, pointValue: 50, contracts: 1, profile: noPV)
+    ok(dfb.verdict == .withinLimits, "profile $/pt falls back to the signal's when unset")
+    eq(dfb.dollarRiskAtSize, 100, "fallback $/pt computes the correct dollar risk")
+    // Scaling-plan cap is enforced independently of the absolute position cap.
+    let scale = RuleProfile(name: "scale", dailyLossLimit: 0, trailingDrawdown: 0,
+                            maxPositionSize: 0, contractScaling: 3, pointValue: 50, sourceURL: "")
+    let dsc = RuleProfileGate.evaluate(riskPoints: 2, pointValue: 50, contracts: 4, profile: scale)
+    ok(dsc.verdict == .breach && dsc.reasons.contains { $0.contains("scaling-plan") }, "scaling-plan cap breaches independently")
+    eqi(dsc.maxContracts, 3, "scaling-plan cap sets the max contracts")
+}
+
 func testGateRerunDecodeAndStatFormatting() {
     let obj: [String: Any] = [
         "available": true, "prover_sha": "3e818b54f842ebcf", "sigMinN": 30, "alpha": 0.05,
@@ -1826,29 +1904,29 @@ func testWindowLaunchOrderingContract() {
 }
 
 func testBuildNumberContract() {
-    let expectedBuild = "<key>CFBundleVersion</key><string>17</string>"
+    let expectedBuild = "<key>CFBundleVersion</key><string>18</string>"
     for file in ["build.command", "build-signed.command"] {
         guard let src = try? String(contentsOfFile: file, encoding: .utf8) else {
             ok(false, "[source] \(file) readable for build-number contract"); continue
         }
-        ok(src.contains(expectedBuild), "[source] \(file) stamps Trading build 17")
+        ok(src.contains(expectedBuild), "[source] \(file) stamps Trading build 18")
         ok(src.contains("universal2") && src.contains("build_trd_arch arm64") &&
            src.contains("build_trd_arch x86_64") && src.contains("lipo -create"),
            "[source] \(file) builds a universal2 Trading binary")
     }
     if let src = try? String(contentsOfFile: "build-developer-id.sh", encoding: .utf8) {
-        ok(src.contains("BUILD_NUMBER=\"${BUILD_NUMBER:-17}\""), "[source] Developer-ID build defaults to Trading build 17")
+        ok(src.contains("BUILD_NUMBER=\"${BUILD_NUMBER:-18}\""), "[source] Developer-ID build defaults to Trading build 18")
     } else {
         ok(false, "[source] build-developer-id.sh readable for build-number contract")
     }
     if let plist = try? String(contentsOfFile: "Sources/Info.plist", encoding: .utf8) {
-        ok(plist.contains("<key>CFBundleVersion</key>\n\t<string>17</string>"),
-           "[source] Sources/Info.plist CFBundleVersion is 17")
+        ok(plist.contains("<key>CFBundleVersion</key>\n\t<string>18</string>"),
+           "[source] Sources/Info.plist CFBundleVersion is 18")
     } else {
         ok(false, "[source] Sources/Info.plist readable for build-number contract")
     }
     if let project = try? String(contentsOfFile: "project.yml", encoding: .utf8) {
-        ok(project.contains("CFBundleVersion: \"17\""), "[source] project.yml CFBundleVersion is 17")
+        ok(project.contains("CFBundleVersion: \"18\""), "[source] project.yml CFBundleVersion is 18")
     } else {
         ok(false, "[source] project.yml readable for build-number contract")
     }
@@ -1884,6 +1962,12 @@ testGateVerdictNoEdgeAndReasons()
 testGateVerdictAllNoEdgeHeadline()
 testGateVerdictEmptyStoreHonest()
 testGateRerunDecodeAndStatFormatting()
+
+// Prop-firm rule profiles (item 7): the profile-gating decision on the buyer's own caps.
+testRuleProfileGateWithinLimitsAndMax()
+testRuleProfileGateBreach()
+testRuleProfileGateEdgeOfCap()
+testRuleProfileGateEmptyNoProfileNoSignal()
 
 // In-app auto-updater pure core (version compare, sha256, manifest decode, daily-check window)
 testUpdater()

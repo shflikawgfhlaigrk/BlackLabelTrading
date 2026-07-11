@@ -97,6 +97,7 @@ struct SignalsScreen: View {
     @State private var fleetLoading = false
     @State private var reference = ReferenceReport.empty   // reference OOS verdicts on historical ES
     @State private var rerun: GateRerunReport? = nil       // buyer-triggered re-run of the gate on own bars
+    @State private var gateContracts = "1"                 // contract size the buyer wants the prop-firm gate to check
     @State private var rerunning = false
     @State private var dailyLogPath: String? = nil   // path shown after "Export daily logs"
     @State private var tAccount = "50000"             // order-ticket sizing inputs (your own values)
@@ -146,6 +147,11 @@ struct SignalsScreen: View {
                 // empty state until the buyer's own feed produces bars.
                 if live.hasData {
                     signalCard
+
+                    // Prop-firm rule gate — annotates THIS trade plan against the buyer's active
+                    // funded-eval profile (their own caps) and hard-gates it when it would breach.
+                    // Reuses the honesty spine: engine/reason surface, zero aggregate P&L or win-rate.
+                    profileGateBanner
 
                     // Multi-timeframe consensus strip + 13-gate risk checklist.
                     HStack(alignment: .top, spacing: 16) {
@@ -625,6 +631,84 @@ struct SignalsScreen: View {
         }
         .padding(16)
         .holoCard(radius: 16)
+    }
+
+    // Prop-firm rule gate. Evaluates the CURRENT trade plan (stop distance + $/pt) at the buyer's
+    // chosen contract size against their ACTIVE rule profile (the caps THEY entered). Shows an honest
+    // "within limits at N — max M contracts" or a HARD red breach with the specific reason. No
+    // performance/win-rate/$ claim — purely the buyer's own risk math against their own firm limits.
+    private var profileGateBanner: some View {
+        let profile = model.activeProfile
+        let n = max(1, Int(gateContracts) ?? 1)
+        let d = RuleProfileGate.evaluate(riskPoints: result.riskPoints, pointValue: result.pointValue,
+                                         contracts: n, profile: profile)
+        let breach = d.isBreach
+        let accent: Color = {
+            switch d.verdict {
+            case .breach: return BLTheme.red
+            case .withinLimits: return BLTheme.green
+            default: return BLTheme.gold
+            }
+        }()
+        return Panel(title: "Prop-firm rule gate", icon: "shield.lefthalf.filled", accent: accent) {
+            if profile == nil {
+                HStack {
+                    Text("No prop-firm profile selected. Add your funded-eval firm's limits to gate this signal against your daily-loss, trailing-drawdown, and position caps.")
+                        .font(.system(size: 11.5, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer()
+                    GhostButton(label: "Set up profiles", icon: "building.columns.fill") { nav.section = .firms }
+                }
+            } else if d.verdict == .emptyProfile {
+                HStack {
+                    Text("“\(profile!.name)” has no limits set yet. Enter your firm's daily-loss / trailing-drawdown / position caps to gate this signal.")
+                        .font(.system(size: 11.5, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer()
+                    GhostButton(label: "Edit profile", icon: "pencil") { nav.section = .firms }
+                }
+            } else {
+                HStack(spacing: 10) {
+                    Image(systemName: breach ? "exclamationmark.octagon.fill" : "checkmark.shield.fill")
+                        .font(.system(size: 15, weight: .bold)).foregroundColor(accent)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(profile!.name).font(.system(size: 13, weight: .bold, design: .rounded)).foregroundColor(BLTheme.text)
+                        Text(d.annotation).font(.system(size: 11, weight: .semibold, design: .rounded)).foregroundColor(accent)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer()
+                    StatusPill(text: breach ? "BREACH" : (d.verdict == .noSignal ? "NO SIGNAL" : "WITHIN LIMITS"), tint: accent)
+                }
+                // Contract-size input the gate is evaluated at.
+                HStack(spacing: 12) {
+                    Field(title: "Contracts to check", text: $gateContracts, prompt: "1")
+                        .frame(maxWidth: 180)
+                    if d.dollarRiskAtSize > 0 {
+                        Stat(label: "One stop-out risk", value: RuleProfileGate.money(d.dollarRiskAtSize),
+                             tint: breach ? BLTheme.red : BLTheme.text)
+                    }
+                    Spacer()
+                }
+                // Hard visual gate: every breach reason, spelled out.
+                if breach {
+                    VStack(alignment: .leading, spacing: 5) {
+                        ForEach(d.reasons, id: \.self) { reason in
+                            HStack(spacing: 7) {
+                                Image(systemName: "xmark.circle.fill").font(.system(size: 11)).foregroundColor(BLTheme.red)
+                                Text(reason).font(.system(size: 11, weight: .medium, design: .rounded)).foregroundColor(BLTheme.text)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                        }
+                    }
+                    .padding(10).frame(maxWidth: .infinity, alignment: .leading)
+                    .background(BLTheme.red.opacity(0.10)).clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(BLTheme.red.opacity(0.4), lineWidth: 1))
+                }
+                Text("Limits are the caps you entered for \(profile!.name)\(profile!.sourceURL.isEmpty ? "" : " · \(profile!.sourceURL)") — confirm current terms on the firm's site. This gate is a risk annotation on your own plan; it never places or blocks an order.")
+                    .font(.system(size: 10, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
     }
 
     // Hero card.
@@ -1218,12 +1302,152 @@ struct CalculatorsScreen: View {
 
 // MARK: - Firms (prop firm reference)
 struct FirmsScreen: View {
+    @EnvironmentObject var model: AppModel
     var body: some View {
         ScrollView { VStack(alignment: .leading, spacing: 16) {
-            ScreenTitle(title: "Prop Firms", subtitle: "Futures evaluation firms and their rules — confirm current terms on each firm's site.", icon: "building.columns.fill")
-            ForEach(FirmData.all) { f in FirmRow(firm: f) }
+            ScreenTitle(title: "Prop-firm rule profiles",
+                        subtitle: "Enter YOUR funded-eval firm's limits — then Signals annotates and gates every trade plan against them. We ship no firm numbers: confirm current terms on the firm's site and enter them yourself.",
+                        icon: "building.columns.fill")
+
+            // Active profile — the one gating displayed signals.
+            Panel(title: "Active profile", icon: "shield.lefthalf.filled") {
+                if model.profiles.isEmpty {
+                    EmptyState(icon: "shield",
+                               title: "No rule profiles yet",
+                               hint: "Add a blank firm template or a custom profile below, then enter your own daily-loss, trailing-drawdown, and position caps. Signals will gate each trade plan against the active profile.")
+                } else {
+                    Picker(selection: $model.activeProfileID) {
+                        Text("None — no gating").tag(UUID?.none)
+                        ForEach(model.profiles) { p in
+                            Text(p.name.isEmpty ? "Untitled profile" : p.name).tag(UUID?.some(p.id))
+                        }
+                    } label: { EmptyView() }
+                    .pickerStyle(.menu).labelsHidden().frame(maxWidth: 320, alignment: .leading)
+                    if let a = model.activeProfile {
+                        Text(a.hasLimits
+                             ? "Signals is gating trade plans against “\(a.name)”."
+                             : "“\(a.name)” has no limits set yet — edit it below to enable gating.")
+                            .font(.system(size: 11.5, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+                    } else {
+                        Text("Gating is off — no profile is active.").font(.system(size: 11.5, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+                    }
+                }
+            }
+
+            // Add a profile — blank firm-named templates + a custom blank. Zero invented numbers.
+            Panel(title: "Add a profile", icon: "plus.circle.fill") {
+                Text("Templates are blank — every number starts empty. Pick your firm, then enter its current terms yourself.")
+                    .font(.system(size: 11.5, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 10) {
+                    Menu {
+                        ForEach(RuleProfilePresets.templates) { t in
+                            Button(t.name) { model.upsertProfile(RuleProfilePresets.profile(for: t.name)) }
+                        }
+                    } label: {
+                        HStack(spacing: 6) { Image(systemName: "building.columns.fill"); Text("From a firm template") }
+                            .font(.system(size: 13, weight: .semibold, design: .rounded)).foregroundColor(BLTheme.text)
+                            .padding(.vertical, 9).padding(.horizontal, 16)
+                            .background(BLTheme.bg2).clipShape(Capsule())
+                            .overlay(Capsule().stroke(BLTheme.gold.opacity(0.3), lineWidth: 1))
+                    }.menuStyle(.borderlessButton).fixedSize()
+                    GhostButton(label: "Custom profile", icon: "square.and.pencil") {
+                        model.upsertProfile(RuleProfilePresets.custom())
+                    }
+                    Spacer()
+                }
+            }
+
+            // One editor card per profile.
+            ForEach(model.profiles) { p in ProfileEditorCard(profile: p) }
+
+            // Reference: the same futures firms as qualitative reference only — no numbers here.
+            Panel(title: "Reference: futures firms", icon: "list.bullet") {
+                Text("Qualitative reference only (no numbers). Confirm current terms on each firm's site, then enter them into a profile above.")
+                    .font(.system(size: 11.5, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+                    .fixedSize(horizontal: false, vertical: true)
+                ForEach(FirmData.all) { f in FirmRow(firm: f) }
+            }
         }.padding(24) }
     }
+}
+
+// Editor for a single rule profile. Local string state so typing never churns the store; Save
+// commits the parsed numbers back to the model. Every field is the buyer's own — nothing invented.
+struct ProfileEditorCard: View {
+    @EnvironmentObject var model: AppModel
+    let profile: RuleProfile
+    @State private var name: String
+    @State private var dailyLoss: String
+    @State private var trailing: String
+    @State private var maxPos: String
+    @State private var scaling: String
+    @State private var pointValue: String
+    @State private var source: String
+    @State private var saved = false
+
+    init(profile: RuleProfile) {
+        self.profile = profile
+        _name = State(initialValue: profile.name)
+        _dailyLoss = State(initialValue: profile.dailyLossLimit > 0 ? RuleProfileCardFmt.num(profile.dailyLossLimit) : "")
+        _trailing = State(initialValue: profile.trailingDrawdown > 0 ? RuleProfileCardFmt.num(profile.trailingDrawdown) : "")
+        _maxPos = State(initialValue: profile.maxPositionSize > 0 ? RuleProfileCardFmt.num(profile.maxPositionSize) : "")
+        _scaling = State(initialValue: profile.contractScaling > 0 ? RuleProfileCardFmt.num(profile.contractScaling) : "")
+        _pointValue = State(initialValue: profile.pointValue > 0 ? RuleProfileCardFmt.num(profile.pointValue) : "")
+        _source = State(initialValue: profile.sourceURL)
+    }
+
+    private var isActive: Bool { model.activeProfileID == profile.id }
+
+    var body: some View {
+        Panel(title: name.isEmpty ? "Untitled profile" : name,
+              icon: "doc.text.fill",
+              accent: isActive ? BLTheme.green : BLTheme.gold) {
+            HStack {
+                if isActive { StatusPill(text: "Active", tint: BLTheme.green) }
+                Spacer()
+                GhostButton(label: isActive ? "Active" : "Make active", icon: isActive ? "checkmark" : "shield") {
+                    model.setActiveProfile(profile)
+                }
+                GhostButton(label: "Delete", icon: "trash", tint: BLTheme.red) { model.deleteProfile(profile) }
+            }
+            Field(title: "Profile name", text: $name, prompt: "e.g. Topstep 50K")
+            HStack(spacing: 12) {
+                Field(title: "Daily loss limit ($)", text: $dailyLoss, prompt: "your firm's number")
+                Field(title: "Trailing drawdown ($)", text: $trailing, prompt: "your firm's number")
+            }
+            HStack(spacing: 12) {
+                Field(title: "Max position (contracts)", text: $maxPos, prompt: "e.g. 5")
+                Field(title: "Scaling-plan cap (contracts)", text: $scaling, prompt: "e.g. 3")
+                Field(title: "$ per point / contract", text: $pointValue, prompt: "e.g. 50 (ES)")
+            }
+            Field(title: "Source URL (the firm's terms you confirmed)", text: $source, prompt: "https://…")
+            Text("Leave a field blank to skip that cap. Enter numbers from the firm's own terms — confirm current terms on the firm's site.")
+                .font(.system(size: 10, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 10) {
+                GoldButton(label: "Save profile", icon: "checkmark") {
+                    var p = profile
+                    p.name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+                    p.dailyLossLimit = max(0, Double(dailyLoss) ?? 0)
+                    p.trailingDrawdown = max(0, Double(trailing) ?? 0)
+                    p.maxPositionSize = max(0, Double(maxPos) ?? 0)
+                    p.contractScaling = max(0, Double(scaling) ?? 0)
+                    p.pointValue = max(0, Double(pointValue) ?? 0)
+                    p.sourceURL = source.trimmingCharacters(in: .whitespacesAndNewlines)
+                    model.upsertProfile(p)
+                    withAnimation { saved = true }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { withAnimation { saved = false } }
+                }
+                if saved { Text("Saved.").font(.system(size: 11, weight: .semibold, design: .rounded)).foregroundColor(BLTheme.green) }
+                Spacer()
+            }
+        }
+    }
+}
+
+enum RuleProfileCardFmt {
+    static func num(_ v: Double) -> String { v == v.rounded() ? String(Int(v)) : String(v) }
 }
 
 struct FirmRow: View {
