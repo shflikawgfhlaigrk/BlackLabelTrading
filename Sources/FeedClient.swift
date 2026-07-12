@@ -250,6 +250,14 @@ final class FeedClient: ObservableObject {
         return GateRerunReport.decode(obj)
     }
 
+    // MARK: - Instrument catalog (GET /api/instruments): the first-class multi-asset picker source.
+    // Enumerates the instruments actually in the buyer's OWN captured bars (never a hardcoded list),
+    // each classified + labeled for which ES-tuned modules apply. Honest onlyES / empty states.
+    func instrumentCatalog() async -> InstrumentCatalog {
+        guard signedIn, let obj = await getJSON("/api/instruments") else { return .empty }
+        return InstrumentCatalog.decode(obj)
+    }
+
     // MARK: - No-code backtest lab (GET /api/backtest/run): runs the SHIPPED prover on ONE
     // (engine, symbol) over the buyer's OWN captured bars, optionally date-scoped, split into folds.
     // Returns per-fold n / W / L / max-drawdown-R / p + prover_sha — never a fabricated headline.

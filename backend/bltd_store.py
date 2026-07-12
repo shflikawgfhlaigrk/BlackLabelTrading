@@ -158,6 +158,101 @@ def futures_root_any(symbol) -> str:
     return s
 
 
+# ---------------------------------------------------------------------------
+# INSTRUMENT CLASSIFICATION (TR-05 multi-asset product layer).
+#
+# The capture layer is already instrument-agnostic (BLTD_SCOPE=all): the buyer's own browser bridge
+# streams whatever instruments they watch (ES, MNQ, CL, SPY, QQQ, …) straight into the SAME store via
+# the SAME on_candle path. What was missing was a PRODUCT surface that enumerates those instruments,
+# classifies each honestly, and states which ES-tuned modules do/do not apply. This section is that
+# classifier — PURE, no store, no network. It NEVER invents an instrument the buyer doesn't have; the
+# catalog (bltd_analytics.instruments) only ever classifies symbols already present in the buyer's bars.
+#
+# Point values are declared ONLY where the CME/exchange contract spec is genuinely known; an unmapped
+# instrument returns pointValue=None so the UI shows points, never dollars computed with a wrong (e.g.
+# ES $50) multiplier. Asset class is a real bucket, not a guess: a CME venue prefix + a known futures
+# root classifies as that future; a US-equity venue prefix classifies as an ETF/equity; anything else
+# is honestly labeled "other" rather than mis-bucketed.
+# ---------------------------------------------------------------------------
+
+# root -> ($ per 1.00 point, asset_class). Mirrors the Swift TradingSymbolScope.pointValues table and
+# extends it with the asset bucket. Only KNOWN specs are listed.
+_FUTURES_SPECS = {
+    # US equity-index futures (ES-family is handled separately as es_family=True)
+    "ES": (50.0, "us_index_future"),   "MES": (5.0, "us_index_future"),
+    "EP": (50.0, "us_index_future"),
+    "NQ": (20.0, "us_index_future"),   "MNQ": (2.0, "us_index_future"),
+    "YM": (5.0, "us_index_future"),    "MYM": (0.5, "us_index_future"),
+    "RTY": (50.0, "us_index_future"),  "M2K": (5.0, "us_index_future"),
+    # energy futures
+    "CL": (1000.0, "energy_future"),   "MCL": (100.0, "energy_future"),
+    "NG": (10000.0, "energy_future"),  "RB": (42000.0, "energy_future"),
+    "HO": (42000.0, "energy_future"),  "QM": (500.0, "energy_future"),
+    # metal futures
+    "GC": (100.0, "metal_future"),     "MGC": (10.0, "metal_future"),
+    "SI": (5000.0, "metal_future"),    "SIL": (1000.0, "metal_future"),
+    "HG": (25000.0, "metal_future"),   "PL": (50.0, "metal_future"),
+    # rates futures ($ per point of price)
+    "ZB": (1000.0, "rates_future"),    "ZN": (1000.0, "rates_future"),
+    "ZF": (1000.0, "rates_future"),    "ZT": (2000.0, "rates_future"),
+    "UB": (1000.0, "rates_future"),
+    # currency futures
+    "6E": (125000.0, "fx_future"),     "6J": (12500000.0, "fx_future"),
+    "6B": (62500.0, "fx_future"),      "6A": (100000.0, "fx_future"),
+    "6C": (100000.0, "fx_future"),
+    # crypto futures
+    "MBT": (0.1, "crypto_future"),     "MET": (0.1, "crypto_future"),
+}
+
+# US-equity venue prefixes seen from the browser bridge (WealthCharts emits US.SPY / US.QQQ / …).
+_EQUITY_VENUES = {"US", "NASDAQ", "NYSE", "ARCA", "BATS", "AMEX"}
+_FUTURES_VENUES = {"CM", "CME", "CBOT", "NYMEX", "COMEX", "GLOBEX"}
+
+
+def classify_instrument(symbol) -> dict:
+    """Classify ONE captured instrument symbol honestly. PURE. Returns a dict with:
+      symbol       — the raw symbol as captured (venue prefix preserved)
+      display      — clean normalized token (venue prefix stripped)
+      root         — futures root (ES/MNQ/CL) or the bare ticker for equities
+      assetClass   — real bucket: us_index_future / energy_future / metal_future / rates_future /
+                     fx_future / crypto_future / equity_etf / other
+      pointValue   — $ per 1.00 point when the contract spec is KNOWN, else None (UI shows points only)
+      esFamily     — True only for ES/MES (root or dated contract)
+      esModules    — True only when the ES-tuned Session/SMT modules genuinely apply (== esFamily);
+                     the picker/factor UI labels these ES-only on every other instrument.
+    Nothing is fabricated: an unknown instrument is labeled 'other' with pointValue None, never guessed.
+    """
+    raw = str(symbol or "").strip()
+    display = normalize_symbol(raw)
+    venue = raw.split(".")[0].strip().upper() if "." in raw else ""
+    root = futures_root_any(raw)
+    es_family = is_es_symbol(raw)
+
+    if es_family:
+        asset_class, point_value = "us_index_future", _FUTURES_SPECS.get(root, (50.0, "us_index_future"))[0]
+    elif root in _FUTURES_SPECS:
+        point_value, asset_class = _FUTURES_SPECS[root]
+    elif venue in _EQUITY_VENUES:
+        # A US-equity venue instrument. ETF vs single-name is not decidable from the ticker alone, so
+        # we bucket honestly as equity_etf (equities + ETFs) and never claim a futures point value.
+        asset_class, point_value = "equity_etf", None
+    elif venue in _FUTURES_VENUES and root == display and display.isalpha():
+        # A futures-venue root we don't have a spec for: it IS a future, but we won't fake a multiplier.
+        asset_class, point_value = "other_future", None
+    else:
+        asset_class, point_value = "other", None
+
+    return {
+        "symbol": raw or display,
+        "display": display,
+        "root": root,
+        "assetClass": asset_class,
+        "pointValue": point_value,
+        "esFamily": es_family,
+        "esModules": es_family,
+    }
+
+
 def in_scope(symbol) -> bool:
     """True if this symbol is an instrument the product accepts (stores/charts).
 

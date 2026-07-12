@@ -208,6 +208,67 @@ def screen(store, symbols, engines, cfg=None) -> list[dict]:
     return rows
 
 
+def instruments(store, cfg=None) -> dict:
+    """First-class multi-asset catalog (TR-05): enumerate the instruments actually present in the
+    buyer's OWN captured bars, classify each honestly, and state which ES-tuned modules apply. This
+    reads the real store — it NEVER surfaces an instrument the buyer doesn't have. When the buyer has
+    only ES captured, the catalog says so honestly (onlyES=True) rather than pretending to cover more.
+
+    Every instrument is judged on ITS OWN bars — the fleet edge-gate (gate_rerun) and every factor run
+    per-instrument, never pooled across instruments (pooling ES+NQ+SPY into one verdict would be a lie).
+    """
+    cfg = cfg or store.config()
+    cat = store.symbols()  # {backtestable, live, liveTicks, busiest} — all derived from the bars table
+    live_set = set(cat.get("live", []) or []) | set(cat.get("liveTicks", []) or [])
+    bt_set = set(cat.get("backtestable", []) or [])
+
+    universe, seen = [], set()
+    for key in ("liveTicks", "live", "backtestable"):
+        for s in (cat.get(key, []) or []):
+            if s and s not in seen:
+                seen.add(s); universe.append(s)
+    busiest = cat.get("busiest")
+    if busiest and busiest not in seen:
+        seen.add(busiest); universe.append(busiest)
+
+    items, es_family_n, non_es_n = [], 0, 0
+    for s in universe:
+        info = S.classify_instrument(s)
+        try:
+            n = len(store.ohlc(s))
+        except Exception:
+            n = 0
+        info["bars"] = n
+        info["live"] = s in live_set
+        info["backtestable"] = s in bt_set
+        items.append(info)
+        if info["esFamily"]:
+            es_family_n += 1
+        else:
+            non_es_n += 1
+    # Order by depth so the most-analyzable instrument leads the picker.
+    items.sort(key=lambda x: (-x["bars"], x["display"]))
+
+    return {
+        "kind": "instruments",
+        "available": bool(items),
+        "count": len(items),
+        "esFamilyCount": es_family_n,
+        "nonEsCount": non_es_n,
+        # onlyES is an HONEST cold/thin state: the buyer has captured ES-family instruments and nothing
+        # else. The picker shows a "connect your feed and capture NQ/YM/CL/… to analyze them here" note.
+        "onlyES": bool(items) and non_es_n == 0 and es_family_n > 0,
+        "label": ("Instruments captured from YOUR own feed — the full engine fleet and the edge-gate "
+                  "run per-instrument, never pooled. Points shown; dollars only where the contract spec "
+                  "is known."),
+        "esModulesNote": ("Session and SMT are ES-tuned modules. On non-ES instruments they are labeled "
+                          "ES-only and never run with wrong math — every other module is instrument-agnostic."),
+        "instruments": items,
+        "reason": (None if items else
+                   "no instruments captured yet — connect your feed and let bars accumulate"),
+    }
+
+
 def gate_rerun(store, symbols, engines, cfg=None) -> dict:
     """Re-run the SHIPPED edge-gate provers (bltd_store.PROVERS, SIG_MIN_N=30, one-sided binomial
     p<0.05) over the buyer's OWN captured bars, on demand, and return a fully reproducible verdict:

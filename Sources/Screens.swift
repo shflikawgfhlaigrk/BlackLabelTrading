@@ -97,6 +97,7 @@ struct SignalsScreen: View {
     @State private var backendFires: [FireRow] = []
     @State private var fleetLoading = false
     @State private var reference = ReferenceReport.empty   // reference OOS verdicts on historical ES
+    @State private var catalog = InstrumentCatalog.empty    // multi-asset instruments in the buyer's own bars
     @State private var rerun: GateRerunReport? = nil       // buyer-triggered re-run of the gate on own bars
     @State private var gateContracts = "1"                 // contract size the buyer wants the prop-firm gate to check
     @State private var rerunning = false
@@ -150,6 +151,12 @@ struct SignalsScreen: View {
                 // The real edge-gated engine fleet (backend /api/screen + /api/fires) — every
                 // engine's honest OOS verdict on the buyer's OWN captured bars.
                 engineFleet
+
+                // FIRST-CLASS MULTI-ASSET PICKER (TR-05): every instrument in the buyer's OWN captured
+                // bars — beyond ES — classified by asset class, with which ES-tuned modules apply. The
+                // full fleet + edge-gate run per-instrument (never pooled). Honest "only ES captured so
+                // far" state; never a hardcoded list of instruments the buyer doesn't have.
+                multiAssetPanel
 
                 // One-click reproducible re-run of the SAME edge-gate over the buyer's own bars —
                 // prover_sha + full n / W / L / max-drawdown / p-value. Buyer-verifiable, no cherry-picking.
@@ -356,7 +363,8 @@ struct SignalsScreen: View {
         let rows = await feed.engineScreen()
         let fires = await feed.recentFires()
         let ref = await feed.referenceReport()
-        await MainActor.run { fleet = rows; backendFires = fires; reference = ref; fleetLoading = false }
+        let cat = await feed.instrumentCatalog()
+        await MainActor.run { fleet = rows; backendFires = fires; reference = ref; catalog = cat; fleetLoading = false }
     }
 
     // FIRST-CLASS "NO EDGE TODAY" hero. A pure roll-up (GateVerdict.compute) of the SAME engine
@@ -414,6 +422,71 @@ struct SignalsScreen: View {
             Spacer(minLength: 0)
         }
         .padding(.vertical, 6).padding(.horizontal, 10).background(BLTheme.bg2).clipShape(RoundedRectangle(cornerRadius: 9))
+    }
+
+    // FIRST-CLASS MULTI-ASSET PICKER (TR-05). Enumerates the instruments in the buyer's OWN captured
+    // bars — beyond ES — from GET /api/instruments (never a hardcoded list). Each instrument shows its
+    // asset class, captured bar count, live state, dollar-per-point (only when the spec is known), and
+    // an HONEST per-instrument module note: on non-ES instruments Session + SMT are labeled ES-only and
+    // never run with wrong math. The fleet + edge-gate run per-instrument; "Re-run the edge gate on my
+    // bars" below judges every one of these on its own bars, never pooled.
+    private var multiAssetPanel: some View {
+        Panel(title: "My instruments (multi-asset)", icon: "square.grid.2x2.fill", accent: BLTheme.gold) {
+            Text(catalog.available ? catalog.label
+                 : "Every instrument you stream — ES, NQ/YM index futures, CL/GC, or SPY/QQQ ETFs — is analyzed on its OWN bars by the full engine fleet and the edge-gate. Points shown; dollars only where the contract spec is known.")
+                .font(.system(size: 11, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 8) {
+                Text(catalog.headline)
+                    .font(.system(size: 11.5, weight: .bold, design: .rounded)).foregroundColor(BLTheme.text)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 0)
+                if catalog.available {
+                    StatusPill(text: "\(catalog.count) instr · \(catalog.nonEsCount) non-ES",
+                               tint: catalog.nonEsCount > 0 ? BLTheme.green : BLTheme.gold)
+                }
+            }
+            if !catalog.available {
+                EmptyState(icon: "square.grid.2x2",
+                           title: "No instruments captured yet",
+                           hint: catalog.reason ?? "Connect your feed and let bars accumulate — every instrument you stream will appear here, each analyzed on its own bars.")
+            } else {
+                if catalog.onlyES {
+                    Text("Only ES captured so far — capture NQ/YM/CL/ETFs on your feed and they will appear here, each judged on their own bars (never pooled with ES).")
+                        .font(.system(size: 10.5, weight: .medium, design: .rounded)).foregroundColor(BLTheme.gold.opacity(0.85))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Divider().background(BLTheme.stroke).padding(.vertical, 2)
+                VStack(spacing: 8) { ForEach(catalog.instruments) { instrumentRow($0) } }
+                Text(catalog.esModulesNote)
+                    .font(.system(size: 9, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private func instrumentRow(_ i: InstrumentInfo) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: i.esModules ? "star.circle.fill" : "circle.grid.cross")
+                .font(.system(size: 14, weight: .bold)).foregroundColor(i.esModules ? BLTheme.gold : BLTheme.sub).frame(width: 18)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(i.display).font(.system(size: 13, weight: .bold, design: .rounded)).foregroundColor(BLTheme.text)
+                    Text(i.assetClassLabel).font(.system(size: 9.5, weight: .heavy, design: .rounded))
+                        .foregroundColor(BLTheme.sub).padding(.horizontal, 6).padding(.vertical, 1)
+                        .background(BLTheme.panel2).clipShape(Capsule())
+                    if i.live { Text("LIVE").font(.system(size: 8.5, weight: .heavy, design: .rounded)).foregroundColor(BLTheme.green) }
+                }
+                Text("\(i.bars) bars · \(i.dollarNote) · \(i.moduleNote)")
+                    .font(.system(size: 10, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+                    .monospacedDigit().lineLimit(1)
+            }
+            Spacer()
+            StatusPill(text: i.esModules ? "ES-tuned modules on" : "Session/SMT ES-only",
+                       tint: i.esModules ? BLTheme.gold : BLTheme.sub)
+        }
+        .padding(12).background(BLTheme.panel2).clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 11, style: .continuous).stroke(BLTheme.stroke, lineWidth: 1))
     }
 
     // One-click, buyer-reproducible re-run of the edge-gate over the buyer's OWN captured bars.
@@ -971,6 +1044,9 @@ struct SignalsScreen: View {
             if let v = v {
                 Text(String(format: "%+.2f", v)).font(.system(size: 13, weight: .bold, design: .rounded)).monospacedDigit()
                     .foregroundColor(v > 0.05 ? BLTheme.green : (v < -0.05 ? BLTheme.red : BLTheme.sub))
+            } else if live.esOnlyAbsent.contains(f.rawValue) {
+                // TR-05 (c): honest, explicit reason on non-ES instruments — never silent wrong math.
+                Text("ES-only module (n/a here)").font(.system(size: 10, weight: .heavy, design: .rounded)).foregroundColor(BLTheme.gold.opacity(0.85))
             } else {
                 Text("no live data").font(.system(size: 10, weight: .heavy, design: .rounded)).foregroundColor(BLTheme.sub.opacity(0.8))
             }

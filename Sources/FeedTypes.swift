@@ -618,6 +618,102 @@ struct GateRerunReport: Equatable {
     }
 }
 
+// MARK: - Instrument catalog from GET /api/instruments (TR-05 multi-asset product layer).
+// Enumerates the instruments actually present in the buyer's OWN captured bars, each classified by
+// asset class + whether the ES-tuned modules apply. NEVER a hardcoded list — the backend derives it
+// from the bars table, so it only ever names instruments the buyer really has. `onlyES` is the honest
+// "only ES captured so far" state (not an empty promise of multi-asset coverage).
+struct InstrumentInfo: Equatable, Identifiable {
+    var symbol: String        // raw captured symbol (venue prefix preserved), e.g. "CM.MNQU6"
+    var display: String       // clean token, e.g. "MNQU6"
+    var root: String          // futures root / ticker, e.g. "MNQ"
+    var assetClass: String    // us_index_future / energy_future / metal_future / equity_etf / other …
+    var pointValue: Double?   // $ per 1.00 point when the contract spec is known, else nil (points only)
+    var esFamily: Bool
+    var esModules: Bool       // whether the ES-tuned Session/SMT modules apply (== esFamily)
+    var bars: Int
+    var live: Bool
+    var backtestable: Bool
+    var id: String { symbol }
+
+    // Human asset-class label for the picker.
+    var assetClassLabel: String {
+        switch assetClass {
+        case "us_index_future": return "US index future"
+        case "energy_future":   return "Energy future"
+        case "metal_future":    return "Metal future"
+        case "rates_future":    return "Rates future"
+        case "fx_future":       return "FX future"
+        case "crypto_future":   return "Crypto future"
+        case "other_future":    return "Future"
+        case "equity_etf":      return "Equity / ETF"
+        default:                return "Other"
+        }
+    }
+    // Honest per-instrument module note (never silent wrong math).
+    var moduleNote: String {
+        esModules ? "All modules apply (ES-tuned Session + SMT active)"
+                  : "Session + SMT are ES-only — absent here; all other modules apply"
+    }
+    var dollarNote: String {
+        if let pv = pointValue {
+            let s = pv == pv.rounded() ? String(Int(pv)) : String(format: "%.2f", pv)
+            return "$\(s)/pt"
+        }
+        return "points only (no contract multiplier)"
+    }
+}
+
+struct InstrumentCatalog: Equatable {
+    var available: Bool
+    var count: Int
+    var esFamilyCount: Int
+    var nonEsCount: Int
+    var onlyES: Bool
+    var label: String
+    var esModulesNote: String
+    var instruments: [InstrumentInfo]
+    var reason: String?
+
+    static let empty = InstrumentCatalog(
+        available: false, count: 0, esFamilyCount: 0, nonEsCount: 0, onlyES: false,
+        label: "", esModulesNote: "", instruments: [], reason: nil)
+
+    // Honest headline for the picker header.
+    var headline: String {
+        if !available { return "No instruments captured yet — connect your feed and let bars accumulate." }
+        if onlyES { return "Only ES captured so far — connect your feed and capture NQ/YM/CL/ETFs to analyze them here." }
+        return "\(count) instrument\(count == 1 ? "" : "s") captured · \(nonEsCount) non-ES · each analyzed on its own bars."
+    }
+
+    static func decode(_ obj: [String: Any]) -> InstrumentCatalog {
+        var out = InstrumentCatalog.empty
+        out.available = (obj["available"] as? Bool) ?? false
+        out.count = Int(FeedBars.num(obj["count"] as Any) ?? 0)
+        out.esFamilyCount = Int(FeedBars.num(obj["esFamilyCount"] as Any) ?? 0)
+        out.nonEsCount = Int(FeedBars.num(obj["nonEsCount"] as Any) ?? 0)
+        out.onlyES = (obj["onlyES"] as? Bool) ?? false
+        out.label = (obj["label"] as? String) ?? ""
+        out.esModulesNote = (obj["esModulesNote"] as? String) ?? ""
+        out.reason = obj["reason"] as? String
+        out.instruments = ((obj["instruments"] as? [[String: Any]]) ?? []).compactMap { i in
+            guard let sym = i["symbol"] as? String, TradingSymbolScope.inScope(sym) else { return nil }
+            return InstrumentInfo(
+                symbol: sym,
+                display: (i["display"] as? String) ?? TradingSymbolScope.displaySymbol(sym),
+                root: (i["root"] as? String) ?? "",
+                assetClass: (i["assetClass"] as? String) ?? "other",
+                pointValue: (i["pointValue"] as? NSNull) == nil ? FeedBars.num(i["pointValue"] as Any) : nil,
+                esFamily: (i["esFamily"] as? Bool) ?? false,
+                esModules: (i["esModules"] as? Bool) ?? false,
+                bars: Int(FeedBars.num(i["bars"] as Any) ?? 0),
+                live: (i["live"] as? Bool) ?? false,
+                backtestable: (i["backtestable"] as? Bool) ?? false)
+        }
+        return out
+    }
+}
+
 // MARK: - No-code backtest lab from GET /api/backtest/run.
 // The buyer picks ONE engine + ONE instrument + an optional date range; the backend runs the SAME
 // shipped prover (bltd_store.PROVERS) on their OWN captured bars, split into contiguous folds, and

@@ -17,6 +17,9 @@ struct ChartIndicatorSet: Codable, Equatable {
     var rsi = false
     var macd = false
     var atr = false
+    var stochastic = false
+    var stochPeriod = 14
+    var stochD = 3
     var smaPeriod = 20
     var emaPeriod = 9
     var ema2Period = 21      // second EMA (demo shows EMA9 gold + EMA21 blue)
@@ -33,9 +36,12 @@ struct ChartIndicatorSet: Codable, Equatable {
 // Real minute timeframes (base capture bars are 15s, so 1m = 4 base bars) so the live chart
 // opens on readable 1-minute candles instead of choppy 15-second micro-bars.
 enum ChartTimeframe: String, CaseIterable, Identifiable, Codable {
-    case m1 = "1m", m5 = "5m", m15 = "15m", m30 = "30m", h1 = "1h"
+    case m1 = "1m", m5 = "5m", m15 = "15m", m30 = "30m", h1 = "1h", d1 = "1D"
     var id: String { rawValue }
-    var factor: Int { switch self { case .m1: return 4; case .m5: return 20; case .m15: return 60; case .m30: return 120; case .h1: return 240 } }
+    // Fixed-count aggregation factor over the 15s base bars. Daily (.d1) is calendar-based, not a
+    // fixed count, so it resamples via Resampler.daily instead (see `isDaily`).
+    var factor: Int { switch self { case .m1: return 4; case .m5: return 20; case .m15: return 60; case .m30: return 120; case .h1: return 240; case .d1: return 240 } }
+    var isDaily: Bool { self == .d1 }
 }
 
 enum Resampler {
@@ -121,9 +127,10 @@ struct ChartScreen: View {
         if let d = try? JSONEncoder().encode(ind) { UserDefaults.standard.set(d, forKey: Self.indKey) }
     }
 
-    // Bars after timeframe resampling (every timeframe aggregates the 15s base bars to minutes).
+    // Bars after timeframe resampling (every timeframe aggregates the 15s base bars). Daily aggregates
+    // by calendar day; all others by a fixed count. Honest down-sampling of the buyer's OWN bars.
     private var bars: [Bar] {
-        Resampler.resample(baseBars, factor: timeframe.factor)
+        timeframe.isDaily ? Resampler.daily(baseBars) : Resampler.resample(baseBars, factor: timeframe.factor)
     }
     // Candles for the current style.
     private var candles: [Candle] {
@@ -464,6 +471,7 @@ struct ChartScreen: View {
                 indToggle("RSI", $ind.rsi, BLTheme.blue)
                 indToggle("MACD", $ind.macd, BLTheme.goldDim)
                 indToggle("ATR", $ind.atr, BLTheme.red)
+                indToggle("Stochastic", $ind.stochastic, BLTheme.blue)
                 indToggle("Log", $ind.logScale, BLTheme.goldDim)
                 Spacer()
                 GhostButton(label: "Indicator settings", icon: "slider.horizontal.3") { showIndSettings.toggle() }
@@ -505,6 +513,7 @@ struct ChartScreen: View {
                 stepField("VWAP window", $ind.vwapWindow, 1...1000)
                 stepField("RSI period", $ind.rsiPeriod, 2...100)
                 stepField("ATR period", $ind.atrPeriod, 2...100)
+                stepField("Stoch period", $ind.stochPeriod, 2...100)
                 Spacer()
             }
         }
@@ -574,6 +583,7 @@ struct ChartScreen: View {
         if ind.rsi { r.rsiPeriod = ind.rsiPeriod }
         if ind.macd { r.macd = true }
         if ind.atr { r.atrPeriod = ind.atrPeriod }
+        if ind.stochastic { r.stochastic = (period: ind.stochPeriod, d: ind.stochD) }
         r.logScale = ind.logScale
         r.lastPriceLine = livePriceLine
         if ind.engines {

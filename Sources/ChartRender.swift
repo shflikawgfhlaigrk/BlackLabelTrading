@@ -94,6 +94,7 @@ struct RenderIndicators {
     var rsiPeriod: Int? = nil     // draws an RSI sub-pane when set
     var macd = false              // draws a MACD(12,26,9) sub-pane when true
     var atrPeriod: Int? = nil     // draws an ATR sub-pane when set
+    var stochastic: (period: Int, d: Int)? = nil   // draws a Stochastic %K/%D sub-pane when set
     var bollinger: (period: Int, k: Double)? = nil
     var crosshairIndex: Int? = nil  // candle index to draw the crosshair + OHLC readout at
     var lastPriceLine: Double? = nil
@@ -134,6 +135,7 @@ enum ChartRender {
         var rsi: CGRect = .zero
         var macd: CGRect = .zero
         var atr: CGRect = .zero
+        var stoch: CGRect = .zero
         var vol: CGRect = .zero
         var bottomAxis: CGFloat = 26
         var marginR: CGFloat = 78
@@ -152,6 +154,7 @@ enum ChartRender {
         if ind.rsiPeriod != nil  { lower.append(("rsi",  contentH * 0.16)) }
         if ind.macd              { lower.append(("macd", contentH * 0.16)) }
         if ind.atrPeriod != nil  { lower.append(("atr",  contentH * 0.13)) }
+        if ind.stochastic != nil { lower.append(("stoch", contentH * 0.16)) }
         if showVolume && hasVolume { lower.append(("vol", contentH * 0.12)) }
         let lowerTotal = lower.reduce(CGFloat(0)) { $0 + $1.1 } + CGFloat(lower.count) * gap
         let priceH = max(contentH * 0.42, contentH - lowerTotal)
@@ -161,7 +164,7 @@ enum ChartRender {
         var y = L.price.minY - gap
         for (key, h) in lower {
             let r = CGRect(x: plotL, y: y - h, width: plotW, height: h)
-            switch key { case "rsi": L.rsi = r; case "macd": L.macd = r; case "atr": L.atr = r; default: L.vol = r }
+            switch key { case "rsi": L.rsi = r; case "macd": L.macd = r; case "atr": L.atr = r; case "stoch": L.stoch = r; default: L.vol = r }
             y = r.minY - gap
         }
         return L
@@ -276,7 +279,7 @@ enum ChartRender {
                      size: wmSize, color: RenderPalette.alpha(RenderPalette.text, 0.035), bold: true)
         }
         // Time-aware x-axis over the VISIBLE candles (round-clock labels + session separators).
-        let lowerRects = [L.rsi, L.macd, L.atr, L.vol].filter { $0 != .zero }
+        let lowerRects = [L.rsi, L.macd, L.atr, L.stoch, L.vol].filter { $0 != .zero }
         drawWindowedTimeAxis(ctx, visible: visible, priceRect: priceRect, panes: lowerRects,
                              bottomY: bottomAxis, slot: slot, xCenter: xCenter)
 
@@ -433,6 +436,22 @@ enum ChartRender {
             func yA(_ v: Double) -> CGFloat { L.atr.minY + CGFloat(v/lim) * (L.atr.height - 4) }
             drawSeries(ctx, atr, rect: L.atr, xCenter: xCenter, y: yA, color: RenderPalette.red, width: 1.5)
             drawText(ctx, "ATR \(ap)", at: CGPoint(x: L.atr.minX + 8, y: L.atr.maxY - 16), size: 10, color: RenderPalette.sub, bold: true)
+        }
+
+        // ---- Stochastic sub-pane (%K/%D): real high/low/close math on the buyer's own bars. ----
+        if let st = ind.stochastic, L.stoch != .zero {
+            drawPanel(ctx, L.stoch)
+            let s = ChartIndicators.stochastic(vbars, period: st.period, dPeriod: st.d)
+            func yS(_ v: Double) -> CGFloat { L.stoch.minY + CGFloat(v/100) * L.stoch.height }
+            for lvl in [20.0, 50, 80] {
+                let y = yS(lvl)
+                strokeLine(ctx, CGPoint(x: L.stoch.minX, y: y), CGPoint(x: L.stoch.maxX, y: y),
+                           color: RenderPalette.alpha(lvl==50 ? RenderPalette.sub : (lvl<50 ? RenderPalette.green : RenderPalette.red), 0.30), width: 0.8, dash: [3,3])
+                drawText(ctx, String(Int(lvl)), at: CGPoint(x: L.stoch.maxX + 6, y: y - 5), size: 9, color: RenderPalette.sub)
+            }
+            drawSeries(ctx, s.k, rect: L.stoch, xCenter: xCenter, y: yS, color: RenderPalette.blue, width: 1.6)
+            drawSeries(ctx, s.d, rect: L.stoch, xCenter: xCenter, y: yS, color: RenderPalette.gold, width: 1.4)
+            drawText(ctx, "STOCH \(st.period),\(st.d)", at: CGPoint(x: L.stoch.minX + 8, y: L.stoch.maxY - 16), size: 10, color: RenderPalette.sub, bold: true)
         }
 
         // ---- Volume sub-pane (real volume only) ----

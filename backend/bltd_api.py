@@ -651,6 +651,10 @@ class H(BaseHTTPRequestHandler):
                 return self._send(200, STORE.meta())
             if u.path == "/api/symbols":
                 return self._send(200, STORE.symbols())
+            if u.path == "/api/instruments":
+                # First-class multi-asset catalog over the buyer's OWN captured bars (TR-05): every
+                # instrument classified + per-instrument (never pooled). Honest onlyES state when thin.
+                return self._send(200, bltd_analytics.instruments(STORE, STORE.config()))
             if u.path == "/api/bars":
                 return self._send(200, STORE.bars(g("symbol"), int(g("limit", "5000")), newest=False))
             if u.path == "/api/recent":

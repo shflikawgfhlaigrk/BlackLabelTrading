@@ -1358,6 +1358,119 @@ def test_backtest_lab_empty_store_is_honest_pending():
     assert rep["folds"] == [] and rep["whole"] is None
 
 
+# ===========================================================================
+# TR-05 multi-asset product layer — instrument catalog + per-instrument honesty
+# ===========================================================================
+class _CatalogStore:
+    """Fake store for the instrument catalog: derives symbols() from a {symbol: ohlc} series map the
+    same way the real Store does (backtestable >=40 bars, live/liveTicks = all present, busiest = most
+    bars). Lets the catalog + per-instrument gate be tested with no DB, on real classification math."""
+    def __init__(self, series):
+        self._series = series
+
+    def config(self):
+        return S.CONFIG_DEFAULTS
+
+    def ohlc(self, symbol):
+        return self._series.get(symbol, [])
+
+    def symbols(self):
+        present = [s for s, v in self._series.items() if v]
+        bt = [s for s in present if len(self._series[s]) >= 40]
+        busiest = max(present, key=lambda s: len(self._series[s])) if present else None
+        return {"backtestable": sorted(bt), "live": sorted(present),
+                "liveTicks": sorted(present), "busiest": busiest}
+
+
+def test_classify_instrument_asset_classes_are_honest():
+    # ES-family: es modules apply, dollars known.
+    es = S.classify_instrument("CM.ESU6")
+    assert es["esFamily"] is True and es["esModules"] is True
+    assert es["assetClass"] == "us_index_future" and es["pointValue"] == 50.0 and es["root"] == "ES"
+    # Non-ES index future: classified, dollars known, but ES-tuned modules do NOT apply.
+    mnq = S.classify_instrument("CM.MNQU6")
+    assert mnq["esFamily"] is False and mnq["esModules"] is False
+    assert mnq["assetClass"] == "us_index_future" and mnq["pointValue"] == 2.0 and mnq["root"] == "MNQ"
+    # Energy future: different asset bucket, own spec.
+    cl = S.classify_instrument("CL")
+    assert cl["assetClass"] == "energy_future" and cl["pointValue"] == 1000.0
+    # US equity/ETF: honest bucket, NO fabricated futures multiplier.
+    spy = S.classify_instrument("US.SPY")
+    assert spy["assetClass"] == "equity_etf" and spy["pointValue"] is None and spy["esModules"] is False
+    assert spy["display"] == "SPY"
+    # Unknown instrument: never guessed — 'other' with no point value.
+    other = S.classify_instrument("WIBBLE")
+    assert other["assetClass"] == "other" and other["pointValue"] is None and other["esModules"] is False
+
+
+def test_instruments_catalog_enumerates_captured_symbols_dynamically():
+    import bltd_analytics as A
+    orig = S.INSTRUMENT_SCOPE
+    try:
+        S.INSTRUMENT_SCOPE = "all"
+        series = {
+            "CM.ESU6": [(100.0 + i * 0.1,) * 4 for i in range(120)],   # ES-family, deep
+            "CM.MNQU6": [(200.0 + i * 0.1,) * 4 for i in range(80)],   # non-ES future
+            "US.SPY": [(400.0 + i * 0.1,) * 4 for i in range(60)],     # ETF
+        }
+        rep = A.instruments(_CatalogStore(series))
+    finally:
+        S.INSTRUMENT_SCOPE = orig
+    assert rep["available"] is True and rep["count"] == 3
+    assert rep["esFamilyCount"] == 1 and rep["nonEsCount"] == 2
+    assert rep["onlyES"] is False
+    by_disp = {i["display"]: i for i in rep["instruments"]}
+    # >=2 non-ES instruments surfaced from the buyer's OWN bars (never a hardcoded list).
+    assert {"ESU6", "MNQU6", "SPY"} <= set(by_disp)
+    assert by_disp["MNQU6"]["esModules"] is False and by_disp["SPY"]["assetClass"] == "equity_etf"
+    assert by_disp["ESU6"]["esModules"] is True
+    # Deepest instrument leads the picker; every item carries its own real bar count.
+    assert rep["instruments"][0]["display"] == "ESU6" and rep["instruments"][0]["bars"] == 120
+
+
+def test_instruments_catalog_only_es_is_honest_state():
+    import bltd_analytics as A
+    orig = S.INSTRUMENT_SCOPE
+    try:
+        S.INSTRUMENT_SCOPE = "all"
+        rep = A.instruments(_CatalogStore({"CM.ESU6": [(100.0 + i * 0.1,) * 4 for i in range(60)]}))
+    finally:
+        S.INSTRUMENT_SCOPE = orig
+    # The honest "only ES captured so far" state — never a fabricated multi-asset spread.
+    assert rep["onlyES"] is True and rep["nonEsCount"] == 0 and rep["esFamilyCount"] == 1
+
+
+def test_instruments_catalog_empty_store_is_honest():
+    import bltd_analytics as A
+    rep = A.instruments(_CatalogStore({}))
+    assert rep["available"] is False and rep["count"] == 0 and rep["onlyES"] is False
+    assert rep["reason"] and "no instruments" in rep["reason"].lower()
+
+
+def test_gate_rerun_judges_each_instrument_independently_never_pooled():
+    import bltd_analytics as A
+    orig = S.INSTRUMENT_SCOPE
+    try:
+        S.INSTRUMENT_SCOPE = "all"
+        # Deep ES + a THIN NQ (below the arm threshold). Verdicts must be per (engine, contract):
+        # the thin NQ series is judged insufficient/warming on ITS OWN bars, never averaged into ES.
+        series = {
+            "CM.ESU6": [(100.0 + i * 0.3,) * 4 for i in range(400)],
+            "CM.NQU6": [(200.0 + i * 0.3,) * 4 for i in range(15)],
+        }
+        rep = A.gate_rerun(_CatalogStore(series), ["CM.ESU6", "CM.NQU6"], list(S.PROVERS.keys()))
+    finally:
+        S.INSTRUMENT_SCOPE = orig
+    assert rep["symbols"] == ["CM.ESU6", "CM.NQU6"]                    # both instruments, listed separately
+    for e in rep["engines"]:
+        contracts = {c["symbol"]: c for c in e["contracts"]}
+        assert set(contracts) == {"CM.ESU6", "CM.NQU6"}               # a row PER instrument, not pooled
+        nq = contracts["CM.NQU6"]
+        # The thin instrument is honestly insufficient (warming) and NEVER proven off ES's sample.
+        assert nq["insufficient"] is True and nq["proven"] is False
+        assert nq["bars"] == 15 and ("warming" in nq["reason"] or "insufficient" in nq["reason"])
+
+
 if __name__ == "__main__":
     import sys
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

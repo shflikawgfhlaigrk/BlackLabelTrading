@@ -1866,6 +1866,111 @@ func testNonRepaintClosedBarsSwiftMirror() {
     }, "closed-bar decode is deterministic (non-repainting)")
 }
 
+// ===== TR-05 multi-asset: InstrumentCatalog decode + honest per-instrument module labels =====
+func testInstrumentCatalogDecodeAndModuleLabels() {
+    let obj: [String: Any] = [
+        "available": true, "count": 3, "esFamilyCount": 1, "nonEsCount": 2, "onlyES": false,
+        "label": "Instruments captured from YOUR own feed", "esModulesNote": "Session and SMT are ES-tuned",
+        "instruments": [
+            ["symbol": "CM.ESU6", "display": "ESU6", "root": "ES", "assetClass": "us_index_future",
+             "pointValue": 50.0, "esFamily": true, "esModules": true, "bars": 400, "live": true, "backtestable": true],
+            ["symbol": "CM.MNQU6", "display": "MNQU6", "root": "MNQ", "assetClass": "us_index_future",
+             "pointValue": 2.0, "esFamily": false, "esModules": false, "bars": 300, "live": true, "backtestable": true],
+            ["symbol": "US.SPY", "display": "SPY", "root": "SPY", "assetClass": "equity_etf",
+             "pointValue": NSNull(), "esFamily": false, "esModules": false, "bars": 120, "live": false, "backtestable": true],
+        ],
+    ]
+    let cat = InstrumentCatalog.decode(obj)
+    ok(cat.available && cat.count == 3, "catalog decode available + count")
+    eqi(cat.nonEsCount, 2, "two non-ES instruments decoded")
+    ok(!cat.onlyES, "onlyES false when non-ES present")
+    ok(cat.headline.contains("non-ES"), "headline surfaces non-ES coverage")
+    let es = cat.instruments[0], mnq = cat.instruments[1], spy = cat.instruments[2]
+    // ES: ES-tuned modules apply; dollars known.
+    ok(es.esModules && es.moduleNote.contains("ES-tuned Session + SMT active"), "ES row: modules apply")
+    ok(es.dollarNote == "$50/pt", "ES row: known dollar/pt")
+    // MNQ: non-ES future — Session/SMT labeled ES-only, never silent wrong math; dollars still known.
+    ok(!mnq.esModules && mnq.moduleNote.contains("Session + SMT are ES-only"), "MNQ row: ES-only modules labeled")
+    ok(mnq.dollarNote == "$2/pt", "MNQ row: known dollar/pt")
+    // SPY: ETF — NO fabricated futures multiplier (points only).
+    ok(spy.pointValue == nil && spy.dollarNote.contains("points only"), "SPY row: no fabricated multiplier")
+    ok(spy.assetClassLabel == "Equity / ETF", "SPY row: honest asset class")
+    // Honest onlyES state.
+    let onlyES = InstrumentCatalog.decode(["available": true, "count": 1, "esFamilyCount": 1,
+        "nonEsCount": 0, "onlyES": true, "instruments": [
+            ["symbol": "CM.ESU6", "display": "ESU6", "root": "ES", "assetClass": "us_index_future",
+             "pointValue": 50.0, "esFamily": true, "esModules": true, "bars": 60, "live": true, "backtestable": true]]])
+    ok(onlyES.onlyES && onlyES.headline.contains("Only ES captured"), "onlyES honest headline")
+    // Honest empty state.
+    let empty = InstrumentCatalog.decode(["available": false, "reason": "no instruments captured yet"])
+    ok(!empty.available && empty.headline.contains("No instruments captured"), "empty catalog honest")
+}
+
+// ===== TR-05 (c): ES-tuned Session/SMT modules are labeled ES-only on non-ES instruments =====
+func testEsOnlyModuleLabeling() {
+    func mkBars(_ n: Int, base: Double = 100) -> [Bar] {
+        (0..<n).map { i in
+            let p = base + Double(i) * 0.1
+            return Bar(date: Date(timeIntervalSince1970: 1_700_000_000 + Double(i) * 60),
+                       open: p, high: p + 0.3, low: p - 0.3, close: p + 0.1, volume: 1000)
+        }
+    }
+    let bars = mkBars(60), nq = mkBars(60, base: 200)
+    let sessionKey = SignalFactor.session.rawValue, smtKey = SignalFactor.smt.rawValue
+    // Non-ES instrument: Session + SMT are recorded as ES-only-absent and NOT computed (no wrong math).
+    let nonEs = LiveFactorEngine.compute(bars: bars, nqBars: nq, fires: [], now: Date(), esFamily: false)
+    ok(nonEs.esOnlyAbsent == LiveFactorEngine.esOnlyFactors, "non-ES: Session+SMT flagged ES-only")
+    ok(!nonEs.available.contains(sessionKey) && !nonEs.available.contains(smtKey),
+       "non-ES: ES-only modules are absent, never fabricated")
+    // ES instrument: Session applies (computed from RSI); no ES-only-absent labels.
+    let es = LiveFactorEngine.compute(bars: bars, nqBars: nq, fires: [], now: Date(), esFamily: true)
+    ok(es.esOnlyAbsent.isEmpty, "ES: no ES-only-absent labels")
+    ok(es.available.contains(sessionKey), "ES: Session module active")
+}
+
+// ===== TR-07 charting: Stochastic math + the checked-in parity bar =====
+func testStochasticAndParityBar() {
+    func mkBars(_ n: Int) -> [Bar] {
+        (0..<n).map { i in
+            let p = 100.0 + sin(Double(i) / 5) * 5      // oscillating so %K sweeps its range
+            return Bar(date: Date(timeIntervalSince1970: 1_700_000_000 + Double(i) * 60),
+                       open: p, high: p + 1, low: p - 1, close: p, volume: 1000)
+        }
+    }
+    let s = ChartIndicators.stochastic(mkBars(60), period: 14, dPeriod: 3)
+    let kVals = s.k.compactMap { $0 }
+    ok(!kVals.isEmpty, "stochastic %K produced")
+    ok(kVals.allSatisfy { $0 >= 0 && $0 <= 100 }, "%K bounded to [0,100]")
+    ok(s.d.compactMap { $0 }.count > 0, "%D (SMA of %K) produced")
+    // Flat range → nil, never a fabricated reading (no divide-by-zero).
+    let flat = (0..<20).map { _ in Bar(date: Date(), open: 100, high: 100, low: 100, close: 100, volume: 0) }
+    ok(ChartIndicators.stochastic(flat).k.compactMap { $0 }.isEmpty, "flat range yields no fabricated %K")
+    // The checked-in parity bar meets both floors (≥8 indicators, ≥5 timeframes).
+    ok(ChartParityBar.meetsBar, "parity bar met")
+    ok(ChartParityBar.indicators.count >= ChartParityBar.minIndicators, "≥8 indicators defined")
+    ok(ChartParityBar.timeframes.count >= ChartParityBar.minTimeframes, "≥5 timeframes defined")
+    ok(ChartParityBar.indicators.contains("Stochastic"), "Stochastic is in the parity set")
+    ok(Set(ChartParityBar.indicators).count == ChartParityBar.indicators.count, "no duplicate indicators")
+}
+
+// ===== TR-07 charting: the headless render path draws the full parity indicator set (incl. stochastic) =====
+func testChartRenderParityIndicators() {
+    let bars = (0..<120).map { i -> Bar in
+        let p = 100.0 + sin(Double(i) / 6) * 4
+        return Bar(date: Date(timeIntervalSince1970: 1_700_000_000 + Double(i) * 60),
+                   open: p, high: p + 1, low: p - 1, close: p + 0.2, volume: 1000)
+    }
+    let dir = tmpBase.appendingPathComponent("parity-\(UUID().uuidString)")
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    let path = dir.appendingPathComponent("parity.png").path
+    // Full parity set including the new Stochastic sub-pane — must render on the shared path (both charts).
+    let ind = RenderIndicators(ema1: 9, ema2: 21, sma: 50, vwapWindow: 40, rsiPeriod: 14, macd: true,
+        atrPeriod: 14, stochastic: (period: 14, d: 3), bollinger: (period: 20, k: 2))
+    ok(ChartRender.renderPNG(bars: bars, symbol: "CM.ESU6", title: "parity", indicators: ind, to: path),
+       "render full 9-indicator parity set returns true")
+    ok(FileManager.default.fileExists(atPath: path), "parity PNG written")
+}
+
 func testGateRerunDecodeAndStatFormatting() {
     let obj: [String: Any] = [
         "available": true, "prover_sha": "3e818b54f842ebcf", "sigMinN": 30, "alpha": 0.05,
@@ -2085,29 +2190,29 @@ func testWindowLaunchOrderingContract() {
 }
 
 func testBuildNumberContract() {
-    let expectedBuild = "<key>CFBundleVersion</key><string>18</string>"
+    let expectedBuild = "<key>CFBundleVersion</key><string>20</string>"
     for file in ["build.command", "build-signed.command"] {
         guard let src = try? String(contentsOfFile: file, encoding: .utf8) else {
             ok(false, "[source] \(file) readable for build-number contract"); continue
         }
-        ok(src.contains(expectedBuild), "[source] \(file) stamps Trading build 18")
+        ok(src.contains(expectedBuild), "[source] \(file) stamps Trading build 20")
         ok(src.contains("universal2") && src.contains("build_trd_arch arm64") &&
            src.contains("build_trd_arch x86_64") && src.contains("lipo -create"),
            "[source] \(file) builds a universal2 Trading binary")
     }
     if let src = try? String(contentsOfFile: "build-developer-id.sh", encoding: .utf8) {
-        ok(src.contains("BUILD_NUMBER=\"${BUILD_NUMBER:-18}\""), "[source] Developer-ID build defaults to Trading build 18")
+        ok(src.contains("BUILD_NUMBER=\"${BUILD_NUMBER:-20}\""), "[source] Developer-ID build defaults to Trading build 20")
     } else {
         ok(false, "[source] build-developer-id.sh readable for build-number contract")
     }
     if let plist = try? String(contentsOfFile: "Sources/Info.plist", encoding: .utf8) {
-        ok(plist.contains("<key>CFBundleVersion</key>\n\t<string>18</string>"),
-           "[source] Sources/Info.plist CFBundleVersion is 18")
+        ok(plist.contains("<key>CFBundleVersion</key>\n\t<string>20</string>"),
+           "[source] Sources/Info.plist CFBundleVersion is 20")
     } else {
         ok(false, "[source] Sources/Info.plist readable for build-number contract")
     }
     if let project = try? String(contentsOfFile: "project.yml", encoding: .utf8) {
-        ok(project.contains("CFBundleVersion: \"18\""), "[source] project.yml CFBundleVersion is 18")
+        ok(project.contains("CFBundleVersion: \"20\""), "[source] project.yml CFBundleVersion is 20")
     } else {
         ok(false, "[source] project.yml readable for build-number contract")
     }
@@ -2143,6 +2248,13 @@ testGateVerdictNoEdgeAndReasons()
 testGateVerdictAllNoEdgeHeadline()
 testGateVerdictEmptyStoreHonest()
 testGateRerunDecodeAndStatFormatting()
+
+// TR-05 multi-asset: instrument catalog decode + per-instrument module labels + ES-only labeling +
+// TR-07 charting depth: stochastic math, the checked-in parity bar, and the parity render path.
+testInstrumentCatalogDecodeAndModuleLabels()
+testEsOnlyModuleLabeling()
+testStochasticAndParityBar()
+testChartRenderParityIndicators()
 
 // No-code backtest lab (item 10): decode + per-fold honest stat formatting on the buyer's own bars.
 testBacktestLabDecodeAndFolds()
