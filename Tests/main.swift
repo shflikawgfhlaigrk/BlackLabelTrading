@@ -1733,6 +1733,63 @@ func testRuleProfileGateEmptyNoProfileNoSignal() {
     eqi(dsc.maxContracts, 3, "scaling-plan cap sets the max contracts")
 }
 
+// Sourced prop-firm presets (from propfirm-rules-v2-2026-07-12.md): the pre-filled, cited values
+// and the §5.1 encoding rule (0 cells stay user-entered; every field editable; firm-domain source).
+func testSourcedPropFirmPresets() {
+    let presets = RuleProfilePresets.sourcedPresets
+    ok(!presets.isEmpty, "sourced presets ship with cited firm values")
+
+    func find(_ firm: String, _ size: String) -> RuleProfilePresets.SourcedPreset? {
+        presets.first { $0.firm == firm && $0.accountLabel == size }
+    }
+
+    // 50K anchors — every number traces to the firm's own page (2026-07-12).
+    guard let apex = find("Apex Intraday PA", "50K") else { ok(false, "Apex 50K preset present"); return }
+    eq(apex.trailingDrawdown, 2000, "Apex Intraday PA 50K trailing DD = $2,000 (sourced)")
+    eq(apex.maxPositionSize, 4, "Apex Intraday PA 50K max position = 4 (sourced)")
+    eq(apex.dailyLossLimit, 0, "Apex daily-loss is tier-based -> user-entered (0), not fabricated")
+
+    guard let tradeify = find("Tradeify Growth", "50K") else { ok(false, "Tradeify 50K preset present"); return }
+    eq(tradeify.dailyLossLimit, 1250, "Tradeify Growth 50K daily-loss = $1,250 (sourced)")
+    eq(tradeify.trailingDrawdown, 2000, "Tradeify Growth 50K trailing DD = $2,000 (sourced)")
+    eq(tradeify.maxPositionSize, 4, "Tradeify Growth 50K max position = 4 (sourced)")
+
+    guard let tpt = find("Take Profit Trader", "50K") else { ok(false, "TPT 50K preset present"); return }
+    eq(tpt.dailyLossLimit, 0, "TPT has no daily-loss limit -> 0 (honest, not fabricated)")
+    eq(tpt.trailingDrawdown, 2000, "TPT 50K trailing DD = $2,000 (sourced)")
+    eq(tpt.maxPositionSize, 6, "TPT 50K max position = 6 (sourced)")
+
+    guard let fn = find("FundedNext Flex", "50K") else { ok(false, "FundedNext 50K preset present"); return }
+    eq(fn.trailingDrawdown, 1500, "FundedNext Flex 50K trailing DD = $1,500 (sourced)")
+    eq(fn.maxPositionSize, 3, "FundedNext Flex 50K max position = 3 (sourced)")
+
+    // The [unverified-blocked] Tradeify 25K trailing cell must stay user-entered (0), never guessed.
+    guard let t25 = find("Tradeify Growth", "25K") else { ok(false, "Tradeify 25K preset present"); return }
+    eq(t25.trailingDrawdown, 0, "Tradeify 25K trailing prints N/A on the firm's page -> user-entered (0)")
+    eq(t25.dailyLossLimit, 600, "Tradeify 25K daily-loss = $600 (sourced) even when trailing is blocked")
+
+    // Invariants across EVERY sourced preset: a firm-domain source, at least one real cap, editable,
+    // and it actually gates a signal (proves the pre-fill flows into the same honest gate math).
+    for p in presets {
+        ok(p.sourceURL.hasPrefix("https://"), "\(p.id): carries an https firm-source URL")
+        let prof = p.makeProfile()
+        ok(prof.sourceURL == p.sourceURL, "\(p.id): profile keeps the cited source URL")
+        ok(prof.hasLimits, "\(p.id): sourced preset has at least one real cap set")
+        eq(prof.contractScaling, 0, "\(p.id): scaling stays user-entered (buyer's funded tier)")
+        eq(prof.pointValue, 0, "\(p.id): $/pt stays user-entered (buyer's instrument)")
+        // A stop-out sized to breach the trailing cap must be caught by the same gate.
+        if prof.trailingDrawdown > 0 {
+            let contracts = Int(prof.trailingDrawdown / 100) + 2   // > cap at $/pt=1, riskPoints=100
+            let d = RuleProfileGate.evaluate(riskPoints: 100, pointValue: 1, contracts: contracts, profile: prof)
+            ok(d.verdict == .breach, "\(p.id): an over-cap stop-out breaches the sourced trailing DD")
+        }
+    }
+
+    // Grouping keeps size order within each firm (for the UI submenu).
+    let groups = RuleProfilePresets.sourcedByFirm
+    ok(groups.contains { $0.firm == "Apex Intraday PA" && $0.presets.count == 4 }, "Apex groups its 4 sourced sizes")
+}
+
 // ===== TR-18 Discipline cockpit (pure compliance math on the buyer's OWN fills) =====
 // A deterministic UTC calendar so startOfDay bucketing is timezone-independent in the test.
 let cockpitCal: Calendar = { var c = Calendar(identifier: .gregorian); c.timeZone = TimeZone(identifier: "UTC")!; return c }()
@@ -2264,6 +2321,7 @@ testRuleProfileGateWithinLimitsAndMax()
 testRuleProfileGateBreach()
 testRuleProfileGateEdgeOfCap()
 testRuleProfileGateEmptyNoProfileNoSignal()
+testSourcedPropFirmPresets()
 
 // TR-18 discipline cockpit (live compliance gauges on the buyer's own fills) + TR-13 client-side
 // non-repaint mirror (a live tick folds only into the forming bar; closed bars never repaint).

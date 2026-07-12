@@ -327,10 +327,13 @@ struct DisciplineCockpit: Equatable {
     private static func money(_ v: Double) -> String { RuleProfileGate.money(v) }
 }
 
-// Blank firm-named templates. NO numeric limits are shipped (company-researcher's sourced table
-// had not landed at build time) — every number is 0 until the buyer enters it from the firm's own
-// terms, and `sourceURL` starts empty for the buyer to paste. This is the §5.1-safe fallback: the
-// editable mechanism ships; invented firm numbers do not. `note` reuses the factual FirmData text.
+// Blank firm-named templates + SOURCED presets. Blank templates ship for firms with no fetched
+// figures (buyer enters every number). SOURCED presets pre-fill only cells company-researcher
+// fetched from each firm's OWN help page on 2026-07-12 (`propfirm-rules-v2-2026-07-12.md`),
+// each carrying that firm-primary `sourceURL`. §5.1 encoding rule: a cell's confidence is its own —
+// only `[confirmed]`/`[single-source]` cells are encoded; `[unverified-blocked]` and tier-based
+// cells stay 0 (user-entered). EVERY field remains editable in the profile editor; rules change
+// often, so a preset is a cited starting point the buyer confirms, never an authority.
 enum RuleProfilePresets {
     struct Template: Identifiable { let name: String; let note: String; var id: String { name } }
 
@@ -347,6 +350,86 @@ enum RuleProfilePresets {
         Template(name: "Funded Futures Network", note: "Trailing drawdown + scaling — confirm current numbers on the firm's site."),
         Template(name: "Legends Trading", note: "Intraday or end-of-day drawdown choices — confirm current numbers on the firm's site."),
     ]
+
+    // One firm program at one account size, filled ONLY from its own fetched page (2026-07-12).
+    // A 0 cell is deliberately user-entered (the firm made it tier-based or hid it behind a JS tab);
+    // `note` says which. maxPositionSize is the firm's mini-contract cap. contractScaling stays 0 —
+    // the buyer sets it per their funded scaling tier.
+    struct SourcedPreset: Identifiable {
+        let firm: String            // firm + program (display + profile name stem)
+        let accountLabel: String    // e.g. "50K"
+        let dailyLossLimit: Double   // 0 == user-entered (firm has none, or it is tier-based)
+        let trailingDrawdown: Double // 0 == user-entered (firm prints N/A or hides it)
+        let maxPositionSize: Double  // mini-contract cap
+        let sourceURL: String        // the firm's OWN page the value came from
+        let note: String             // drawdown TYPE + which cells stay user-entered
+        var id: String { "\(firm) \(accountLabel)" }
+        var displayName: String { "\(firm) — \(accountLabel)" }
+
+        // A cited, pre-filled profile. contractScaling/pointValue stay 0 (buyer's tier/instrument),
+        // and every field is editable afterward.
+        func makeProfile() -> RuleProfile {
+            RuleProfile(name: displayName,
+                        dailyLossLimit: dailyLossLimit,
+                        trailingDrawdown: trailingDrawdown,
+                        maxPositionSize: maxPositionSize,
+                        contractScaling: 0,
+                        pointValue: 0,
+                        sourceURL: sourceURL)
+        }
+    }
+
+    // Firm-primary source URLs (fetched 2026-07-12) — kept beside the data they cite.
+    private static let urlFundedNext = "https://helpfutures.fundednext.com/en/articles/14878751-what-is-fundednext-futures-flex-challenge"
+    private static let urlTPT = "https://takeprofittrader.com/"
+    private static let urlTradeify = "https://help.tradeify.co/en/articles/10495897-rules-trailing-max-drawdowns"
+    private static let urlApex = "https://apextraderfunding.com/help-center/intraday-trailing-drawdown-accounts/intraday-trailing-drawdown-performance-accounts-pa/"
+
+    // All [confirmed] cells from propfirm-rules-v2-2026-07-12.md. Grouped by firm, ascending size.
+    static let sourcedPresets: [SourcedPreset] = [
+        // FundedNext Futures — Flex (end-of-day trailing). Flex has NO daily-loss limit.
+        SourcedPreset(firm: "FundedNext Flex", accountLabel: "50K",  dailyLossLimit: 0, trailingDrawdown: 1500, maxPositionSize: 3,
+                      sourceURL: urlFundedNext, note: "Flex — end-of-day trailing drawdown; no daily-loss limit. Cap = mini contracts."),
+        SourcedPreset(firm: "FundedNext Flex", accountLabel: "100K", dailyLossLimit: 0, trailingDrawdown: 2500, maxPositionSize: 5,
+                      sourceURL: urlFundedNext, note: "Flex — end-of-day trailing drawdown; no daily-loss limit. Cap = mini contracts."),
+        SourcedPreset(firm: "FundedNext Flex", accountLabel: "150K", dailyLossLimit: 0, trailingDrawdown: 4000, maxPositionSize: 8,
+                      sourceURL: urlFundedNext, note: "Flex — end-of-day trailing drawdown; no daily-loss limit. Cap = mini contracts."),
+
+        // Take Profit Trader — no daily-loss limit on any account; only 50K renders statically.
+        SourcedPreset(firm: "Take Profit Trader", accountLabel: "50K", dailyLossLimit: 0, trailingDrawdown: 2000, maxPositionSize: 6,
+                      sourceURL: urlTPT, note: "No daily-loss limit on any account. Trailing = end-of-day (Test/PRO+) or intraday (PRO). Other sizes: enter yourself."),
+
+        // Tradeify — Growth (end-of-day trailing). Daily-loss = soft breach; trailing = hard breach.
+        SourcedPreset(firm: "Tradeify Growth", accountLabel: "25K",  dailyLossLimit: 600,  trailingDrawdown: 0,    maxPositionSize: 1,
+                      sourceURL: urlTradeify, note: "Growth — EOD trailing (hard breach); daily-loss soft breach (pauses the day). 25K trailing prints N/A — enter it yourself."),
+        SourcedPreset(firm: "Tradeify Growth", accountLabel: "50K",  dailyLossLimit: 1250, trailingDrawdown: 2000, maxPositionSize: 4,
+                      sourceURL: urlTradeify, note: "Growth — EOD trailing (hard breach); daily-loss soft breach (pauses the day)."),
+        SourcedPreset(firm: "Tradeify Growth", accountLabel: "100K", dailyLossLimit: 2500, trailingDrawdown: 4000, maxPositionSize: 8,
+                      sourceURL: urlTradeify, note: "Growth — EOD trailing (hard breach); daily-loss soft breach (pauses the day)."),
+        SourcedPreset(firm: "Tradeify Growth", accountLabel: "150K", dailyLossLimit: 3000, trailingDrawdown: 5250, maxPositionSize: 12,
+                      sourceURL: urlTradeify, note: "Growth — EOD trailing (hard breach); daily-loss soft breach (pauses the day)."),
+
+        // Apex Trader Funding — Intraday Trailing PA. Daily-loss is scaling-tier-based (user-entered).
+        SourcedPreset(firm: "Apex Intraday PA", accountLabel: "25K",  dailyLossLimit: 0, trailingDrawdown: 1000, maxPositionSize: 2,
+                      sourceURL: urlApex, note: "Intraday Trailing PA — daily-loss is scaling-tier-based, so enter your tier. Trailing stops at Max DD + $100."),
+        SourcedPreset(firm: "Apex Intraday PA", accountLabel: "50K",  dailyLossLimit: 0, trailingDrawdown: 2000, maxPositionSize: 4,
+                      sourceURL: urlApex, note: "Intraday Trailing PA — daily-loss is scaling-tier-based, so enter your tier. Trailing stops at Max DD + $100."),
+        SourcedPreset(firm: "Apex Intraday PA", accountLabel: "100K", dailyLossLimit: 0, trailingDrawdown: 3000, maxPositionSize: 6,
+                      sourceURL: urlApex, note: "Intraday Trailing PA — daily-loss is scaling-tier-based, so enter your tier. Trailing stops at Max DD + $100."),
+        SourcedPreset(firm: "Apex Intraday PA", accountLabel: "150K", dailyLossLimit: 0, trailingDrawdown: 4000, maxPositionSize: 10,
+                      sourceURL: urlApex, note: "Intraday Trailing PA — daily-loss is scaling-tier-based, so enter your tier. Trailing stops at Max DD + $100."),
+    ]
+
+    // Sourced presets grouped by firm, preserving size order — for a firm → size submenu.
+    static var sourcedByFirm: [(firm: String, presets: [SourcedPreset])] {
+        var order: [String] = []
+        var groups: [String: [SourcedPreset]] = [:]
+        for p in sourcedPresets {
+            if groups[p.firm] == nil { order.append(p.firm) }
+            groups[p.firm, default: []].append(p)
+        }
+        return order.map { (firm: $0, presets: groups[$0] ?? []) }
+    }
 
     // A blank profile pre-named for a firm. Buyer fills in every number from the firm's terms.
     static func profile(for name: String) -> RuleProfile {

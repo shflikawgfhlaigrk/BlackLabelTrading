@@ -1468,18 +1468,35 @@ struct FirmsScreen: View {
                 }
             }
 
-            // Add a profile — blank firm-named templates + a custom blank. Zero invented numbers.
+            // Add a profile — sourced firm presets (cited, pre-filled) + blank firm templates + a
+            // custom blank. Sourced numbers come from each firm's OWN page (2026-07-12); every field
+            // stays editable, and a 0 cell is deliberately user-entered (see each preset's note).
             Panel(title: "Add a profile", icon: "plus.circle.fill") {
-                Text("Templates are blank — every number starts empty. Pick your firm, then enter its current terms yourself.")
+                Text("Sourced presets pre-fill from each firm's own rules page (confirm before you trade — rules change). Templates start blank. Every number stays editable.")
                     .font(.system(size: 11.5, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
                     .fixedSize(horizontal: false, vertical: true)
                 HStack(spacing: 10) {
+                    Menu {
+                        ForEach(RuleProfilePresets.sourcedByFirm, id: \.firm) { group in
+                            Menu(group.firm) {
+                                ForEach(group.presets) { p in
+                                    Button(p.accountLabel) { model.upsertProfile(p.makeProfile()) }
+                                }
+                            }
+                        }
+                    } label: {
+                        HStack(spacing: 6) { Image(systemName: "checkmark.seal.fill"); Text("Sourced firm preset") }
+                            .font(.system(size: 13, weight: .semibold, design: .rounded)).foregroundColor(BLTheme.text)
+                            .padding(.vertical, 9).padding(.horizontal, 16)
+                            .background(BLTheme.bg2).clipShape(Capsule())
+                            .overlay(Capsule().stroke(BLTheme.gold.opacity(0.5), lineWidth: 1))
+                    }.menuStyle(.borderlessButton).fixedSize()
                     Menu {
                         ForEach(RuleProfilePresets.templates) { t in
                             Button(t.name) { model.upsertProfile(RuleProfilePresets.profile(for: t.name)) }
                         }
                     } label: {
-                        HStack(spacing: 6) { Image(systemName: "building.columns.fill"); Text("From a firm template") }
+                        HStack(spacing: 6) { Image(systemName: "building.columns.fill"); Text("Blank firm template") }
                             .font(.system(size: 13, weight: .semibold, design: .rounded)).foregroundColor(BLTheme.text)
                             .padding(.vertical, 9).padding(.horizontal, 16)
                             .background(BLTheme.bg2).clipShape(Capsule())
