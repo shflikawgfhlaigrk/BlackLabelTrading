@@ -1790,6 +1790,49 @@ func testSourcedPropFirmPresets() {
     ok(groups.contains { $0.firm == "Apex Intraday PA" && $0.presets.count == 4 }, "Apex groups its 4 sourced sizes")
 }
 
+// §5.1 citation invariant: NO uncited number ships. Every non-zero preset field must carry a
+// firm-primary sourceURL, and every cell the research marked [unverified-blocked] / tier-based must
+// stay 0 (user-entered) — never a guessed value. This is the no-fabrication contract for the pre-fill.
+func testSourcedPresetCitationInvariant() {
+    let presets = RuleProfilePresets.sourcedPresets
+    ok(!presets.isEmpty, "citation invariant runs over shipped sourced presets")
+
+    for p in presets {
+        // Any encoded (non-zero) cap MUST be backed by a non-empty, firm-domain https source.
+        let hasAnyNonZero = p.dailyLossLimit > 0 || p.trailingDrawdown > 0
+            || p.maxPositionSize > 0
+        if hasAnyNonZero {
+            ok(!p.sourceURL.isEmpty, "\(p.id): a non-zero preset field is backed by a non-empty sourceURL")
+            ok(p.sourceURL.hasPrefix("https://"), "\(p.id): sourceURL is an https firm-primary page")
+        }
+        // The pre-filled profile must carry that same citation and never invent contractScaling/pointValue.
+        let prof = p.makeProfile()
+        if prof.dailyLossLimit > 0 || prof.trailingDrawdown > 0 || prof.maxPositionSize > 0 {
+            ok(!prof.sourceURL.isEmpty, "\(p.id): pre-filled profile keeps a non-empty citation for its caps")
+        }
+        eq(prof.contractScaling, 0, "\(p.id): contractScaling stays 0 (uncited, buyer's funded tier)")
+        eq(prof.pointValue, 0, "\(p.id): pointValue stays 0 (uncited, buyer's instrument)")
+    }
+
+    // The exact cells company-researcher marked unverified-blocked / tier-based MUST be zero — never guessed.
+    func cell(_ firm: String, _ size: String) -> RuleProfilePresets.SourcedPreset? {
+        presets.first { $0.firm == firm && $0.accountLabel == size }
+    }
+    // Apex Intraday PA daily-loss is scaling-tier-based at EVERY size → user-entered (0).
+    for size in ["25K", "50K", "100K", "150K"] {
+        if let a = cell("Apex Intraday PA", size) {
+            eq(a.dailyLossLimit, 0, "Apex \(size): tier-based daily-loss stays 0 (uncited)")
+        }
+    }
+    // Tradeify 25K trailing drawdown prints N/A on the firm page → user-entered (0).
+    if let t = cell("Tradeify Growth", "25K") { eq(t.trailingDrawdown, 0, "Tradeify 25K trailing stays 0 (firm prints N/A)") }
+    // Take Profit Trader: only 50K renders statically → no other size may be pre-filled at all.
+    let tptSizes = presets.filter { $0.firm == "Take Profit Trader" }.map { $0.accountLabel }
+    ok(tptSizes == ["50K"], "TPT: only the statically-exposed 50K size is pre-filled (others user-entered)")
+    // Take Profit Trader has no daily-loss limit on any account → 0 (honest, not fabricated).
+    if let tpt = cell("Take Profit Trader", "50K") { eq(tpt.dailyLossLimit, 0, "TPT 50K daily-loss stays 0 (firm has none)") }
+}
+
 // ===== TR-18 Discipline cockpit (pure compliance math on the buyer's OWN fills) =====
 // A deterministic UTC calendar so startOfDay bucketing is timezone-independent in the test.
 let cockpitCal: Calendar = { var c = Calendar(identifier: .gregorian); c.timeZone = TimeZone(identifier: "UTC")!; return c }()
@@ -2247,29 +2290,29 @@ func testWindowLaunchOrderingContract() {
 }
 
 func testBuildNumberContract() {
-    let expectedBuild = "<key>CFBundleVersion</key><string>22</string>"
+    let expectedBuild = "<key>CFBundleVersion</key><string>23</string>"
     for file in ["build.command", "build-signed.command"] {
         guard let src = try? String(contentsOfFile: file, encoding: .utf8) else {
             ok(false, "[source] \(file) readable for build-number contract"); continue
         }
-        ok(src.contains(expectedBuild), "[source] \(file) stamps Trading build 22")
+        ok(src.contains(expectedBuild), "[source] \(file) stamps Trading build 23")
         ok(src.contains("universal2") && src.contains("build_trd_arch arm64") &&
            src.contains("build_trd_arch x86_64") && src.contains("lipo -create"),
            "[source] \(file) builds a universal2 Trading binary")
     }
     if let src = try? String(contentsOfFile: "build-developer-id.sh", encoding: .utf8) {
-        ok(src.contains("BUILD_NUMBER=\"${BUILD_NUMBER:-22}\""), "[source] Developer-ID build defaults to Trading build 22")
+        ok(src.contains("BUILD_NUMBER=\"${BUILD_NUMBER:-23}\""), "[source] Developer-ID build defaults to Trading build 23")
     } else {
         ok(false, "[source] build-developer-id.sh readable for build-number contract")
     }
     if let plist = try? String(contentsOfFile: "Sources/Info.plist", encoding: .utf8) {
-        ok(plist.contains("<key>CFBundleVersion</key>\n\t<string>22</string>"),
-           "[source] Sources/Info.plist CFBundleVersion is 22")
+        ok(plist.contains("<key>CFBundleVersion</key>\n\t<string>23</string>"),
+           "[source] Sources/Info.plist CFBundleVersion is 23")
     } else {
         ok(false, "[source] Sources/Info.plist readable for build-number contract")
     }
     if let project = try? String(contentsOfFile: "project.yml", encoding: .utf8) {
-        ok(project.contains("CFBundleVersion: \"22\""), "[source] project.yml CFBundleVersion is 22")
+        ok(project.contains("CFBundleVersion: \"23\""), "[source] project.yml CFBundleVersion is 23")
     } else {
         ok(false, "[source] project.yml readable for build-number contract")
     }
@@ -2322,6 +2365,7 @@ testRuleProfileGateBreach()
 testRuleProfileGateEdgeOfCap()
 testRuleProfileGateEmptyNoProfileNoSignal()
 testSourcedPropFirmPresets()
+testSourcedPresetCitationInvariant()
 
 // TR-18 discipline cockpit (live compliance gauges on the buyer's own fills) + TR-13 client-side
 // non-repaint mirror (a live tick folds only into the forming bar; closed bars never repaint).
