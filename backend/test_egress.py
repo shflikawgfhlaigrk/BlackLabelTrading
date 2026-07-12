@@ -118,6 +118,27 @@ def test_alert_module_hardcodes_no_destination_except_pushover():
             f"bltd_alerts must not hardcode an egress host other than Pushover's public API: {u}")
 
 
+def test_backtest_farm_module_does_no_network_during_compute():
+    """TR-19 own-silicon farm: the sweep runs entirely on local cores — no cloud, no data fee, no
+    egress during compute. Statically assert the farm code path in bltd_analytics imports/uses NO
+    network primitive (urllib/requests/socket/http.client) and reaches no URL literal. The farm is
+    pure math over the buyer's OWN captured bars fanned across concurrent.futures; the ONLY thing it
+    touches off-core is the local process pool. If someone later wires a cloud backtest service or a
+    telemetry ping into the farm, this test fails the build."""
+    src = open(os.path.join(ROOT, "bltd_analytics.py"), encoding="utf-8").read()
+    # no URL literals of any scheme anywhere in the analytics/farm module
+    urls = _URL.findall(src)
+    assert not urls, f"bltd_analytics (farm module) must contain no egress URL literal: {urls}"
+    # no network client imports/uses in the module
+    forbidden = ("import socket", "import requests", "import urllib", "from urllib",
+                 "http.client", "urlopen(", "requests.", "socket.socket")
+    offenders = [tok for tok in forbidden if tok in src]
+    assert not offenders, ("the farm module must use no network primitive during compute — found: "
+                           + ", ".join(offenders))
+    # the farm's only off-core reach is the local process pool
+    assert "concurrent.futures" in src, "the farm must fan across local cores (concurrent.futures)"
+
+
 if __name__ == "__main__":
     import sys
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

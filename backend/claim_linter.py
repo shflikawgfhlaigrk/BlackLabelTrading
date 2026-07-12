@@ -158,6 +158,33 @@ def scan_alert_payloads(render_fn=None) -> list[tuple[str, int, str, str]]:
     return hits
 
 
+def scan_farm_payloads(render_fn=None) -> list[tuple[str, int, str, str]]:
+    """Scan the RENDERED TR-19 backtest-farm payloads — the buyer-facing text a farm run / share
+    would emit — not just source. A parameter sweep is the surface most tempted to parade a
+    best-of-N win-rate or a $ headline; this catches a forbidden figure that reaches the farm's text
+    even if computed. Default source is bltd_analytics.farm_sample_payloads(); tests inject render_fn.
+
+    Import/introspection failure is a warning, not a pass — but only when the real module is scanned
+    (render_fn is None); a missing bltd_analytics in a temp-root fixture is a no-op."""
+    if render_fn is None:
+        try:
+            import bltd_analytics  # noqa: PLC0415 — optional, lazy: the linter must run without it too
+        except Exception as exc:  # noqa: BLE001
+            print(f"  WARN cannot import bltd_analytics to scan farm payloads (skipping): "
+                  f"{type(exc).__name__}: {exc}", file=sys.stderr)
+            return []
+        render_fn = bltd_analytics.farm_sample_payloads
+    try:
+        texts = list(render_fn())
+    except Exception as exc:  # noqa: BLE001
+        print(f"  WARN cannot render farm payloads: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return []
+    hits: list[tuple[str, int, str, str]] = []
+    for i, text in enumerate(texts):
+        hits += scan_text(str(text), source=f"<farm-payload#{i}>")
+    return hits
+
+
 def scan_binary(binary: str) -> list[tuple[str, int, str, str]]:
     """Scan the compiled binary's embedded strings — the surface a buyer actually sees at runtime."""
     if not os.path.isfile(binary):
@@ -192,6 +219,9 @@ def main(argv: list[str] | None = None) -> int:
     if not args.no_payloads:
         scanned += 1
         all_hits += scan_alert_payloads()
+        # …and the TR-19 farm payloads — a best-of-N sweep must never emit a snooped win-rate/$.
+        scanned += 1
+        all_hits += scan_farm_payloads()
 
     if all_hits:
         print(f"claim_linter: {len(all_hits)} FORBIDDEN CLAIM(S) in the shipped surface "

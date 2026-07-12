@@ -403,6 +403,55 @@ def test_backtest_run_host_and_auth_gated():
         srv.shutdown()
 
 
+def test_backtest_farm_route_sweeps_and_reports_cells_over_fit_transparently():
+    """TR-19 farm route: seed the buyer's OWN bars, sweep the SHIPPED prover's grid, and return
+    per-cell n/W/L/max-drawdown-R + a BH-FDR-corrected p (pEdgeAdj) across the whole grid + prover_sha.
+    NEVER a raw best-cell p, never an aggregate win-rate/$ headline. workers=1 keeps the test serial."""
+    srv, port = _start_server()
+    try:
+        h = f"127.0.0.1:{port}"
+        now = int(time.time())
+        # a real oscillating series so the mean-reversion prover actually triggers trades
+        bars = []
+        for i in range(400):
+            base = 100.0 + (2.0 if (i // 5) % 2 == 0 else -2.0) + (i % 3) * 0.1
+            bars.append([base, base + 0.5, base - 0.5, base, now + i])
+        st, o = _req(port, "POST", "/webhook/feed", host=h, token=TOK,
+                     body={"symbol": "FARMX6", "bars": bars})
+        assert st == 200 and o["ok"] is True
+
+        st, r = _req(port, "GET", "/api/backtest/farm?engine=meanrev&symbol=FARMX6&workers=1",
+                     host=h, token=TOK)
+        assert st == 200
+        assert r["engine"] == "meanrev" and r["symbol"] == "FARMX6"
+        assert len(r["prover_sha"]) == 16 and r["sigMinN"] == S.SIG_MIN_N
+        assert r["available"] is True
+        assert r["cellsTried"] == len(r["cells"]) > 1               # a real multi-cell sweep
+        assert r["compute"].startswith("serial")                   # workers=1 -> serial, honest
+        for c in r["cells"]:
+            assert c["wins"] + c["losses"] == c["trades"]          # honest W/L split
+            assert "pEdgeAdj" in c and "pEdge" not in c            # only the FDR-corrected p is shown
+            assert 0.0 <= c["pEdgeAdj"] <= 1.0
+            if c["trades"] < S.SIG_MIN_N:
+                assert c["insufficient"] is True and c["proven"] is False
+        # never a fabricated aggregate win-rate / $ headline
+        assert "winRateAll" not in r and "netPnlDollars" not in r
+    finally:
+        srv.shutdown()
+
+
+def test_backtest_farm_route_host_and_auth_gated():
+    srv, port = _start_server()
+    try:
+        h = f"127.0.0.1:{port}"
+        st, _ = _req(port, "GET", "/api/backtest/farm?engine=meanrev&symbol=LABX6", host="attacker.com")
+        assert st == 403                                          # host allowlist before anything
+        st, _ = _req(port, "GET", "/api/backtest/farm?engine=meanrev&symbol=LABX6", host=h)
+        assert st == 401                                          # auth required (no token)
+    finally:
+        srv.shutdown()
+
+
 if __name__ == "__main__":
     import sys
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

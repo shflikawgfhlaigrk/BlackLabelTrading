@@ -810,6 +810,130 @@ struct BacktestLabReport: Equatable {
     }
 }
 
+// MARK: - TR-19 own-silicon parameter-sweep backtest FARM from GET /api/backtest/farm.
+// The buyer picks ONE engine + ONE instrument; the backend fans the SHIPPED prover's hyperparameter
+// grid across this Mac's cores over their OWN captured bars — no cloud, no data fee, no egress. Every
+// cell reports n / W / L / max-drawdown-R and a Benjamini–Hochberg FDR-corrected p across the WHOLE
+// grid (`pEdgeAdj`). A raw best-cell p is NEVER surfaced (that would be a multiple-comparisons lie);
+// there is NO aggregate win-rate / equity / $ figure. A cell with < minTrades OOS trades decodes as
+// `insufficient`. "On your captured bars only — NOT a promise."
+struct BacktestFarmCell: Equatable, Identifiable {
+    var index: Int
+    var params: String       // human-readable parameter set, e.g. "lookback=20 · mrZ=2.0"
+    var trades: Int
+    var wins: Int
+    var losses: Int
+    var netPts: Double
+    var maxDrawdownR: Double
+    var pEdgeAdj: Double      // BH-FDR-corrected — the ONLY p shown as significance
+    var proven: Bool
+    var insufficient: Bool
+    var reason: String
+    var id: Int { index }
+
+    // Raw, reproducible stat line — trade count + FDR-adjusted p, never a headline win-rate/$.
+    var statLine: String {
+        if trades == 0 { return "n=0 · no trades on your bars" }
+        let base = "n=\(trades) · \(wins)W/\(losses)L · net \(String(format: "%+.2f", netPts)) pts · maxDD \(String(format: "%.2f", maxDrawdownR))R"
+        if insufficient { return base + " · p n/a (n<min)" }
+        return base + " · FDR-adj p=\(String(format: "%.3f", pEdgeAdj))"
+    }
+}
+
+struct BacktestFarmReport: Equatable {
+    var available: Bool
+    var engine: String
+    var symbol: String
+    var label: String
+    var overfitNote: String
+    var proverSHA: String
+    var minTrades: Int
+    var alpha: Double
+    var fdrQ: Double
+    var compute: String       // "process-pool (N workers)" | "serial …" — honest, never faked
+    var cores: Int
+    var generatedUTC: String
+    var totalBars: Int
+    var cellsTried: Int
+    var provenCells: Int
+    var cellsInsufficient: Int
+    var cellsSufficient: Int
+    var gridSize: Int
+    var gridTruncated: Bool
+    var status: String        // "candidate" | "no_edge" | "insufficient"
+    var best: BacktestFarmCell?
+    var cells: [BacktestFarmCell]
+    var reason: String
+
+    static let empty = BacktestFarmReport(
+        available: false, engine: "", symbol: "",
+        label: "Parameter sweep of the SHIPPED edge-gate prover on YOUR captured bars only — reproducible, NOT a promise, no performance guaranteed.",
+        overfitNote: "Best-of-N parameter search inflates significance. Every p is Benjamini–Hochberg FDR-corrected across all cells tried; a raw best-cell p is never shown.",
+        proverSHA: "", minTrades: 30, alpha: 0.05, fdrQ: 0.10, compute: "", cores: 0,
+        generatedUTC: "", totalBars: 0, cellsTried: 0, provenCells: 0, cellsInsufficient: 0,
+        cellsSufficient: 0, gridSize: 0, gridTruncated: false, status: "insufficient",
+        best: nil, cells: [], reason: "")
+
+    var proverLine: String {
+        "prover \(proverSHA.isEmpty ? "—" : proverSHA) · BH-FDR q≤\(String(format: "%.2f", fdrQ)) · min n \(minTrades)"
+    }
+
+    private static func paramString(_ p: [String: Any]) -> String {
+        p.keys.sorted().map { k -> String in
+            let v = p[k]
+            if let d = FeedBars.num(v as Any) {
+                // integers without a trailing ".0"; floats to 2dp
+                return d == d.rounded() ? "\(k)=\(Int(d))" : "\(k)=\(String(format: "%.2f", d))"
+            }
+            return "\(k)=\(v ?? "")"
+        }.joined(separator: " · ")
+    }
+
+    private static func decodeCell(_ c: [String: Any], _ idx: Int) -> BacktestFarmCell {
+        BacktestFarmCell(
+            index: idx,
+            params: paramString((c["params"] as? [String: Any]) ?? [:]),
+            trades: Int(FeedBars.num(c["trades"] as Any) ?? 0),
+            wins: Int(FeedBars.num(c["wins"] as Any) ?? 0),
+            losses: Int(FeedBars.num(c["losses"] as Any) ?? 0),
+            netPts: FeedBars.num(c["netPts"] as Any) ?? 0,
+            maxDrawdownR: FeedBars.num(c["maxDrawdownR"] as Any) ?? 0,
+            pEdgeAdj: FeedBars.num(c["pEdgeAdj"] as Any) ?? 1.0,
+            proven: (c["proven"] as? Bool) ?? false,
+            insufficient: (c["insufficient"] as? Bool) ?? false,
+            reason: (c["reason"] as? String) ?? "")
+    }
+
+    static func decode(_ obj: [String: Any]) -> BacktestFarmReport {
+        var out = BacktestFarmReport.empty
+        out.available = (obj["available"] as? Bool) ?? false
+        out.engine = (obj["engine"] as? String) ?? ""
+        out.symbol = (obj["symbol"] as? String) ?? ""
+        out.label = (obj["label"] as? String) ?? out.label
+        out.overfitNote = (obj["overfitNote"] as? String) ?? out.overfitNote
+        out.proverSHA = (obj["prover_sha"] as? String) ?? ""
+        out.minTrades = Int(FeedBars.num(obj["sigMinN"] as Any) ?? 30)
+        out.alpha = FeedBars.num(obj["alpha"] as Any) ?? 0.05
+        out.fdrQ = FeedBars.num(obj["fdrQ"] as Any) ?? 0.10
+        out.compute = (obj["compute"] as? String) ?? ""
+        out.cores = Int(FeedBars.num(obj["cores"] as Any) ?? 0)
+        out.generatedUTC = (obj["generatedUTC"] as? String) ?? ""
+        out.totalBars = Int(FeedBars.num(obj["totalBars"] as Any) ?? 0)
+        out.cellsTried = Int(FeedBars.num(obj["cellsTried"] as Any) ?? 0)
+        out.provenCells = Int(FeedBars.num(obj["provenCells"] as Any) ?? 0)
+        out.cellsInsufficient = Int(FeedBars.num(obj["cellsInsufficient"] as Any) ?? 0)
+        out.cellsSufficient = Int(FeedBars.num(obj["cellsSufficient"] as Any) ?? 0)
+        out.gridSize = Int(FeedBars.num(obj["gridSize"] as Any) ?? 0)
+        out.gridTruncated = (obj["gridTruncated"] as? Bool) ?? false
+        out.status = (obj["status"] as? String) ?? "insufficient"
+        out.reason = (obj["reason"] as? String) ?? ""
+        let rawCells = (obj["cells"] as? [[String: Any]]) ?? []
+        out.cells = rawCells.enumerated().map { decodeCell($1, $0) }
+        if let b = obj["best"] as? [String: Any] { out.best = decodeCell(b, -1) }
+        return out
+    }
+}
+
 // MARK: - Signal journal from GET /api/fires.
 // Real recorded (non-synthetic) edge-gated fires, newest first. outcome/pnl are nil until the
 // daemon grades the signal (honest — never an invented result for an open signal). A row with no

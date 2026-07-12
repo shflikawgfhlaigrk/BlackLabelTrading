@@ -483,6 +483,272 @@ def backtest_lab(store, engine: str, symbol: str, start_ts=None, end_ts=None,
 
 
 # ===========================================================================
+# TR-19 — own-silicon parameter-sweep backtest FARM
+# ===========================================================================
+# A parallel parameter sweep over the buyer's OWN captured bars, reusing the SHIPPED provers
+# (bltd_store.PROVERS) with ZERO new edge math — every cell is just the same gate math run under a
+# different hyperparameter set. Runs entirely on this Mac's cores (concurrent.futures); no cloud, no
+# CME data fee, no network egress during compute. Its whole reason to exist is HONEST over-fit
+# transparency: best-of-N parameter search inflates significance, so every p we surface is
+# Benjamini–Hochberg FDR-corrected across ALL N cells tried and we never show a raw best-cell p.
+# A cell with < SIG_MIN_N OOS trades is 'insufficient' (never a fabricated p); no aggregate
+# win-rate / equity / $ figure is produced anywhere. "On your captured bars only — NOT a promise."
+
+import concurrent.futures as _futures  # noqa: E402
+import itertools as _itertools          # noqa: E402
+import os as _os                         # noqa: E402
+
+# Per-engine sweep grids. Every key here is a hyperparameter the SHIPPED prover already reads from
+# cfg (see bltd_store CONFIG_DEFAULTS) — the farm only varies existing knobs, it invents no math.
+_FARM_GRIDS = {
+    "meanrev":  {"lookback": [10, 20, 30], "mrZ": [1.5, 2.0, 2.5],
+                 "mrTgtFrac": [0.4, 0.6, 0.8], "mrStopMult": [6.0, 10.0]},
+    "breakout": {"lookback": [10, 20, 30, 40], "bkTargetR": [1.0, 1.5, 2.0, 2.5, 3.0]},
+    "research": {"lookback": [10, 20, 30, 40], "bkTargetR": [1.0, 1.5, 2.0, 2.5, 3.0]},
+}
+# The consensus family (momentum/structure/regime/channel/context_*) shares the same two universal
+# knobs the prover honours; its geometry (ATR stop / fixed 2:1 target) is deliberately NOT swept so a
+# runner can't snoop the reward:risk cap.
+_FARM_GRID_CONSENSUS = {"lookback": [8, 12, 20, 30], "oosFrac": [0.3, 0.4, 0.5]}
+_FARM_MAX_CELLS = 256  # hard ceiling on grid size so a farm run is always bounded
+
+
+def _farm_grid(engine: str, base_cfg: dict):
+    """The list of cfg-override dicts (the cells) for one engine — the Cartesian product of its sweep
+    grid, deterministically ordered, capped at _FARM_MAX_CELLS. Returns (cells, full_grid_size)."""
+    grid = _FARM_GRIDS.get(engine, _FARM_GRID_CONSENSUS)
+    keys = sorted(grid.keys())
+    combos = list(_itertools.product(*(grid[k] for k in keys)))
+    full = len(combos)
+    cells = [dict(zip(keys, combo)) for combo in combos[:_FARM_MAX_CELLS]]
+    return cells, full
+
+
+def _bh_adjusted_pvalues(pvals):
+    """Benjamini–Hochberg step-up ADJUSTED p-values (a.k.a. BH q-values) for a family of raw p's.
+    adj[i] = min over ranks k>=rank(i) of (m/k)*p(k), clamped to [0,1] and enforced monotone. A cell
+    survives family-wide FDR control at level q iff its adjusted p <= q — the SAME guard the live
+    screener/gate_rerun apply, expressed per-cell so the farm can show an honest corrected p for every
+    parameter set instead of a snooped best-cell raw p. Returns a list aligned to the input order."""
+    m = len(pvals)
+    if m == 0:
+        return []
+    order = sorted(range(m), key=lambda i: pvals[i])   # ascending p
+    adj = [1.0] * m
+    running = 1.0
+    # walk from the largest p down to the smallest, keeping the running minimum of (m/rank)*p
+    for rank in range(m, 0, -1):
+        idx = order[rank - 1]
+        val = min(1.0, (m / rank) * pvals[idx])
+        running = min(running, val)
+        adj[idx] = running
+    return adj
+
+
+# ── process-pool worker (module-level so it is picklable under spawn) ──────────
+_FARM_OHLC = None
+_FARM_ENGINE = None
+_FARM_BASE_CFG = None
+
+
+def _farm_eval(prover, ohlc, cfg_override, base_cfg) -> dict:
+    """Run ONE cell: the SHIPPED prover under base_cfg + this cell's overrides. Pure — no I/O."""
+    cfg = dict(base_cfg)
+    cfg.update(cfg_override)
+    v = prover(ohlc, cfg)
+    trades = int(v.get("trades", 0))
+    return {
+        "params": cfg_override,
+        "trades": trades,
+        "wins": int(v.get("wins", 0)),
+        "losses": int(v.get("losses", 0)),
+        "winRate": round(float(v.get("winRate", 0.0)), 4),
+        "netPts": round(float(v.get("netPts", 0.0)), 4),
+        "expectancyR": round(float(v.get("expectancyR", 0.0)), 4),
+        "maxDrawdownR": round(float(v.get("maxDrawdownR", 0.0)), 4),
+        "_pRaw": float(v.get("pEdge", 1.0)),          # internal only — NEVER surfaced as significance
+        "_edgeFloor": bool(v.get("edgeProven")) and bool(v.get("ok")),
+        "insufficient": trades < S.SIG_MIN_N,
+    }
+
+
+def _farm_pool_init_full(ohlc, engine, base_cfg):
+    """Pool initializer: hand each worker the bar series + engine + base cfg ONCE (not per cell)."""
+    global _FARM_OHLC, _FARM_ENGINE, _FARM_BASE_CFG
+    _FARM_OHLC, _FARM_ENGINE, _FARM_BASE_CFG = ohlc, engine, base_cfg
+
+
+def _farm_pool_worker(cfg_override):
+    """ProcessPoolExecutor task body — evaluates one cell against the initializer-seeded series."""
+    from bltd_store import PROVERS  # re-import in the spawned worker
+    return _farm_eval(PROVERS[_FARM_ENGINE], _FARM_OHLC, cfg_override, _FARM_BASE_CFG)
+
+
+def backtest_farm(store, engine: str, symbol: str, start_ts=None, end_ts=None,
+                  workers: int | None = None, cfg=None) -> dict:
+    """Parallel parameter-sweep FARM for ONE (engine, symbol) over the buyer's OWN captured bars.
+
+    Reuses the SHIPPED prover (bltd_store.PROVERS[engine]) unchanged for every cell — zero new edge
+    math — and fans the engine's hyperparameter grid across this Mac's cores. Returns, for every cell
+    TRIED, the honest OOS statistics (n / wins / losses / net points / max-drawdown-R) and a
+    Benjamini–Hochberg FDR-corrected p (`pEdgeAdj`) computed across the WHOLE grid. It NEVER surfaces
+    a raw best-cell p — that would be a multiple-comparisons lie. A cell with < SIG_MIN_N OOS trades
+    is 'insufficient' (significance not assessed, never 'proven'). NO aggregate win-rate / equity / $
+    figure. Stamped with prover_sha so the buyer can reproduce it. Nothing is downloaded or invented;
+    an empty / too-thin store yields an honest empty verdict.
+
+    `workers`: None -> use the machine's cores; 1 -> serial (deterministic, no pool). On any pool
+    failure the farm falls back to serial and says so in `compute` (never a silent lie)."""
+    cfg = cfg or store.config()
+    base_cfg = dict(cfg)
+    lookback = cfg.get("lookback", S.LOOKBACK)
+    q = cfg.get("fdrQ", 0.10)
+    label = ("Parameter sweep of the SHIPPED edge-gate prover on YOUR captured bars only — "
+             "reproducible, NOT a promise, no performance guaranteed.")
+    overfit_note = ("Best-of-N parameter search inflates significance. Every p below is "
+                    "Benjamini–Hochberg FDR-corrected across all cells tried; a raw best-cell "
+                    "p is never shown.")
+    head = {"kind": "backtest_farm", "available": False, "engine": engine, "symbol": symbol,
+            "label": label, "overfitNote": overfit_note,
+            "source": "your own captured bars (this Mac's store)",
+            "prover_sha": S.prover_source_sha(), "sigMinN": S.SIG_MIN_N, "alpha": S.SIG_ALPHA,
+            "fdrQ": q, "test": "one-sided binomial vs R-geometry breakeven, BH-FDR corrected across the grid",
+            "cores": _os.cpu_count() or 1, "startTs": start_ts, "endTs": end_ts,
+            "cells": [], "best": None, "cellsTried": 0, "reason": ""}
+    if engine not in S.PROVERS:
+        head["reason"] = f"unknown engine '{engine}'"
+        return head
+    if not S.in_scope(symbol):
+        head["reason"] = f"'{symbol}' is not a recognized instrument"
+        return head
+    ohlc = store.ohlc_between(symbol, start_ts, end_ts)
+    total = len(ohlc)
+    head["totalBars"] = total
+    cells_cfg, full_grid = _farm_grid(engine, base_cfg)
+    head["gridSize"] = full_grid
+    head["gridTruncated"] = full_grid > len(cells_cfg)
+    if total < lookback + 2:
+        head["reason"] = (f"insufficient bars — only {total} captured for {symbol} in this range "
+                          f"(prover arms at {lookback + 2}); connect your feed and let bars accumulate")
+        return head
+
+    # ── run the grid (parallel across cores, serial fallback) ──────────────────
+    prover = S.PROVERS[engine]
+    n_workers = (_os.cpu_count() or 1) if workers is None else max(1, int(workers))
+    n_workers = min(n_workers, len(cells_cfg))
+    results = None
+    compute = "serial"
+    if n_workers > 1:
+        try:
+            with _futures.ProcessPoolExecutor(
+                    max_workers=n_workers, initializer=_farm_pool_init_full,
+                    initargs=(ohlc, engine, base_cfg)) as ex:
+                results = list(ex.map(_farm_pool_worker, cells_cfg))
+            compute = f"process-pool ({n_workers} workers)"
+        except Exception as exc:  # noqa: BLE001 — BrokenProcessPool / spawn issues -> honest fallback
+            results = None
+            compute = f"serial (pool unavailable: {type(exc).__name__})"
+    if results is None:
+        results = [_farm_eval(prover, ohlc, c, base_cfg) for c in cells_cfg]
+    head["compute"] = compute
+
+    # ── family-wide BH-FDR correction across every cell's raw p ────────────────
+    adj = _bh_adjusted_pvalues([r["_pRaw"] for r in results])
+    cells = []
+    proven_n = insuff_n = suff_n = 0
+    for r, a in zip(results, adj):
+        insufficient = r["insufficient"]
+        proven = (not insufficient) and r["_edgeFloor"] and (a <= q)
+        if insufficient:
+            insuff_n += 1
+            reason = (f"insufficient sample — {r['trades']} OOS trades, need ≥{S.SIG_MIN_N} "
+                      f"before significance can be assessed")
+        else:
+            suff_n += 1
+            if proven:
+                proven_n += 1
+                reason = (f"candidate — win {r['winRate'] * 100:.1f}% / net {r['netPts']:+.2f} pts on "
+                          f"{r['trades']} trades (FDR-adj p={a:.3f}); research only, live verification required")
+            else:
+                reason = (f"no edge — win {r['winRate'] * 100:.1f}% / net {r['netPts']:+.2f} pts on "
+                          f"{r['trades']} OOS trades (FDR-adj p={a:.3f} > q={q:.2f})")
+        cells.append({
+            "params": r["params"], "trades": r["trades"], "wins": r["wins"], "losses": r["losses"],
+            "winRate": r["winRate"], "netPts": r["netPts"], "expectancyR": r["expectancyR"],
+            "maxDrawdownR": r["maxDrawdownR"], "pEdgeAdj": round(a, 6),
+            "proven": proven, "insufficient": insufficient, "reason": reason,
+        })
+    # deterministic order: proven first, then sufficient, then by adjusted p ascending
+    cells.sort(key=lambda c: (not c["proven"], c["insufficient"], c["pEdgeAdj"]))
+    head["cells"] = cells
+    head["cellsTried"] = len(cells)
+    head["provenCells"] = proven_n
+    head["cellsInsufficient"] = insuff_n
+    head["cellsSufficient"] = suff_n
+    head["available"] = True
+
+    # ── the best cell: honest either way, always by ADJUSTED p ─────────────────
+    sufficient_cells = [c for c in cells if not c["insufficient"]]
+    if proven_n > 0:
+        head["best"] = cells[0]
+        head["status"] = "candidate"
+    elif sufficient_cells:
+        best = min(sufficient_cells, key=lambda c: c["pEdgeAdj"])
+        head["best"] = best
+        head["status"] = "no_edge"
+        head["reason"] = (f"no parameter set beat the family-wide FDR correction across "
+                          f"{len(cells)} cells tried — best FDR-adj p={best['pEdgeAdj']:.3f} (need ≤{q:.2f})")
+    else:
+        head["best"] = None
+        head["status"] = "insufficient"
+        head["reason"] = (f"every one of the {len(cells)} cells had < {S.SIG_MIN_N} OOS trades on this "
+                          f"slice — capture more bars before the farm can judge an edge")
+    return head
+
+
+# ── claim-linter hook: render farm payloads so the zero-claims linter has teeth over them ──────────
+def render_farm_payload(report: dict) -> str:
+    """Render a farm report to the buyer-facing TEXT surface (what a share/alert would emit), honestly
+    and with NO aggregate win-rate/$ headline. claim_linter scans this so a forbidden figure that
+    reaches the farm's text — even a computed one — fails the build, not just a source literal. Cells
+    are described by trade COUNT + FDR-adjusted p + verdict word; percentages/$ are deliberately not
+    composed into a claim shape."""
+    if not report.get("available"):
+        return f"Backtest farm ({report.get('engine')} on {report.get('symbol')}): {report.get('reason', 'no data')}"
+    lines = [f"Black Label Trading — parameter-sweep farm ({report['engine']} on {report['symbol']})",
+             f"{report['cellsTried']} cells tried on your captured bars only — NOT a promise.",
+             report["overfitNote"]]
+    best = report.get("best")
+    status = report.get("status")
+    if status == "candidate" and best:
+        lines.append(f"Best cell: candidate on {best['trades']} OOS trades "
+                     f"(FDR-adj p={best['pEdgeAdj']:.3f}) — research only, live verification required.")
+    elif status == "no_edge" and best:
+        lines.append(f"Verdict: NO EDGE — no parameter set beat the correction "
+                     f"(best FDR-adj p={best['pEdgeAdj']:.3f} on {best['trades']} trades).")
+    else:
+        lines.append("Verdict: INSUFFICIENT — not enough OOS trades to judge; capture more bars.")
+    return "\n".join(lines)
+
+
+def farm_sample_payloads() -> list[str]:
+    """Representative rendered farm payloads for the claim linter — a candidate case, a no-edge case,
+    and an insufficient case. Mirrors bltd_alerts.linter_sample_payloads: the linter renders these so
+    a fabricated figure reaching the farm's text surface fails the build."""
+    candidate = {"available": True, "engine": "meanrev", "symbol": "ES", "cellsTried": 54,
+                 "overfitNote": ("Best-of-N parameter search inflates significance. Every p is "
+                                 "Benjamini–Hochberg FDR-corrected; a raw best-cell p is never shown."),
+                 "status": "candidate",
+                 "best": {"trades": 42, "pEdgeAdj": 0.031}}
+    no_edge = {"available": True, "engine": "breakout", "symbol": "NQ", "cellsTried": 20,
+               "overfitNote": candidate["overfitNote"], "status": "no_edge",
+               "best": {"trades": 61, "pEdgeAdj": 0.184}}
+    insufficient = {"available": True, "engine": "regime", "symbol": "CL", "cellsTried": 12,
+                    "overfitNote": candidate["overfitNote"], "status": "insufficient", "best": None}
+    return [render_farm_payload(candidate), render_farm_payload(no_edge), render_farm_payload(insufficient)]
+
+
+# ===========================================================================
 # chart studies — EMA / VWAP / RSI / Bollinger from real OHLC bars
 # ===========================================================================
 def ema(values, span):

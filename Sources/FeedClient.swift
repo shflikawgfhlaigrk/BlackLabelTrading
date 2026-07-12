@@ -325,6 +325,21 @@ final class FeedClient: ObservableObject {
         return BacktestLabReport.decode(obj)
     }
 
+    // MARK: - TR-19 own-silicon parameter-sweep FARM (GET /api/backtest/farm): fans the SHIPPED
+    // prover's hyperparameter grid across this Mac's cores over the buyer's OWN bars. Per-cell
+    // n / W / L / max-drawdown-R + a BH-FDR-corrected p across the whole grid + prover_sha. No cloud,
+    // no data fee, no aggregate win-rate/$ figure. Signed-out / unreachable -> honest empty report.
+    func runBacktestFarm(engine: String, symbol: String,
+                         startTs: Int? = nil, endTs: Int? = nil) async -> BacktestFarmReport {
+        let s = symbol.trimmingCharacters(in: .whitespaces)
+        guard signedIn, !s.isEmpty, !engine.isEmpty else { return .empty }
+        var path = "/api/backtest/farm?engine=\(enc(engine))&symbol=\(enc(s))"
+        if let a = startTs { path += "&start=\(a)" }
+        if let b = endTs { path += "&end=\(b)" }
+        guard let obj = await getJSON(path) else { return .empty }
+        return BacktestFarmReport.decode(obj)
+    }
+
     // First/last captured epoch + count for a symbol (GET /api/backtest/bounds) — the lab's honest
     // date-range default (the real span of the buyer's OWN data). Empty store -> zeros.
     func barBounds(symbol: String) async -> (count: Int, firstTs: Int?, lastTs: Int?) {

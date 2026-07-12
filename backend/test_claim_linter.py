@@ -118,6 +118,38 @@ def test_main_fails_when_payloads_are_poisoned(monkeypatch=None):
         bltd_alerts.linter_sample_payloads = orig
 
 
+# ── TR-19 FARM PAYLOAD TEETH: a forbidden figure in a RENDERED farm payload must fail ────────────
+def test_rendered_farm_payloads_are_clean():
+    # The real TR-19 farm payloads (bltd_analytics.farm_sample_payloads) must carry no forbidden
+    # aggregate figure — a best-of-N sweep is the surface most tempted to parade one.
+    assert L.scan_farm_payloads() == [], "the shipped farm payloads must be claim-clean"
+
+
+def test_planted_winrate_in_a_farm_payload_trips_the_linter():
+    # A best-of-N win-rate injected into the farm render path (even a computed one) must be caught by
+    # scanning the RENDERED payload, not just source.
+    poisoned = lambda: ["Backtest farm — best cell wins at an 82.0% win rate across 54 cells tried"]
+    assert L.scan_farm_payloads(render_fn=poisoned), "a planted farm win-rate must be caught"
+
+
+def test_planted_pnl_in_a_farm_payload_trips_the_linter():
+    poisoned = lambda: ["Farm result", "the winning parameter set earned a profit of $1,434,082"]
+    assert L.scan_farm_payloads(render_fn=poisoned), "a planted farm P&L must be caught"
+
+
+def test_main_fails_when_farm_payloads_are_poisoned():
+    # End-to-end: main() returns exit 1 when the farm render path emits a forbidden figure, even on
+    # an otherwise-clean tree. Swap farm_sample_payloads' default source via the module hook.
+    import bltd_analytics
+    orig = bltd_analytics.farm_sample_payloads
+    bltd_analytics.farm_sample_payloads = lambda: ["a win rate of 90% on the best cell"]
+    try:
+        root = _tree({"Sources/Ok.swift": 'Text("clean")\n'})
+        assert L.main(["--root", root]) == 1, "poisoned farm payloads must fail the whole linter"
+    finally:
+        bltd_analytics.farm_sample_payloads = orig
+
+
 if __name__ == "__main__":
     import sys
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

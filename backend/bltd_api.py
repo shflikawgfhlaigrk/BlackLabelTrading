@@ -26,6 +26,7 @@ Endpoints (Bearer token from /auth/signin required on /api/*):
   GET  /api/gate/rerun?symbols=&engines=  -> {available,prover_sha,sigMinN,alpha,engines:[{engine,status,contracts:[{n,wins,losses,maxDrawdownR,pEdge...}]}], ...}
   GET  /api/backtest/run?engine=&symbol=&start=&end=&folds= -> {available,prover_sha,whole,folds:[{fold,trades,wins,losses,maxDrawdownR,pEdge,insufficient...}]}  (no-code lab)
   GET  /api/backtest/bounds?symbol=       -> {symbol, count, firstTs, lastTs}  (date-range defaults for the lab)
+  GET  /api/backtest/farm?engine=&symbol=&start=&end=&workers= -> {available,prover_sha,cellsTried,provenCells,cells:[{params,trades,wins,losses,maxDrawdownR,pEdgeAdj,proven,insufficient}],best,status}  (TR-19 own-silicon parameter-sweep farm; BH-FDR-corrected p per cell)
   GET  /api/fires?limit=&symbol=&engine=  -> {fires:[{...}]}   (the signal journal)
   GET  /api/journal?symbol=&engine=       -> {graded, winRate, netPnl, byEngine}
   GET  /api/feed/sources                  -> {sources:[{key,label,kind,credFields,note}], active}
@@ -737,6 +738,25 @@ class H(BaseHTTPRequestHandler):
                 report = bltd_analytics.backtest_lab(STORE, engine, sym,
                                                      start_ts=_int("start"), end_ts=_int("end"),
                                                      folds=int(g("folds", "1") or 1), cfg=STORE.config())
+                report["generatedUTC"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                return self._send(200, report)
+            if u.path == "/api/backtest/farm":
+                # TR-19 own-silicon parameter-sweep FARM: fan the SHIPPED prover's hyperparameter
+                # grid across this Mac's cores over the buyer's OWN bars. Per-cell n/W/L/DD + a
+                # BH-FDR-corrected p across the whole grid (NEVER a raw best-cell p) + prover_sha.
+                # No cloud, no data fee, no aggregate win-rate/$ figure (§5.1/§5.7).
+                def _int(name):
+                    raw = g(name, "")
+                    try:
+                        return int(raw) if raw != "" else None
+                    except ValueError:
+                        return None
+                engine = g("engine", "meanrev")
+                sym = g("symbol")
+                wk = g("workers", "")
+                report = bltd_analytics.backtest_farm(
+                    STORE, engine, sym, start_ts=_int("start"), end_ts=_int("end"),
+                    workers=(int(wk) if wk.isdigit() else None), cfg=STORE.config())
                 report["generatedUTC"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
                 return self._send(200, report)
             if u.path == "/api/backtest/bounds":
