@@ -1471,6 +1471,59 @@ def test_gate_rerun_judges_each_instrument_independently_never_pooled():
         assert nq["bars"] == 15 and ("warming" in nq["reason"] or "insufficient" in nq["reason"])
 
 
+def test_on_candle_routes_non_es_instrument_identically_no_repaint_es_unchanged():
+    # TR-05 engine parameterization proof: the ingest + bar path is instrument-AGNOSTIC. A non-ES
+    # instrument driven through the REAL Capture.on_candle path must obey the SAME closed-bar /
+    # non-repaint invariants as ES — byte-identical closed-bar structure — proving no capture or
+    # bucketing code is ES-special-cased. Guards against a multi-asset regression where non-ES ticks
+    # would be dropped, mis-bucketed, or repaint an already-closed bar. Also asserts ES's own behavior
+    # is unchanged by multi-asset support (the "ES behavior unchanged" floor).
+    import bltd_capture as C
+
+    def _run(sym):
+        store, path, cfg = _temp_store()
+        try:
+            cap = C.Capture(store, bar_seconds=15, lookback=20, edge_gate=False)
+            # Two ticks inside one 15s bucket -> nothing closes while the bucket is still forming.
+            cap.on_candle({"symbol": sym, "close": 100.0, "epoch": None}, arrival=1_700_000_000.0)
+            cap.on_candle({"symbol": sym, "close": 101.0, "epoch": None}, arrival=1_700_000_005.0)
+            assert cap.pending_bars == {}, f"{sym}: no bar closes while the bucket is still forming"
+            cap.flush()
+            assert store.bars(sym, 10, newest=False)["bars"] == [], f"{sym}: forming bucket persists no closed bar"
+            # Cross into the next bucket -> the first bucket closes (o=100, c=101), frozen.
+            cap.on_candle({"symbol": sym, "close": 102.0, "epoch": None}, arrival=1_700_000_015.0)
+            cap.flush()
+            closed = store.bars(sym, 10, newest=False)["bars"]
+            # A wild tick in the NEW forming bucket must not repaint the already-closed bar.
+            cap.on_candle({"symbol": sym, "close": 250.0, "epoch": None}, arrival=1_700_000_020.0)
+            cap.flush()
+            assert store.bars(sym, 10, newest=False)["bars"] == closed, \
+                f"{sym}: closed bar frozen while a new bucket forms (no repaint)"
+            return closed
+        finally:
+            for p in (path, cfg):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+
+    orig = S.INSTRUMENT_SCOPE
+    try:
+        S.INSTRUMENT_SCOPE = "all"                  # deterministic even under a dev BLTD_SCOPE=es
+        es_closed = _run("CM.ESU6")                 # ES-family future
+        mnq_closed = _run("CM.MNQU6")               # non-ES index future (esModules=False)
+        spy_closed = _run("US.SPY")                 # equity ETF, no fabricated futures multiplier
+    finally:
+        S.INSTRUMENT_SCOPE = orig
+    # ES's own closed-bar structure is unchanged by multi-asset support.
+    expected = [[100.0, 101.0, 100.0, 101.0, 1_700_000_010.0, 0.0, 0.0]]
+    assert es_closed == expected, "ES closed-bar structure unchanged by multi-asset support"
+    # The non-ES instruments produce EXACTLY the ES closed-bar structure — the ingest path is
+    # instrument-agnostic; non-ES bars route through on_candle identically, with no repaint.
+    assert mnq_closed == es_closed, "non-ES (MNQ) routes through on_candle identically to ES"
+    assert spy_closed == es_closed, "non-ES (SPY ETF) routes through on_candle identically to ES"
+
+
 if __name__ == "__main__":
     import sys
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
