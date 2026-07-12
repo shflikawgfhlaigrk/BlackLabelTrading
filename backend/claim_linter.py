@@ -131,6 +131,33 @@ def scan_file(path: str) -> list[tuple[str, int, str, str]]:
     return scan_text(text, source=path)
 
 
+def scan_alert_payloads(render_fn=None) -> list[tuple[str, int, str, str]]:
+    """Scan the RENDERED TR-06 alert payloads — the actual text/JSON that would go on the wire — not
+    just the source. This catches a forbidden figure that reaches a push through the render path even
+    if it was computed rather than a static literal (a source-only scan would miss that). Default
+    source is bltd_alerts.linter_sample_payloads(); tests inject render_fn to prove the teeth.
+
+    Import/introspection failure is reported as a warning, not a pass — but only when the real module
+    is being scanned (render_fn is None); a missing bltd_alerts in a temp-root fixture is a no-op."""
+    if render_fn is None:
+        try:
+            import bltd_alerts  # noqa: PLC0415 — optional, lazy: the linter must run without it too
+        except Exception as exc:  # noqa: BLE001
+            print(f"  WARN cannot import bltd_alerts to scan payloads (skipping): "
+                  f"{type(exc).__name__}: {exc}", file=sys.stderr)
+            return []
+        render_fn = bltd_alerts.linter_sample_payloads
+    try:
+        texts = list(render_fn())
+    except Exception as exc:  # noqa: BLE001
+        print(f"  WARN cannot render alert payloads: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return []
+    hits: list[tuple[str, int, str, str]] = []
+    for i, text in enumerate(texts):
+        hits += scan_text(str(text), source=f"<alert-payload#{i}>")
+    return hits
+
+
 def scan_binary(binary: str) -> list[tuple[str, int, str, str]]:
     """Scan the compiled binary's embedded strings — the surface a buyer actually sees at runtime."""
     if not os.path.isfile(binary):
@@ -149,6 +176,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--root", default=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                     help="repo root (default: parent of backend/)")
     ap.add_argument("--binary", default=None, help="also scan this compiled binary via `strings`")
+    ap.add_argument("--no-payloads", action="store_true",
+                    help="skip rendering + scanning the TR-06 alert payloads")
     args = ap.parse_args(argv)
 
     all_hits: list[tuple[str, int, str, str]] = []
@@ -159,6 +188,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.binary:
         scanned += 1
         all_hits += scan_binary(args.binary)
+    # Scan the RENDERED TR-06 alert payloads too — a forbidden figure must never reach a push (§5.1).
+    if not args.no_payloads:
+        scanned += 1
+        all_hits += scan_alert_payloads()
 
     if all_hits:
         print(f"claim_linter: {len(all_hits)} FORBIDDEN CLAIM(S) in the shipped surface "

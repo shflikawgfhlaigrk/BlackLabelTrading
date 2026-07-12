@@ -113,6 +113,58 @@ final class FeedClient: ObservableObject {
         }
     }
 
+    // Authed POST returning the decoded JSON body (nil on transport/HTTP failure).
+    private func postJSON(_ path: String, _ body: [String: Any]) async -> [String: Any]? {
+        guard let req0 = authed(path) else { return nil }
+        var req = req0; req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        do {
+            let (data, resp) = try await session.data(for: req)
+            guard (resp as? HTTPURLResponse)?.statusCode == 200 else { return nil }
+            return try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        } catch {
+            lastError = friendly(error)
+            return nil
+        }
+    }
+
+    // MARK: - TR-06 honest edge-gate alerts. Posts the gate VERDICT (incl. "no edge") to an endpoint
+    // the buyer OWNS. OFF by default; no endpoint => the backend makes zero network calls. A push can
+    // NEVER become an order (the alert path imports nothing from the execution engine).
+
+    /// Token-free view of the alert config for the settings UI.
+    func alertStatus() async -> AlertStatus {
+        guard signedIn, let o = await getJSON("/api/alerts/status") else { return .empty }
+        return AlertStatus.decode(o)
+    }
+
+    /// Persist the buyer's alert settings (through /api/config; alert keys only).
+    @discardableResult
+    func saveAlertConfig(enabled: Bool, endpoint: String, provider: String,
+                         pushoverToken: String, pushoverUser: String) async -> Bool {
+        let patch: [String: Any] = [
+            "alertEnabled": enabled,
+            "alertEndpoint": endpoint.trimmingCharacters(in: .whitespacesAndNewlines),
+            "alertProvider": provider,
+            "alertPushoverToken": pushoverToken.trimmingCharacters(in: .whitespacesAndNewlines),
+            "alertPushoverUser": pushoverUser.trimmingCharacters(in: .whitespacesAndNewlines),
+        ]
+        return await postJSON("/api/config", patch) != nil
+    }
+
+    /// Fire a TEST alert to the configured endpoint. Returns the honest result (posted / not-sent).
+    func testAlert() async -> AlertSendResult {
+        guard signedIn, let o = await postJSON("/api/alerts/test", [:]) else { return .unreachable }
+        return AlertSendResult.decode(o)
+    }
+
+    /// Post the current edge-gate verdict for the buyer's bars to their endpoint now.
+    func sendGateAlert() async -> AlertSendResult {
+        guard signedIn, let o = await postJSON("/api/alerts/send", [:]) else { return .unreachable }
+        return AlertSendResult.decode(o)
+    }
+
     // MARK: - Reference OOS verdicts (GET /api/reference): Black Label's edge-gate result on OUR OWN
     // historical ES bars, so a cold buyer sees a real, earned verdict before they've captured a
     // single bar. REFERENCE ONLY — historical ES, not the buyer's account, not a promise. Public

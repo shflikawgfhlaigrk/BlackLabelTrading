@@ -851,3 +851,53 @@ enum FireFeed {
         }
     }
 }
+
+// MARK: - TR-06 honest alert models (decoded from /api/alerts/*).
+
+/// Token-free view of the alert configuration (GET /api/alerts/status). Never carries the Pushover
+/// token/user or a raw endpoint query — the backend redacts before it reaches here.
+struct AlertStatus: Equatable {
+    var enabled: Bool
+    var provider: String
+    var endpoint: String
+    var configured: Bool
+    var egressOk: Bool
+    var pushoverConfigured: Bool
+    var note: String
+
+    static let empty = AlertStatus(enabled: false, provider: "ntfy", endpoint: "",
+                                   configured: false, egressOk: false, pushoverConfigured: false,
+                                   note: "")
+
+    static func decode(_ obj: [String: Any]) -> AlertStatus {
+        AlertStatus(
+            enabled: (obj["enabled"] as? Bool) ?? false,
+            provider: (obj["provider"] as? String) ?? "ntfy",
+            endpoint: (obj["endpoint"] as? String) ?? "",
+            configured: (obj["configured"] as? Bool) ?? false,
+            egressOk: (obj["egressOk"] as? Bool) ?? false,
+            pushoverConfigured: (obj["pushoverConfigured"] as? Bool) ?? false,
+            note: (obj["note"] as? String) ?? "")
+    }
+}
+
+/// The honest result of a test / send (POST /api/alerts/{test,send}). `sent` means the buyer's
+/// endpoint accepted the POST — "posted", never "delivered". `networked` is false when the app made
+/// no network call at all (off / no endpoint), which is the provable no-egress state.
+struct AlertSendResult: Equatable {
+    var sent: Bool
+    var networked: Bool
+    var reason: String
+    var summary: String
+
+    static let unreachable = AlertSendResult(sent: false, networked: false,
+                                             reason: "backend unreachable", summary: "")
+
+    static func decode(_ obj: [String: Any]) -> AlertSendResult {
+        AlertSendResult(
+            sent: (obj["sent"] as? Bool) ?? false,
+            networked: (obj["networked"] as? Bool) ?? false,
+            reason: (obj["reason"] as? String) ?? "",
+            summary: (obj["summary"] as? String) ?? "")
+    }
+}

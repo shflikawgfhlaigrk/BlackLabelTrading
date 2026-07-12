@@ -86,6 +86,14 @@ CONFIG_DEFAULTS = {
     # alert/signal delivery channels (the daemon writes a fire; channels mirror it out)
     "alertSound": True,
     "alertWebhook": "",        # POST each fire as JSON to this URL (e.g. Discord/Slack)
+    # TR-06 honest edge-gate ALERT channel (bltd_alerts): posts the gate VERDICT — incl. "no edge" —
+    # to an endpoint the buyer owns. OFF by default; empty endpoint => zero egress. Never a relay,
+    # never an aggregate win-rate/$ figure. See bltd_alerts.py for the full posture.
+    "alertEnabled": False,     # master switch; False => bltd_alerts makes no network call at all
+    "alertEndpoint": "",       # buyer's OWN https:// endpoint (ntfy topic / webhook / Shortcuts)
+    "alertProvider": "ntfy",   # ntfy | pushover | webhook — how the body is shaped
+    "alertPushoverToken": "",  # Pushover app token (buyer's own), only for the pushover provider
+    "alertPushoverUser": "",   # Pushover user key (buyer's own), only for the pushover provider
 }
 
 _CONFIG_RANGES = {

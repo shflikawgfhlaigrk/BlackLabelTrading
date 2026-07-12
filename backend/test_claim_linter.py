@@ -86,6 +86,38 @@ def test_real_shipped_surface_is_clean():
     assert L.main(["--root", repo]) == 0, "the shipped Trading surface must be claim-clean"
 
 
+# ── TR-06 PAYLOAD TEETH: a forbidden figure in a RENDERED alert payload must fail ────────────
+def test_rendered_alert_payloads_are_clean():
+    # The real TR-06 alert payloads (bltd_alerts.linter_sample_payloads) must carry no forbidden
+    # aggregate figure — this is the standing invariant the build gate holds.
+    assert L.scan_alert_payloads() == [], "the shipped alert payloads must be claim-clean"
+
+
+def test_planted_winrate_in_a_payload_trips_the_linter():
+    # A win-rate injected into the render path (even a computed one) must be caught by scanning the
+    # RENDERED payload, not just source. We inject a poisoned render_fn and assert teeth.
+    poisoned = lambda: ["Black Label Trading — edge-gate verdict\nOur engine wins at an 82.0% win rate"]
+    assert L.scan_alert_payloads(render_fn=poisoned), "a planted payload win-rate must be caught"
+
+
+def test_planted_pnl_in_a_payload_trips_the_linter():
+    poisoned = lambda: ["No edge today.", "Members earned a profit of $1,434,082 this quarter"]
+    assert L.scan_alert_payloads(render_fn=poisoned), "a planted payload P&L must be caught"
+
+
+def test_main_fails_when_payloads_are_poisoned(monkeypatch=None):
+    # End-to-end: main() must return exit 1 when the payload render path emits a forbidden figure,
+    # even on an otherwise-clean tree. We swap scan_alert_payloads' default source via the module hook.
+    import bltd_alerts
+    orig = bltd_alerts.linter_sample_payloads
+    bltd_alerts.linter_sample_payloads = lambda: ["a win rate of 90%"]
+    try:
+        root = _tree({"Sources/Ok.swift": 'Text("clean")\n'})
+        assert L.main(["--root", root]) == 1, "poisoned payloads must fail the whole linter"
+    finally:
+        bltd_alerts.linter_sample_payloads = orig
+
+
 if __name__ == "__main__":
     import sys
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

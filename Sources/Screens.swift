@@ -1825,6 +1825,12 @@ struct SettingsScreen: View {
             }
             .onAppear { feedURLDraft = feed.baseURL; Task { await feed.refreshStatus() } }
 
+            // TR-06 — honest edge-gate alerts to an endpoint the buyer OWNS (off by default).
+            EdgeGateAlertsPanel()
+
+            // TR-20 — feed-cost transparency + provable no-network posture.
+            FeedCostPanel()
+
             // Make the Google sign-in option configurable rather than silently hidden.
             Panel(title: "Sign-in providers", icon: "globe") {
                 Text("Both the Apple and Google buttons always appear on the login screen. Apple sign-in runs for real in the signed (provisioned) build; email/password and guest always work. To make the Google button do a real login, paste your own Google DESKTOP OAuth client ID below — it's stored on this Mac, never bundled. A Web client ID will NOT work for the app's loopback flow; create a \"Desktop\" client in the Google Cloud console.")
@@ -1909,6 +1915,118 @@ struct SettingsScreen: View {
             StatusPill(text: status, tint: tint)
         }
         .padding(.vertical, 4)
+    }
+}
+
+// MARK: - TR-06 Edge-gate alerts (honest push to an endpoint the BUYER owns)
+// Posts the edge-gate VERDICT — including the honest "no edge on your bars today" — to the buyer's
+// OWN ntfy topic / webhook / Pushover, never through a Black Label relay. OFF by default; with no
+// endpoint the backend makes ZERO network calls. A push can never become an order.
+struct EdgeGateAlertsPanel: View {
+    @EnvironmentObject var feed: FeedClient
+    @State private var status = AlertStatus.empty
+    @State private var enabled = false
+    @State private var provider = "ntfy"
+    @State private var endpoint = ""
+    @State private var pushToken = ""
+    @State private var pushUser = ""
+    @State private var saved = false
+    @State private var sendMsg: String? = nil
+    @State private var sendOK = false
+    @State private var busy = false
+    private let providers = ["ntfy", "pushover", "webhook"]
+
+    var body: some View {
+        Panel(title: "Edge-gate alerts", icon: "bell.badge") {
+            Text("Get the edge-gate's verdict pushed to a channel YOU own — including the honest \u{201C}no edge on your bars today.\u{201D} It posts only to the endpoint you set below, never to a Black Label server, and never sends a win-rate or P&L. A push is information out; it can never place a trade.")
+                .font(.system(size: 11.5, design: .rounded)).foregroundColor(BLTheme.sub).fixedSize(horizontal: false, vertical: true)
+            Toggle(isOn: $enabled) {
+                Text("Enable edge-gate alerts").font(.system(size: 12.5, weight: .semibold, design: .rounded)).foregroundColor(BLTheme.text)
+            }.tint(BLTheme.gold)
+            HStack(spacing: 8) {
+                Text("CHANNEL").font(.system(size: 10, weight: .bold, design: .rounded)).foregroundColor(BLTheme.sub).tracking(0.6)
+                Picker("", selection: $provider) { ForEach(providers, id: \.self) { Text($0).tag($0) } }
+                    .pickerStyle(.segmented).labelsHidden().frame(width: 240)
+                Spacer()
+            }
+            Field(title: provider == "pushover" ? "Endpoint (optional — blank uses Pushover API)" : "Your endpoint URL (https://…)",
+                  text: $endpoint, prompt: provider == "ntfy" ? "https://ntfy.sh/your-topic" : "https://…")
+            if provider == "pushover" {
+                Field(title: "Pushover app token", text: $pushToken, prompt: "your own app token")
+                Field(title: "Pushover user key", text: $pushUser, prompt: "your own user key")
+            }
+            HStack(spacing: 8) {
+                GoldButton(label: "Save", icon: "checkmark") {
+                    busy = true
+                    Task {
+                        let ok = await feed.saveAlertConfig(enabled: enabled, endpoint: endpoint,
+                                                            provider: provider, pushoverToken: pushToken,
+                                                            pushoverUser: pushUser)
+                        status = await feed.alertStatus()
+                        busy = false
+                        withAnimation { saved = ok }
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { withAnimation { saved = false } }
+                    }
+                }
+                GhostButton(label: "Send test", icon: "paperplane") {
+                    busy = true; sendMsg = nil
+                    Task {
+                        let r = await feed.testAlert()
+                        busy = false
+                        sendOK = r.sent
+                        // Honest status: "posted to your endpoint", never "delivered".
+                        sendMsg = r.networked ? (r.sent ? "Posted to your endpoint." : r.reason)
+                                              : "No endpoint configured — nothing was sent (0 network calls)."
+                    }
+                }
+                if saved { Text("Saved.").font(.system(size: 11, weight: .semibold, design: .rounded)).foregroundColor(BLTheme.green) }
+                if busy { Text("…").font(.system(size: 12, design: .rounded)).foregroundColor(BLTheme.sub) }
+            }
+            if let m = sendMsg {
+                Text(m).font(.system(size: 11.5, weight: .semibold, design: .rounded))
+                    .foregroundColor(sendOK ? BLTheme.green : BLTheme.sub).fixedSize(horizontal: false, vertical: true)
+            }
+            HStack(spacing: 6) {
+                Circle().fill(status.configured && status.enabled ? BLTheme.green : BLTheme.sub).frame(width: 8, height: 8)
+                Text(statusLine).font(.system(size: 11, design: .rounded)).foregroundColor(BLTheme.sub)
+            }
+        }
+        .onAppear {
+            Task {
+                status = await feed.alertStatus()
+                enabled = status.enabled
+                provider = status.provider.isEmpty ? "ntfy" : status.provider
+                endpoint = status.endpoint
+            }
+        }
+    }
+    private var statusLine: String {
+        if !status.enabled { return "Alerts off — no network calls are made." }
+        if !status.configured { return "On, but no endpoint set — nothing is sent yet." }
+        return "On — posting to your \(status.provider) endpoint." + (status.egressOk ? "" : " (endpoint must be https://)")
+    }
+}
+
+// MARK: - TR-20 Feed cost & network transparency (the plain truth, provable)
+struct FeedCostPanel: View {
+    var body: some View {
+        Panel(title: "Feed cost & network", icon: "lock.shield") {
+            Text("You already own the feed. Black Label Trading reads YOUR own WealthCharts or TopstepX session in a product-owned browser on this Mac — it does not resell data and there is no subscription you pay us for quotes. Because the bars come from your already-open session, there is $0 extra CME real-time add-on to buy on our side — you are on your entitlement, not ours.")
+                .font(.system(size: 11.5, design: .rounded)).foregroundColor(BLTheme.sub).fixedSize(horizontal: false, vertical: true)
+            Divider().background(BLTheme.stroke)
+            Text("This app phones home to nobody.").font(.system(size: 12.5, weight: .bold, design: .rounded)).foregroundColor(BLTheme.text)
+            bullet("Your captured bars, journal, and gate verdicts stay on this Mac.")
+            bullet("Outbound connections go only to localhost, the broker/feed YOU connect (with your own credentials), and the alert endpoint YOU configure.")
+            bullet("No Black Label server ever receives your data. No analytics, no telemetry, no tracker.")
+            Text("Provable, not just promised: a build-time test (backend/test_egress.py) fails the release if any egress destination is a Black Label server or a tracker; the signed app declares network.client (outbound only) and no inbound server entitlement. Details in docs/EGRESS-AND-FEED-COST.md.")
+                .font(.system(size: 11, design: .rounded)).foregroundColor(BLTheme.sub).fixedSize(horizontal: false, vertical: true).padding(.top, 2)
+        }
+    }
+    @ViewBuilder private func bullet(_ s: String) -> some View {
+        HStack(alignment: .top, spacing: 6) {
+            Text("•").font(.system(size: 12, weight: .bold, design: .rounded)).foregroundColor(BLTheme.gold)
+            Text(s).font(.system(size: 11.5, design: .rounded)).foregroundColor(BLTheme.sub).fixedSize(horizontal: false, vertical: true)
+        }
     }
 }
 

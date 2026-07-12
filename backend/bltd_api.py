@@ -54,6 +54,7 @@ from urllib.parse import parse_qs, urlparse
 
 import bltd_store
 import bltd_analytics
+import bltd_alerts   # TR-06 honest edge-gate alert delivery (off by default; buyer-owned endpoint)
 
 # A real deployment issues per-user tokens; for the local/dev backend any sign-in mints this.
 # SECURITY: never default to a publicly-known constant (the source ships in the repo). When
@@ -627,6 +628,20 @@ class H(BaseHTTPRequestHandler):
             if not self._authed():
                 return self._send(401, {"error": "unauthorized"})
             return self._send(200, _exec_command(u.path, body if isinstance(body, dict) else {}))
+        # TR-06 honest alert: post the edge-gate verdict (incl. "no edge") to the buyer's OWN
+        # endpoint. OFF/no-endpoint => zero egress (bltd_alerts guards before any socket). This path
+        # can NEVER place an order — it imports nothing from bltd_exec.
+        if u.path == "/api/alerts/test":
+            if not self._authed():
+                return self._send(401, {"error": "unauthorized"})
+            return self._send(200, bltd_alerts.test_send(STORE))
+        if u.path == "/api/alerts/send":
+            if not self._authed():
+                return self._send(401, {"error": "unauthorized"})
+            b = body if isinstance(body, dict) else {}
+            syms = b.get("symbols") if isinstance(b.get("symbols"), list) else None
+            engs = b.get("engines") if isinstance(b.get("engines"), list) else None
+            return self._send(200, bltd_alerts.send_gate_alert(STORE, syms, engs))
         self._send(404, {"error": "not found"})
 
     def do_GET(self):
@@ -733,6 +748,10 @@ class H(BaseHTTPRequestHandler):
                                                    g("symbol") or None, g("engine") or None))
             if u.path == "/api/journal":
                 return self._send(200, STORE.journal_stats(g("symbol") or None, g("engine") or None))
+            if u.path == "/api/alerts/status":
+                # Token-free view of the TR-06 alert config for the settings UI (no Pushover
+                # token/user, no raw endpoint query is ever returned).
+                return self._send(200, bltd_alerts.status(STORE))
         except Exception as exc:  # noqa: BLE001
             return self._send(200, {"error": f"{type(exc).__name__}: {exc}"})
         self._send(404, {"error": "unknown endpoint"})

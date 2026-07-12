@@ -2190,29 +2190,29 @@ func testWindowLaunchOrderingContract() {
 }
 
 func testBuildNumberContract() {
-    let expectedBuild = "<key>CFBundleVersion</key><string>20</string>"
+    let expectedBuild = "<key>CFBundleVersion</key><string>21</string>"
     for file in ["build.command", "build-signed.command"] {
         guard let src = try? String(contentsOfFile: file, encoding: .utf8) else {
             ok(false, "[source] \(file) readable for build-number contract"); continue
         }
-        ok(src.contains(expectedBuild), "[source] \(file) stamps Trading build 20")
+        ok(src.contains(expectedBuild), "[source] \(file) stamps Trading build 21")
         ok(src.contains("universal2") && src.contains("build_trd_arch arm64") &&
            src.contains("build_trd_arch x86_64") && src.contains("lipo -create"),
            "[source] \(file) builds a universal2 Trading binary")
     }
     if let src = try? String(contentsOfFile: "build-developer-id.sh", encoding: .utf8) {
-        ok(src.contains("BUILD_NUMBER=\"${BUILD_NUMBER:-20}\""), "[source] Developer-ID build defaults to Trading build 20")
+        ok(src.contains("BUILD_NUMBER=\"${BUILD_NUMBER:-21}\""), "[source] Developer-ID build defaults to Trading build 21")
     } else {
         ok(false, "[source] build-developer-id.sh readable for build-number contract")
     }
     if let plist = try? String(contentsOfFile: "Sources/Info.plist", encoding: .utf8) {
-        ok(plist.contains("<key>CFBundleVersion</key>\n\t<string>20</string>"),
-           "[source] Sources/Info.plist CFBundleVersion is 20")
+        ok(plist.contains("<key>CFBundleVersion</key>\n\t<string>21</string>"),
+           "[source] Sources/Info.plist CFBundleVersion is 21")
     } else {
         ok(false, "[source] Sources/Info.plist readable for build-number contract")
     }
     if let project = try? String(contentsOfFile: "project.yml", encoding: .utf8) {
-        ok(project.contains("CFBundleVersion: \"20\""), "[source] project.yml CFBundleVersion is 20")
+        ok(project.contains("CFBundleVersion: \"21\""), "[source] project.yml CFBundleVersion is 21")
     } else {
         ok(false, "[source] project.yml readable for build-number contract")
     }
