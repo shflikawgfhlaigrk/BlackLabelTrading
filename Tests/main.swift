@@ -1759,14 +1759,34 @@ func testSourcedPropFirmPresets() {
     eq(tpt.trailingDrawdown, 2000, "TPT 50K trailing DD = $2,000 (sourced)")
     eq(tpt.maxPositionSize, 6, "TPT 50K max position = 6 (sourced)")
 
+    // v3 (2026-07-14): TPT per-size table now firm-Zendesk sourced at ALL five sizes.
+    guard let tpt25 = find("Take Profit Trader", "25K") else { ok(false, "TPT 25K preset present"); return }
+    eq(tpt25.trailingDrawdown, 1500, "TPT 25K trailing DD = $1,500 (v3 sourced)")
+    eq(tpt25.maxPositionSize, 3, "TPT 25K max position = 3 (v3 sourced)")
+    guard let tpt75 = find("Take Profit Trader", "75K") else { ok(false, "TPT 75K preset present"); return }
+    eq(tpt75.trailingDrawdown, 2500, "TPT 75K trailing DD = $2,500 (v3 sourced)")
+    eq(tpt75.maxPositionSize, 9, "TPT 75K max position = 9 (v3 sourced)")
+    guard let tpt100 = find("Take Profit Trader", "100K") else { ok(false, "TPT 100K preset present"); return }
+    eq(tpt100.trailingDrawdown, 3000, "TPT 100K trailing DD = $3,000 (v3 sourced)")
+    eq(tpt100.maxPositionSize, 12, "TPT 100K max position = 12 (v3 sourced)")
+    guard let tpt150 = find("Take Profit Trader", "150K") else { ok(false, "TPT 150K preset present"); return }
+    eq(tpt150.trailingDrawdown, 4500, "TPT 150K trailing DD = $4,500 (v3 sourced)")
+    eq(tpt150.maxPositionSize, 15, "TPT 150K max position = 15 (v3 sourced)")
+
     guard let fn = find("FundedNext Flex", "50K") else { ok(false, "FundedNext 50K preset present"); return }
     eq(fn.trailingDrawdown, 1500, "FundedNext Flex 50K trailing DD = $1,500 (sourced)")
     eq(fn.maxPositionSize, 3, "FundedNext Flex 50K max position = 3 (sourced)")
 
-    // The [unverified-blocked] Tradeify 25K trailing cell must stay user-entered (0), never guessed.
+    // v3: FundedNext Bolt (50K only) — DLL $1,000 soft breach / max loss $2,000 EOD trailing / 3 mini.
+    guard let bolt = find("FundedNext Bolt", "50K") else { ok(false, "FundedNext Bolt 50K preset present"); return }
+    eq(bolt.dailyLossLimit, 1000, "FundedNext Bolt 50K daily-loss = $1,000 (v3 sourced, soft breach)")
+    eq(bolt.trailingDrawdown, 2000, "FundedNext Bolt 50K max loss / trailing DD = $2,000 (v3 sourced)")
+    eq(bolt.maxPositionSize, 3, "FundedNext Bolt 50K max position = 3 minis (v3 sourced)")
+
+    // v3 (firm page updated 2026-06-18): Tradeify 25K Growth trailing RESOLVED to $1,000 (v2 N/A retired).
     guard let t25 = find("Tradeify Growth", "25K") else { ok(false, "Tradeify 25K preset present"); return }
-    eq(t25.trailingDrawdown, 0, "Tradeify 25K trailing prints N/A on the firm's page -> user-entered (0)")
-    eq(t25.dailyLossLimit, 600, "Tradeify 25K daily-loss = $600 (sourced) even when trailing is blocked")
+    eq(t25.trailingDrawdown, 1000, "Tradeify 25K Growth trailing DD = $1,000 (v3 sourced; lock @ $26,100)")
+    eq(t25.dailyLossLimit, 600, "Tradeify 25K daily-loss = $600 (sourced)")
 
     // Invariants across EVERY sourced preset: a firm-domain source, at least one real cap, editable,
     // and it actually gates a signal (proves the pre-fill flows into the same honest gate math).
@@ -1818,19 +1838,40 @@ func testSourcedPresetCitationInvariant() {
     func cell(_ firm: String, _ size: String) -> RuleProfilePresets.SourcedPreset? {
         presets.first { $0.firm == firm && $0.accountLabel == size }
     }
-    // Apex Intraday PA daily-loss is scaling-tier-based at EVERY size → user-entered (0).
+    // Apex Intraday PA daily-loss is scaling-tier-based at EVERY size → user-entered (0). Apex EOD/Legacy
+    // per-size dollars stay [unverified-blocked] (firm renders them as an image / Zendesk 403) → not encoded at all.
     for size in ["25K", "50K", "100K", "150K"] {
         if let a = cell("Apex Intraday PA", size) {
             eq(a.dailyLossLimit, 0, "Apex \(size): tier-based daily-loss stays 0 (uncited)")
         }
     }
-    // Tradeify 25K trailing drawdown prints N/A on the firm page → user-entered (0).
-    if let t = cell("Tradeify Growth", "25K") { eq(t.trailingDrawdown, 0, "Tradeify 25K trailing stays 0 (firm prints N/A)") }
-    // Take Profit Trader: only 50K renders statically → no other size may be pre-filled at all.
+    ok(!presets.contains { $0.firm.contains("Apex") && ($0.firm.contains("EOD") || $0.firm.contains("Legacy")) },
+       "Apex EOD/Legacy per-size stays [unverified-blocked] — no guessed dollars encoded")
+    // v3 (firm page updated 2026-06-18): Tradeify 25K Growth trailing is now firm-sourced = $1,000 (not N/A),
+    // and it must carry a firm-primary citation like any encoded cap.
+    if let t = cell("Tradeify Growth", "25K") {
+        eq(t.trailingDrawdown, 1000, "Tradeify 25K Growth trailing = $1,000 (v3 firm-sourced, lock @ $26,100)")
+        ok(t.sourceURL.hasPrefix("https://"), "Tradeify 25K trailing carries a firm-primary citation")
+    }
+    // v3: Take Profit Trader now renders ALL five sizes from its firm Zendesk help center → all pre-filled.
     let tptSizes = presets.filter { $0.firm == "Take Profit Trader" }.map { $0.accountLabel }
-    ok(tptSizes == ["50K"], "TPT: only the statically-exposed 50K size is pre-filled (others user-entered)")
-    // Take Profit Trader has no daily-loss limit on any account → 0 (honest, not fabricated).
-    if let tpt = cell("Take Profit Trader", "50K") { eq(tpt.dailyLossLimit, 0, "TPT 50K daily-loss stays 0 (firm has none)") }
+    ok(tptSizes == ["25K", "50K", "75K", "100K", "150K"], "TPT: all five firm-Zendesk-sourced sizes are pre-filled (v3)")
+    // Take Profit Trader has no daily-loss limit on any account → 0 (honest, not fabricated) at every size.
+    for size in tptSizes {
+        if let tpt = cell("Take Profit Trader", size) { eq(tpt.dailyLossLimit, 0, "TPT \(size) daily-loss stays 0 (firm has none)") }
+    }
+
+    // TEETH (regression lock): the invariant's core guard — a non-zero cap with an empty sourceURL — must be
+    // exactly what gets rejected. Plant such a preset locally and assert the guard predicate would fire on it.
+    // (Proves the citation invariant still has teeth without polluting the shipped `sourcedPresets`.)
+    let planted = RuleProfilePresets.SourcedPreset(firm: "PLANTED-UNCITED", accountLabel: "X",
+        dailyLossLimit: 999, trailingDrawdown: 0, maxPositionSize: 0, sourceURL: "", note: "planted teeth check")
+    let plantedHasNonZero = planted.dailyLossLimit > 0 || planted.trailingDrawdown > 0 || planted.maxPositionSize > 0
+    ok(plantedHasNonZero && planted.sourceURL.isEmpty,
+       "citation-invariant teeth: a non-zero cap with an empty sourceURL is exactly what the guard rejects")
+    ok(!presets.contains { p in
+            (p.dailyLossLimit > 0 || p.trailingDrawdown > 0 || p.maxPositionSize > 0) && p.sourceURL.isEmpty
+        }, "no shipped sourced preset carries an uncited (empty-sourceURL) non-zero cap")
 }
 
 // ===== TR-18 Discipline cockpit (pure compliance math on the buyer's OWN fills) =====
@@ -2290,29 +2331,29 @@ func testWindowLaunchOrderingContract() {
 }
 
 func testBuildNumberContract() {
-    let expectedBuild = "<key>CFBundleVersion</key><string>23</string>"
+    let expectedBuild = "<key>CFBundleVersion</key><string>24</string>"
     for file in ["build.command", "build-signed.command"] {
         guard let src = try? String(contentsOfFile: file, encoding: .utf8) else {
             ok(false, "[source] \(file) readable for build-number contract"); continue
         }
-        ok(src.contains(expectedBuild), "[source] \(file) stamps Trading build 23")
+        ok(src.contains(expectedBuild), "[source] \(file) stamps Trading build 24")
         ok(src.contains("universal2") && src.contains("build_trd_arch arm64") &&
            src.contains("build_trd_arch x86_64") && src.contains("lipo -create"),
            "[source] \(file) builds a universal2 Trading binary")
     }
     if let src = try? String(contentsOfFile: "build-developer-id.sh", encoding: .utf8) {
-        ok(src.contains("BUILD_NUMBER=\"${BUILD_NUMBER:-23}\""), "[source] Developer-ID build defaults to Trading build 23")
+        ok(src.contains("BUILD_NUMBER=\"${BUILD_NUMBER:-24}\""), "[source] Developer-ID build defaults to Trading build 24")
     } else {
         ok(false, "[source] build-developer-id.sh readable for build-number contract")
     }
     if let plist = try? String(contentsOfFile: "Sources/Info.plist", encoding: .utf8) {
-        ok(plist.contains("<key>CFBundleVersion</key>\n\t<string>23</string>"),
-           "[source] Sources/Info.plist CFBundleVersion is 23")
+        ok(plist.contains("<key>CFBundleVersion</key>\n\t<string>24</string>"),
+           "[source] Sources/Info.plist CFBundleVersion is 24")
     } else {
         ok(false, "[source] Sources/Info.plist readable for build-number contract")
     }
     if let project = try? String(contentsOfFile: "project.yml", encoding: .utf8) {
-        ok(project.contains("CFBundleVersion: \"23\""), "[source] project.yml CFBundleVersion is 23")
+        ok(project.contains("CFBundleVersion: \"24\""), "[source] project.yml CFBundleVersion is 24")
     } else {
         ok(false, "[source] project.yml readable for build-number contract")
     }

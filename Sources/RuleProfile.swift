@@ -329,11 +329,19 @@ struct DisciplineCockpit: Equatable {
 
 // Blank firm-named templates + SOURCED presets. Blank templates ship for firms with no fetched
 // figures (buyer enters every number). SOURCED presets pre-fill only cells company-researcher
-// fetched from each firm's OWN help page on 2026-07-12 (`propfirm-rules-v2-2026-07-12.md`),
-// each carrying that firm-primary `sourceURL`. §5.1 encoding rule: a cell's confidence is its own —
-// only `[confirmed]`/`[single-source]` cells are encoded; `[unverified-blocked]` and tier-based
-// cells stay 0 (user-entered). EVERY field remains editable in the profile editor; rules change
-// often, so a preset is a cited starting point the buyer confirms, never an authority.
+// fetched from each firm's OWN help page, refreshed 2026-07-14 (`propfirm-rules-v3-2026-07-14.md`,
+// which supersedes the v2 blocked cells), each carrying that firm-primary `sourceURL`. §5.1 encoding
+// rule: a cell's confidence is its own — only `[confirmed]`/`[confirmed-derived]`/`[single-source]`
+// cells are encoded; `[unverified-blocked]` and tier-based cells stay 0 (user-entered). EVERY field
+// remains editable in the profile editor; rules change often, so a preset is a cited starting point
+// the buyer confirms, never an authority.
+//
+// v3 (2026-07-14) cleared prior blocks: Take Profit Trader now covers ALL five sizes (25/50/75/100/150K)
+// from the firm's OWN Zendesk help center (Rule 1/2/3 articles), and Tradeify's restructured page
+// (updated 2026-06-18) resolves the 25K Growth trailing drawdown = $1,000 (retiring the v2 N/A) and
+// corrects Growth 100K→$3,500 / 150K→$5,000 to the firm's verbatim lock-trigger values. FundedNext
+// Bolt (50K only) is added. Apex EOD + Legacy per-size dollars remain [unverified-blocked] (firm pages
+// render them only as an image / Zendesk API 403) → those stay 0, never invented.
 enum RuleProfilePresets {
     struct Template: Identifiable { let name: String; let note: String; var id: String { name } }
 
@@ -379,13 +387,19 @@ enum RuleProfilePresets {
         }
     }
 
-    // Firm-primary source URLs (fetched 2026-07-12) — kept beside the data they cite.
+    // Firm-primary source URLs — kept beside the data they cite (v2 fetch 2026-07-12; v3 2026-07-14).
     private static let urlFundedNext = "https://helpfutures.fundednext.com/en/articles/14878751-what-is-fundednext-futures-flex-challenge"
-    private static let urlTPT = "https://takeprofittrader.com/"
+    private static let urlFundedNextBolt = "https://fundednext.com/futures/bolt"
+    // TPT per-size caps come from the firm's OWN Zendesk help center (v3, 2026-07-14). Rule 3 (EOD max
+    // trailing drawdown) is the source for the headline trailing cap encoded below; Rule 2 (max position
+    // size) sources the contract cap. Both are firm-owned takeprofittraderhelp.zendesk.com articles.
+    private static let urlTPT = "https://takeprofittraderhelp.zendesk.com/hc/en-us/articles/15170265979165-Rule-3-Do-Not-Hit-End-Of-Day-EOD-Maximum-Trailing-Drawdown"
     private static let urlTradeify = "https://help.tradeify.co/en/articles/10495897-rules-trailing-max-drawdowns"
     private static let urlApex = "https://apextraderfunding.com/help-center/intraday-trailing-drawdown-accounts/intraday-trailing-drawdown-performance-accounts-pa/"
 
-    // All [confirmed] cells from propfirm-rules-v2-2026-07-12.md. Grouped by firm, ascending size.
+    // Cited cells from propfirm-rules-v3-2026-07-14.md (supersedes v2 blocked cells). Grouped by
+    // firm, ascending size. Every non-zero cap carries a firm-primary https sourceURL; [unverified-blocked]
+    // cells (Apex EOD/Legacy $, Apex tier-based daily-loss) stay 0.
     static let sourcedPresets: [SourcedPreset] = [
         // FundedNext Futures — Flex (end-of-day trailing). Flex has NO daily-loss limit.
         SourcedPreset(firm: "FundedNext Flex", accountLabel: "50K",  dailyLossLimit: 0, trailingDrawdown: 1500, maxPositionSize: 3,
@@ -395,19 +409,36 @@ enum RuleProfilePresets {
         SourcedPreset(firm: "FundedNext Flex", accountLabel: "150K", dailyLossLimit: 0, trailingDrawdown: 4000, maxPositionSize: 8,
                       sourceURL: urlFundedNext, note: "Flex — end-of-day trailing drawdown; no daily-loss limit. Cap = mini contracts."),
 
-        // Take Profit Trader — no daily-loss limit on any account; only 50K renders statically.
-        SourcedPreset(firm: "Take Profit Trader", accountLabel: "50K", dailyLossLimit: 0, trailingDrawdown: 2000, maxPositionSize: 6,
-                      sourceURL: urlTPT, note: "No daily-loss limit on any account. Trailing = end-of-day (Test/PRO+) or intraday (PRO). Other sizes: enter yourself."),
+        // FundedNext Futures — Bolt (50K ONLY). Daily-loss = soft breach; max loss = EOD trailing (hard).
+        // FLAG (v3): a help-center listing indicated Bolt/Rapid may close to new purchases/resets effective
+        // 2026-07-10 [unverified] — valid for existing accounts; verify buyability before surfacing as buyable.
+        SourcedPreset(firm: "FundedNext Bolt", accountLabel: "50K", dailyLossLimit: 1000, trailingDrawdown: 2000, maxPositionSize: 3,
+                      sourceURL: urlFundedNextBolt, note: "Bolt (50K only) — daily-loss $1,000 soft breach (pauses to EOD); max loss $2,000 EOD trailing; profit target $3,000; 3 mini / 9 micro. Verify purchasability (2026-07-10 close flag)."),
+
+        // Take Profit Trader — no daily-loss limit on any account. v3: ALL five sizes now firm-Zendesk sourced
+        // (Rule 1/2/3 articles). Trailing = EOD (Test/PRO+) or intraday (PRO); the $ is identical, only the window differs.
+        SourcedPreset(firm: "Take Profit Trader", accountLabel: "25K",  dailyLossLimit: 0, trailingDrawdown: 1500, maxPositionSize: 3,
+                      sourceURL: urlTPT, note: "No daily-loss limit. Trailing = EOD (Test/PRO+) or intraday (PRO). Profit target $1,500; cap = 3 minis / 30 micros."),
+        SourcedPreset(firm: "Take Profit Trader", accountLabel: "50K",  dailyLossLimit: 0, trailingDrawdown: 2000, maxPositionSize: 6,
+                      sourceURL: urlTPT, note: "No daily-loss limit. Trailing = EOD (Test/PRO+) or intraday (PRO). Profit target $3,000; cap = 6 minis / 60 micros."),
+        SourcedPreset(firm: "Take Profit Trader", accountLabel: "75K",  dailyLossLimit: 0, trailingDrawdown: 2500, maxPositionSize: 9,
+                      sourceURL: urlTPT, note: "No daily-loss limit. Trailing = EOD (Test/PRO+) or intraday (PRO). Profit target $4,500; cap = 9 minis / 90 micros."),
+        SourcedPreset(firm: "Take Profit Trader", accountLabel: "100K", dailyLossLimit: 0, trailingDrawdown: 3000, maxPositionSize: 12,
+                      sourceURL: urlTPT, note: "No daily-loss limit. Trailing = EOD (Test/PRO+) or intraday (PRO). Profit target $6,000; cap = 12 minis / 120 micros."),
+        SourcedPreset(firm: "Take Profit Trader", accountLabel: "150K", dailyLossLimit: 0, trailingDrawdown: 4500, maxPositionSize: 15,
+                      sourceURL: urlTPT, note: "No daily-loss limit. Trailing = EOD (Test/PRO+) or intraday (PRO). Profit target $9,000; cap = 15 minis / 150 micros."),
 
         // Tradeify — Growth (end-of-day trailing). Daily-loss = soft breach; trailing = hard breach.
-        SourcedPreset(firm: "Tradeify Growth", accountLabel: "25K",  dailyLossLimit: 600,  trailingDrawdown: 0,    maxPositionSize: 1,
-                      sourceURL: urlTradeify, note: "Growth — EOD trailing (hard breach); daily-loss soft breach (pauses the day). 25K trailing prints N/A — enter it yourself."),
+        // v3 (firm page updated 2026-06-18): 25K trailing RESOLVED = $1,000 (retires v2 N/A); Growth
+        // 100K→$3,500 and 150K→$5,000 corrected to the firm's verbatim lock-trigger values (start+DD+100).
+        SourcedPreset(firm: "Tradeify Growth", accountLabel: "25K",  dailyLossLimit: 600,  trailingDrawdown: 1000, maxPositionSize: 1,
+                      sourceURL: urlTradeify, note: "Growth — EOD trailing (hard breach); daily-loss soft breach (pauses the day). Trailing $1,000 (lock @ $26,100, v3)."),
         SourcedPreset(firm: "Tradeify Growth", accountLabel: "50K",  dailyLossLimit: 1250, trailingDrawdown: 2000, maxPositionSize: 4,
                       sourceURL: urlTradeify, note: "Growth — EOD trailing (hard breach); daily-loss soft breach (pauses the day)."),
-        SourcedPreset(firm: "Tradeify Growth", accountLabel: "100K", dailyLossLimit: 2500, trailingDrawdown: 4000, maxPositionSize: 8,
-                      sourceURL: urlTradeify, note: "Growth — EOD trailing (hard breach); daily-loss soft breach (pauses the day)."),
-        SourcedPreset(firm: "Tradeify Growth", accountLabel: "150K", dailyLossLimit: 3000, trailingDrawdown: 5250, maxPositionSize: 12,
-                      sourceURL: urlTradeify, note: "Growth — EOD trailing (hard breach); daily-loss soft breach (pauses the day)."),
+        SourcedPreset(firm: "Tradeify Growth", accountLabel: "100K", dailyLossLimit: 2500, trailingDrawdown: 3500, maxPositionSize: 8,
+                      sourceURL: urlTradeify, note: "Growth — EOD trailing (hard breach); daily-loss soft breach (pauses the day). Trailing $3,500 (firm example, v3)."),
+        SourcedPreset(firm: "Tradeify Growth", accountLabel: "150K", dailyLossLimit: 3000, trailingDrawdown: 5000, maxPositionSize: 12,
+                      sourceURL: urlTradeify, note: "Growth — EOD trailing (hard breach); daily-loss soft breach (pauses the day). Trailing $5,000 (lock @ $155,100, v3)."),
 
         // Apex Trader Funding — Intraday Trailing PA. Daily-loss is scaling-tier-based (user-entered).
         SourcedPreset(firm: "Apex Intraday PA", accountLabel: "25K",  dailyLossLimit: 0, trailingDrawdown: 1000, maxPositionSize: 2,
