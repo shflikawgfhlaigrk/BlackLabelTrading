@@ -1468,6 +1468,62 @@ func testNoAPIWebhookIngestionContract() {
        "feed UI does not ask for prop-account API credentials")
 }
 
+// entitlementKeys — the <key> names GRANTED by an entitlements plist, judged by the <dict> alone.
+// XML comments are stripped first: the rationale comment in app-developerid.entitlements deliberately
+// NAMES allow-dyld-environment-variables to explain why it is withheld, so a whole-file substring
+// check would read that prose as a grant and fire on a clean tree. Only a real <key> counts.
+func entitlementKeys(_ rel: String) -> [String] {
+    var text = source(rel)
+    while let open = text.range(of: "<!--"),
+          let close = text.range(of: "-->", range: open.upperBound..<text.endIndex) {
+        text.removeSubrange(open.lowerBound..<close.upperBound)
+    }
+    var keys: [String] = []
+    var rest = Substring(text)
+    while let open = rest.range(of: "<key>"),
+          let close = rest.range(of: "</key>", range: open.upperBound..<rest.endIndex) {
+        keys.append(String(rest[open.upperBound..<close.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines))
+        rest = rest[close.upperBound...]
+    }
+    return keys
+}
+
+// ===== Entitlements hardening (b25) — the bytes the Developer-ID ship signs with =====
+// allow-dyld-environment-variables must stay ABSENT. It governs DYLD_* variables only; nothing in the
+// app sets one — launch-backend.sh passes PYTHONPATH, a plain interpreter var the hardened runtime
+// never strips. Granting it alongside disable-library-validation (which the bundled CPython genuinely
+// needs) would re-open DYLD_INSERT_LIBRARIES injection of unsigned dylibs into a notarized,
+// Developer-ID-trusted process. disable-library-validation must stay PRESENT or the backend can't load
+// its .so extensions. Both halves are asserted per file: absence alone would pass on an empty read.
+func testEntitlementsHardeningContract() {
+    let dyldEnv = "com.apple.security.cs.allow-dyld-environment-variables"
+    let libVal = "com.apple.security.cs.disable-library-validation"
+
+    for file in ["Sources/app-developerid.entitlements", "Sources/app.entitlements"] {
+        let keys = entitlementKeys(file)
+        // Positive control: a wrong/empty path yields no keys, which would otherwise read as
+        // "no forbidden entitlement granted" — i.e. clean by vacuity.
+        ok(!keys.isEmpty, "[entitlements] \(file) parsed at least one granted key")
+        ok(keys.contains(libVal), "[entitlements] \(file) GRANTS disable-library-validation")
+        ok(!keys.contains(dyldEnv), "[entitlements] \(file) does NOT grant allow-dyld-environment-variables")
+        ok(!keys.contains("com.apple.security.app-sandbox"),
+           "[entitlements] \(file) does NOT grant app-sandbox (would break the backend spawn)")
+    }
+
+    // The reason the entitlement is not needed, asserted against the launcher it describes.
+    let launcher = source("backend/launch-backend.sh")
+    ok(launcher.contains("export PYTHONPATH="),
+       "[entitlements] launcher imports bundled modules via PYTHONPATH")
+    ok(!launcher.contains("DYLD_"),
+       "[entitlements] launcher sets no DYLD_* variable, so no dyld-env entitlement is needed")
+
+    // The rationale must survive in the shipped file — a future reader who deletes it loses the
+    // reason and re-grants the entitlement. Asserted on the raw text, not the parsed keys.
+    let raw = source("Sources/app-developerid.entitlements")
+    ok(raw.contains("intentionally NOT granted"),
+       "[entitlements] Developer-ID file documents why the dyld-env entitlement is withheld")
+}
+
 // ===== ChartRender — headless chart + engine-trade overlay (edge-gate transparency) =====
 // Locks that the renderer survives every honest input shape: a full fire (entry/stop/target), a
 // fire with nil legs (no stop/no target), a CLOSED fire (outcome set), and empty bars (no-data
@@ -2331,29 +2387,29 @@ func testWindowLaunchOrderingContract() {
 }
 
 func testBuildNumberContract() {
-    let expectedBuild = "<key>CFBundleVersion</key><string>24</string>"
+    let expectedBuild = "<key>CFBundleVersion</key><string>25</string>"
     for file in ["build.command", "build-signed.command"] {
         guard let src = try? String(contentsOfFile: file, encoding: .utf8) else {
             ok(false, "[source] \(file) readable for build-number contract"); continue
         }
-        ok(src.contains(expectedBuild), "[source] \(file) stamps Trading build 24")
+        ok(src.contains(expectedBuild), "[source] \(file) stamps Trading build 25")
         ok(src.contains("universal2") && src.contains("build_trd_arch arm64") &&
            src.contains("build_trd_arch x86_64") && src.contains("lipo -create"),
            "[source] \(file) builds a universal2 Trading binary")
     }
     if let src = try? String(contentsOfFile: "build-developer-id.sh", encoding: .utf8) {
-        ok(src.contains("BUILD_NUMBER=\"${BUILD_NUMBER:-24}\""), "[source] Developer-ID build defaults to Trading build 24")
+        ok(src.contains("BUILD_NUMBER=\"${BUILD_NUMBER:-25}\""), "[source] Developer-ID build defaults to Trading build 25")
     } else {
         ok(false, "[source] build-developer-id.sh readable for build-number contract")
     }
     if let plist = try? String(contentsOfFile: "Sources/Info.plist", encoding: .utf8) {
-        ok(plist.contains("<key>CFBundleVersion</key>\n\t<string>24</string>"),
-           "[source] Sources/Info.plist CFBundleVersion is 24")
+        ok(plist.contains("<key>CFBundleVersion</key>\n\t<string>25</string>"),
+           "[source] Sources/Info.plist CFBundleVersion is 25")
     } else {
         ok(false, "[source] Sources/Info.plist readable for build-number contract")
     }
     if let project = try? String(contentsOfFile: "project.yml", encoding: .utf8) {
-        ok(project.contains("CFBundleVersion: \"24\""), "[source] project.yml CFBundleVersion is 24")
+        ok(project.contains("CFBundleVersion: \"25\""), "[source] project.yml CFBundleVersion is 25")
     } else {
         ok(false, "[source] project.yml readable for build-number contract")
     }
@@ -2380,6 +2436,7 @@ testFeedSymbolsPicker()
 testTradingSymbolScope()
 testProductSurfaceSymbolScopeContract()
 testNoAPIWebhookIngestionContract()
+testEntitlementsHardeningContract()
 
 // Engine roster + fire feed decode (the /api/screen + /api/fires wire contract)
 testEngineRosterDecode()

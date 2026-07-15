@@ -31,7 +31,7 @@ BUNDLE_ID="com.blacklabel.trading"
 TEAM="745ZPGFRA5"
 ENTS="$SRC/app-developerid.entitlements"
 NOTARY_PROFILE="${NOTARY_PROFILE:-BL_NOTARY}"
-BUILD_NUMBER="${BUILD_NUMBER:-24}"
+BUILD_NUMBER="${BUILD_NUMBER:-25}"
 PY_RUNTIME_SRC="${BLTD_PYTHON_RUNTIME:-$ROOT/vendor/python-runtime}"
 SUBMIT="${SUBMIT:-0}"
 INSTALL=0
@@ -232,6 +232,10 @@ ENTDUMP="$(codesign -d --entitlements - "$APP" 2>/dev/null || true)"
 echo "$ENTDUMP" | grep -q 'app-sandbox'  && { echo "FAIL: app-sandbox must NOT be present for the Developer-ID backend-spawn build" >&2; exit 1; } || true
 echo "$ENTDUMP" | grep -q 'applesignin' && { echo "FAIL: applesignin must NOT be present (AMFI SIGKILL without a profile)" >&2; exit 1; } || true
 echo "$ENTDUMP" | grep -q 'disable-library-validation' || { echo "FAIL: disable-library-validation missing (python backend won't load its libs)" >&2; exit 1; }
+# b25: assert on the SIGNED bytes, not just the source plist — this dump is the only surface that
+# shows what codesign actually embedded. Paired with disable-library-validation above, granting this
+# would re-enable DYLD_INSERT_LIBRARIES injection of unsigned dylibs into a notarized process.
+echo "$ENTDUMP" | grep -q 'allow-dyld-environment-variables' && { echo "FAIL: allow-dyld-environment-variables must NOT be present (nothing sets DYLD_*; it would re-open dylib injection)" >&2; exit 1; } || true
 
 # --- Gatekeeper assessment (informational for adhoc; real verdict needs notarization) ----
 echo "==> spctl -a -t exec assessment:"
