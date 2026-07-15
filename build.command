@@ -20,8 +20,8 @@ BIN_NAME="Black Label Trading"
 BUNDLE_ID="com.blacklabel.trading"
 
 # --- mode flags --------------------------------------------------------------
-# --devid   : sign Developer-ID + hardened runtime + NON-sandbox entitlements (app-devid.entitlements,
-#             an empty dict) — notarization-ready, and the ONLY build the in-app updater can
+# --devid   : sign Developer-ID + hardened runtime + NON-sandbox entitlements (app-developerid.entitlements
+#             — network.client + disable-library-validation) — notarization-ready, and the ONLY build the in-app updater can
 #             self-replace (the sandbox forbids self-replace). The adhoc default path is unchanged.
 # --install : after building, install the fresh bundle into /Applications (atomic swap).
 DEVID=0; INSTALL=0
@@ -31,7 +31,13 @@ if [[ "$INSTALL" == "1" && "$DEVID" != "1" ]]; then
   exit 64
 fi
 
-DEVID_ENTITLEMENTS="$SRC/app-devid.entitlements"
+# DEVID and ADHOC both sign with the HARDENED, non-sandbox Developer-ID entitlements
+# (network.client + disable-library-validation). The bundled Python backend loads unsigned
+# .so extensions, so library validation MUST be disabled on BOTH paths or the backend fails
+# to start. The near-namesake app-devid.entitlements is an EMPTY <dict> and must NOT be used
+# here — Tests/devid-entitlements-contract.sh guards this pointer. (See CHARTER §5.9 / memory
+# "trading-two-entitlements-files-devid-is-an-empty-dict".)
+DEVID_ENTITLEMENTS="$SRC/app-developerid.entitlements"
 ADHOC_ENTITLEMENTS="$SRC/app-developerid.entitlements"
 DEVID_IDENTITY=""
 if [ "$DEVID" = "1" ]; then
@@ -192,7 +198,7 @@ fi
 # the restricted applesignin entitlement (AMFI SIGKILLs an ad-hoc app that carries applesignin).
 # The Apple button is runtime-gated on the entitlement, so this build hides it. For a notarizable,
 # distributable bundle use ./build-developer-id.sh (hardened runtime + Developer ID + spctl/notary).
-echo "==> Signing ($([ "$DEVID" = "1" ] && echo "Developer-ID + hardened runtime + non-sandbox (app-devid.entitlements)" || echo "adhoc with Developer-ID entitlements"))"
+echo "==> Signing ($([ "$DEVID" = "1" ] && echo "Developer-ID + hardened runtime + non-sandbox (app-developerid.entitlements)" || echo "adhoc with Developer-ID entitlements"))"
 sign_bundle "$APP"
 codesign --verify --deep --strict "$APP"
 

@@ -69,6 +69,7 @@ echo "==> Black Label Trading :: combined test gate"
 run_suite "swift-logic"    bash "$ROOT/Tests/run-tests.sh"
 run_suite "backend-engine" bash "$ROOT/backend/run-tests.sh"
 run_suite "submission-contract" bash "$ROOT/Tests/submission-contract.sh"
+run_suite "devid-entitlements" bash "$ROOT/Tests/devid-entitlements-contract.sh"
 
 # TR-10 PERMANENT zero-claims linter — scans the shipped source surface, and the built binary too
 # when present. This is the standing mechanism (⛔H1): no fabricated win-rate / P&L / return / track-
