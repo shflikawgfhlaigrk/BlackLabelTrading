@@ -86,6 +86,14 @@ CONFIG_DEFAULTS = {
     # alert/signal delivery channels (the daemon writes a fire; channels mirror it out)
     "alertSound": True,
     "alertWebhook": "",        # POST each fire as JSON to this URL (e.g. Discord/Slack)
+    # TR-06 honest edge-gate ALERT channel (bltd_alerts): posts the gate VERDICT — incl. "no edge" —
+    # to an endpoint the buyer owns. OFF by default; empty endpoint => zero egress. Never a relay,
+    # never an aggregate win-rate/$ figure. See bltd_alerts.py for the full posture.
+    "alertEnabled": False,     # master switch; False => bltd_alerts makes no network call at all
+    "alertEndpoint": "",       # buyer's OWN https:// endpoint (ntfy topic / webhook / Shortcuts)
+    "alertProvider": "ntfy",   # ntfy | pushover | webhook — how the body is shaped
+    "alertPushoverToken": "",  # Pushover app token (buyer's own), only for the pushover provider
+    "alertPushoverUser": "",   # Pushover user key (buyer's own), only for the pushover provider
 }
 
 _CONFIG_RANGES = {
@@ -156,6 +164,101 @@ def futures_root_any(symbol) -> str:
         if 1 <= d <= 2 and i >= 1 and s[i] in _ES_MONTH_CODES:
             return s[:i]
     return s
+
+
+# ---------------------------------------------------------------------------
+# INSTRUMENT CLASSIFICATION (TR-05 multi-asset product layer).
+#
+# The capture layer is already instrument-agnostic (BLTD_SCOPE=all): the buyer's own browser bridge
+# streams whatever instruments they watch (ES, MNQ, CL, SPY, QQQ, …) straight into the SAME store via
+# the SAME on_candle path. What was missing was a PRODUCT surface that enumerates those instruments,
+# classifies each honestly, and states which ES-tuned modules do/do not apply. This section is that
+# classifier — PURE, no store, no network. It NEVER invents an instrument the buyer doesn't have; the
+# catalog (bltd_analytics.instruments) only ever classifies symbols already present in the buyer's bars.
+#
+# Point values are declared ONLY where the CME/exchange contract spec is genuinely known; an unmapped
+# instrument returns pointValue=None so the UI shows points, never dollars computed with a wrong (e.g.
+# ES $50) multiplier. Asset class is a real bucket, not a guess: a CME venue prefix + a known futures
+# root classifies as that future; a US-equity venue prefix classifies as an ETF/equity; anything else
+# is honestly labeled "other" rather than mis-bucketed.
+# ---------------------------------------------------------------------------
+
+# root -> ($ per 1.00 point, asset_class). Mirrors the Swift TradingSymbolScope.pointValues table and
+# extends it with the asset bucket. Only KNOWN specs are listed.
+_FUTURES_SPECS = {
+    # US equity-index futures (ES-family is handled separately as es_family=True)
+    "ES": (50.0, "us_index_future"),   "MES": (5.0, "us_index_future"),
+    "EP": (50.0, "us_index_future"),
+    "NQ": (20.0, "us_index_future"),   "MNQ": (2.0, "us_index_future"),
+    "YM": (5.0, "us_index_future"),    "MYM": (0.5, "us_index_future"),
+    "RTY": (50.0, "us_index_future"),  "M2K": (5.0, "us_index_future"),
+    # energy futures
+    "CL": (1000.0, "energy_future"),   "MCL": (100.0, "energy_future"),
+    "NG": (10000.0, "energy_future"),  "RB": (42000.0, "energy_future"),
+    "HO": (42000.0, "energy_future"),  "QM": (500.0, "energy_future"),
+    # metal futures
+    "GC": (100.0, "metal_future"),     "MGC": (10.0, "metal_future"),
+    "SI": (5000.0, "metal_future"),    "SIL": (1000.0, "metal_future"),
+    "HG": (25000.0, "metal_future"),   "PL": (50.0, "metal_future"),
+    # rates futures ($ per point of price)
+    "ZB": (1000.0, "rates_future"),    "ZN": (1000.0, "rates_future"),
+    "ZF": (1000.0, "rates_future"),    "ZT": (2000.0, "rates_future"),
+    "UB": (1000.0, "rates_future"),
+    # currency futures
+    "6E": (125000.0, "fx_future"),     "6J": (12500000.0, "fx_future"),
+    "6B": (62500.0, "fx_future"),      "6A": (100000.0, "fx_future"),
+    "6C": (100000.0, "fx_future"),
+    # crypto futures
+    "MBT": (0.1, "crypto_future"),     "MET": (0.1, "crypto_future"),
+}
+
+# US-equity venue prefixes seen from the browser bridge (WealthCharts emits US.SPY / US.QQQ / …).
+_EQUITY_VENUES = {"US", "NASDAQ", "NYSE", "ARCA", "BATS", "AMEX"}
+_FUTURES_VENUES = {"CM", "CME", "CBOT", "NYMEX", "COMEX", "GLOBEX"}
+
+
+def classify_instrument(symbol) -> dict:
+    """Classify ONE captured instrument symbol honestly. PURE. Returns a dict with:
+      symbol       — the raw symbol as captured (venue prefix preserved)
+      display      — clean normalized token (venue prefix stripped)
+      root         — futures root (ES/MNQ/CL) or the bare ticker for equities
+      assetClass   — real bucket: us_index_future / energy_future / metal_future / rates_future /
+                     fx_future / crypto_future / equity_etf / other
+      pointValue   — $ per 1.00 point when the contract spec is KNOWN, else None (UI shows points only)
+      esFamily     — True only for ES/MES (root or dated contract)
+      esModules    — True only when the ES-tuned Session/SMT modules genuinely apply (== esFamily);
+                     the picker/factor UI labels these ES-only on every other instrument.
+    Nothing is fabricated: an unknown instrument is labeled 'other' with pointValue None, never guessed.
+    """
+    raw = str(symbol or "").strip()
+    display = normalize_symbol(raw)
+    venue = raw.split(".")[0].strip().upper() if "." in raw else ""
+    root = futures_root_any(raw)
+    es_family = is_es_symbol(raw)
+
+    if es_family:
+        asset_class, point_value = "us_index_future", _FUTURES_SPECS.get(root, (50.0, "us_index_future"))[0]
+    elif root in _FUTURES_SPECS:
+        point_value, asset_class = _FUTURES_SPECS[root]
+    elif venue in _EQUITY_VENUES:
+        # A US-equity venue instrument. ETF vs single-name is not decidable from the ticker alone, so
+        # we bucket honestly as equity_etf (equities + ETFs) and never claim a futures point value.
+        asset_class, point_value = "equity_etf", None
+    elif venue in _FUTURES_VENUES and root == display and display.isalpha():
+        # A futures-venue root we don't have a spec for: it IS a future, but we won't fake a multiplier.
+        asset_class, point_value = "other_future", None
+    else:
+        asset_class, point_value = "other", None
+
+    return {
+        "symbol": raw or display,
+        "display": display,
+        "root": root,
+        "assetClass": asset_class,
+        "pointValue": point_value,
+        "esFamily": es_family,
+        "esModules": es_family,
+    }
 
 
 def in_scope(symbol) -> bool:
@@ -575,19 +678,38 @@ def _edge_proven(trades, wins, n, expectancy, min_trades, target_r=None):
     return _edge_pvalue(trades, wins, n, expectancy, min_trades, target_r) < SIG_ALPHA
 
 
+def _max_drawdown_r(trades):
+    """Peak-to-trough drawdown of the cumulative-R equity curve over the OOS trade sequence, in R
+    units (>=0). Honest worst-case pain, not a return claim — computed straight from the same trade
+    R's the edge stat uses, in chronological order. 0.0 for an empty/monotonic-up series."""
+    peak = 0.0
+    cum = 0.0
+    max_dd = 0.0
+    for t in trades:
+        cum += t["r"]
+        if cum > peak:
+            peak = cum
+        dd = peak - cum
+        if dd > max_dd:
+            max_dd = dd
+    return round(max_dd, 4)
+
+
 def _summarize(trades, min_trades=MIN_TRADES, target_r=None):
     n = len(trades)
     if n == 0:
-        return {"trades": 0, "wins": 0, "winRate": 0.0, "expectancyR": 0.0, "netPts": 0.0,
-                "edgeProven": False, "pEdge": 1.0, "reason": "no trades triggered on this series"}
+        return {"trades": 0, "wins": 0, "losses": 0, "winRate": 0.0, "expectancyR": 0.0,
+                "netPts": 0.0, "maxDrawdownR": 0.0, "edgeProven": False, "pEdge": 1.0,
+                "reason": "no trades triggered on this series"}
     rs = [t["r"] for t in trades]
     wins = sum(1 for r in rs if r > 0)
     total_r = sum(rs)
     expectancy = total_r / n
     net_pts = sum((t["exit"] - t["entry"]) if t["dir"] == "long" else (t["entry"] - t["exit"]) for t in trades)
     p_edge = _edge_pvalue(trades, wins, n, expectancy, min_trades, target_r)
-    return {"trades": n, "wins": wins, "winRate": round(wins / n, 4),
+    return {"trades": n, "wins": wins, "losses": n - wins, "winRate": round(wins / n, 4),
             "expectancyR": round(expectancy, 4), "netPts": round(net_pts, 4),
+            "maxDrawdownR": _max_drawdown_r(trades),
             "edgeProven": p_edge < SIG_ALPHA, "pEdge": round(p_edge, 6), "reason": ""}
 
 
@@ -1056,6 +1178,20 @@ PROVERS = {"meanrev": prove_meanrev, "breakout": prove_breakout, "research": pro
            "channel": prove_channel, "context_a": prove_context_a, "context_b": prove_context_b}
 
 
+def prover_source_sha() -> str:
+    """sha256 (16-hex) of THIS prover module's source — the exact edge-gate math a verdict was
+    computed with. Reproducible by the buyer: `shasum -a 256 bltd_store.py`. So a re-run the buyer
+    triggers on their own bars carries the fingerprint of the code that produced it, and any change
+    to the gate math changes the fingerprint. Same computation gen_reference.py stamps onto the
+    reference artifact, exposed here so the live re-run endpoint can stamp it identically."""
+    import hashlib
+    try:
+        with open(__file__, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()[:16]
+    except OSError:
+        return "unknown"
+
+
 # ===========================================================================
 # The own SQLite store.
 # ===========================================================================
@@ -1430,6 +1566,33 @@ class Store:
         # tolerate null o/h/l (close-only history) by falling back to close
         return [((o if o is not None else c), (h if h is not None else c),
                  (l if l is not None else c), c) for (o, h, l, c) in rows]
+
+    def ohlc_between(self, symbol: str, start_ts=None, end_ts=None, limit: int = 20000):
+        """A symbol's bars as [(o,h,l,c), ...] oldest->newest, optionally restricted to the closed
+        epoch-second window [start_ts, end_ts] — the date-scoped input for the no-code backtest lab.
+        Same null-tolerant close fallback as ohlc(). Out-of-scope symbol -> [] (honest)."""
+        if not in_scope(symbol):
+            return []
+        clauses = ["symbol=?"]
+        params: list = [symbol]
+        if start_ts is not None:
+            clauses.append("ts>=?"); params.append(int(start_ts))
+        if end_ts is not None:
+            clauses.append("ts<=?"); params.append(int(end_ts))
+        params.append(int(limit))
+        rows = self._q("SELECT o,h,l,c FROM bars WHERE " + " AND ".join(clauses)
+                       + " ORDER BY ts LIMIT ?", tuple(params))
+        return [((o if o is not None else c), (h if h is not None else c),
+                 (l if l is not None else c), c) for (o, h, l, c) in rows]
+
+    def bar_bounds(self, symbol: str) -> dict:
+        """First/last captured epoch-second timestamp + bar count for a symbol — so the lab can show
+        the buyer the real span of their OWN data and default the date range to it. Empty -> zeros."""
+        if not in_scope(symbol):
+            return {"symbol": symbol, "count": 0, "firstTs": None, "lastTs": None}
+        r = self._q("SELECT COUNT(*), MIN(ts), MAX(ts) FROM bars WHERE symbol=?", (symbol,))
+        n, lo, hi = (r[0] if r else (0, None, None))
+        return {"symbol": symbol, "count": int(n or 0), "firstTs": lo, "lastTs": hi}
 
     def config(self) -> dict:
         """The current buyer config (defaults + persisted overrides, range-clamped)."""

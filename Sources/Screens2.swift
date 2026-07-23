@@ -669,6 +669,8 @@ struct AlertEditor: View {
 
 // MARK: - Backtest screen
 struct BacktestScreen: View {
+    @EnvironmentObject var feed: FeedClient
+    @EnvironmentObject var nav: Nav
     @State private var csvText = ""
     @State private var bars: [Bar] = []
     @State private var skipped = 0
@@ -681,6 +683,25 @@ struct BacktestScreen: View {
     @State private var mcRuns = 1000
     @State private var mcCapital = 50000.0
     @State private var mc: MonteCarloResult? = nil
+    // No-code edge-gate lab (item 10): pick engine + instrument + date range over the buyer's OWN
+    // captured bars, run the SHIPPED prover, show per-fold n/W-L/maxDrawdownR/p + prover_sha.
+    @State private var labEngine = "meanrev"
+    @State private var labSymbol = ""
+    @State private var labFolds = 3
+    @State private var labSymbols: [String] = []
+    @State private var labUseRange = false
+    @State private var labStart = Date().addingTimeInterval(-86_400 * 30)
+    @State private var labEnd = Date()
+    @State private var labBoundsNote = ""
+    @State private var labReport: BacktestLabReport? = nil
+    @State private var labRunning = false
+
+    // TR-19 own-silicon parameter-sweep FARM: fan the SHIPPED prover's hyperparameter grid across
+    // this Mac's cores over the buyer's OWN bars. Over-fit-transparent (BH-FDR p per cell), no cloud.
+    @State private var farmEngine = "meanrev"
+    @State private var farmSymbol = ""
+    @State private var farmReport: BacktestFarmReport? = nil
+    @State private var farmRunning = false
 
     private var report: PerfReport? { result.map { Analytics.report($0.stats) } }
     private var panel: Analytics.RiskPanel? { result.map { Analytics.riskPanel($0.stats) } }
@@ -688,7 +709,17 @@ struct BacktestScreen: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
-                ScreenTitle(title: "Backtest", subtitle: "Test a rule set on YOUR own historical bars. Honest metrics on real data — never a fabricated track record.", icon: "clock.arrow.circlepath")
+                ScreenTitle(title: "Backtest", subtitle: "Run the SHIPPED edge-gate on YOUR captured bars — no code — or paste your own CSV to test a custom rule set. Honest metrics on real data, never a fabricated track record.", icon: "clock.arrow.circlepath")
+
+                labPanel
+
+                farmPanel
+
+                HStack(spacing: 10) {
+                    Rectangle().fill(BLTheme.stroke).frame(height: 1)
+                    Text("OR TEST A CUSTOM RULE SET ON PASTED BARS").font(.system(size: 9.5, weight: .bold, design: .rounded)).foregroundColor(BLTheme.sub).tracking(0.6).fixedSize()
+                    Rectangle().fill(BLTheme.stroke).frame(height: 1)
+                }.padding(.vertical, 2)
 
                 // Data input.
                 Panel(title: "1 · Your historical bars", icon: "square.and.arrow.down") {
@@ -763,6 +794,275 @@ struct BacktestScreen: View {
                 }
             }.padding(24)
         }
+    }
+
+    // MARK: - No-code edge-gate lab. Pick engine + instrument + optional date range; the backend
+    // runs the SAME shipped prover (bltd_store.PROVERS) on the buyer's OWN captured bars, split into
+    // contiguous folds, and returns per-fold n / W-L / max-drawdown-R / p-value + the prover sha256.
+    // NO aggregate win-rate, NO equity, NO $ figure — the buyer's own edge math on their own data.
+    private var labPanel: some View {
+        Panel(title: "No-code edge-gate lab", icon: "flask.fill", accent: BLTheme.gold) {
+            Text("Pick an engine and one instrument you've captured, choose the whole range or a slice, and run the SAME shipped prover Black Label's live fleet uses — on YOUR captured bars only. You get the out-of-sample trade count, wins / losses, max drawdown in R, and the one-sided binomial p-value per fold, plus the prover fingerprint so you can reproduce it (shasum -a 256 bltd_store.py). Fewer than \(labReport?.minTrades ?? 30) OOS trades in a fold shows as insufficient — never a painted number.")
+                .font(.system(size: 11, design: .rounded)).foregroundColor(BLTheme.sub).fixedSize(horizontal: false, vertical: true)
+
+            if !feed.isSignedIn {
+                EmptyState(icon: "person.crop.circle.badge.questionmark", title: "Sign in to run the lab",
+                           hint: "The lab runs entirely on your own local backend and your own captured bars. Connect in the Feeds tab.")
+                GhostButton(label: "Go to Feeds", icon: "globe") { nav.section = .feeds }
+            } else if labSymbols.isEmpty {
+                EmptyState(icon: "square.stack.3d.up.slash", title: "No captured instruments yet",
+                           hint: "Connect your feed and let bars accumulate — an instrument becomes testable once enough bars are stored. Nothing is downloaded or invented.")
+                GhostButton(label: "Connect my feed", icon: "globe") { nav.section = .feeds }
+            } else {
+                // 1. Engine + instrument pickers.
+                HStack(spacing: 10) {
+                    pickerField("Engine", $labEngine, EngineRoster.order) { EngineRoster.label(for: $0) }
+                    pickerField("Instrument", $labSymbol, labSymbols) { $0 }
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("FOLDS").font(.system(size: 9.5, weight: .bold, design: .rounded)).foregroundColor(BLTheme.sub).tracking(0.5)
+                        Stepper(value: $labFolds, in: 1...8) { Text("\(labFolds)").font(.system(size: 13, weight: .semibold, design: .rounded)).foregroundColor(BLTheme.text).monospacedDigit() }
+                    }.frame(maxWidth: .infinity, alignment: .leading)
+                }
+                if !labBoundsNote.isEmpty {
+                    Text(labBoundsNote).font(.system(size: 10.5, design: .rounded)).foregroundColor(BLTheme.sub)
+                }
+                // 2. Optional date range over the buyer's captured bars.
+                Toggle(isOn: $labUseRange) {
+                    Text("Limit to a date range (default: your whole captured series)")
+                        .font(.system(size: 11.5, weight: .medium, design: .rounded)).foregroundColor(BLTheme.text)
+                }.toggleStyle(.switch).tint(BLTheme.gold)
+                if labUseRange {
+                    HStack(spacing: 12) {
+                        DatePicker("From", selection: $labStart, displayedComponents: .date).datePickerStyle(.field)
+                            .font(.system(size: 12, design: .rounded)).foregroundColor(BLTheme.text)
+                        DatePicker("To", selection: $labEnd, displayedComponents: .date).datePickerStyle(.field)
+                            .font(.system(size: 12, design: .rounded)).foregroundColor(BLTheme.text)
+                    }
+                }
+                HStack(spacing: 10) {
+                    GoldButton(label: labRunning ? "Running the prover…" : "Run edge-gate on my bars", fill: true, icon: "play.fill") {
+                        Task { await runLab() }
+                    }.disabled(labRunning || labSymbol.isEmpty)
+                    if let r = labReport, r.available {
+                        StatusPill(text: labStatusText(r), tint: labStatusTint(r))
+                    }
+                }
+                if let r = labReport { labResults(r) }
+            }
+        }
+        .task { await loadLabSymbols() }
+        .onChange(of: labSymbol) { _ in Task { await refreshLabBounds() } }
+    }
+
+    @ViewBuilder private func labResults(_ r: BacktestLabReport) -> some View {
+        if !r.available {
+            EmptyState(icon: "shield.lefthalf.filled", title: "Nothing to test yet",
+                       hint: r.reason.isEmpty ? "Not enough captured bars for this instrument and range." : r.reason)
+        } else {
+            Divider().background(BLTheme.stroke).padding(.vertical, 2)
+            // Mandatory honesty label — verbatim, always shown with results.
+            HStack(spacing: 6) {
+                Image(systemName: "info.circle.fill").font(.system(size: 11)).foregroundColor(BLTheme.gold)
+                Text("On your captured bars only — the shipped prover re-run, NOT a promise and no performance guaranteed.")
+                    .font(.system(size: 11, weight: .semibold, design: .rounded)).foregroundColor(BLTheme.gold).fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(10).frame(maxWidth: .infinity, alignment: .leading)
+            .background(BLTheme.gold.opacity(0.10)).clipShape(RoundedRectangle(cornerRadius: 10))
+            .overlay(RoundedRectangle(cornerRadius: 10).stroke(BLTheme.gold.opacity(0.35), lineWidth: 1))
+
+            if let w = r.whole {
+                Text("WHOLE RANGE (\(r.totalBars) bars)").font(.system(size: 9.5, weight: .bold, design: .rounded)).foregroundColor(BLTheme.sub).tracking(0.6)
+                labFoldRow(w, minTrades: r.minTrades, headline: true)
+            }
+            if r.folds.count > 1 {
+                Text("PER FOLD").font(.system(size: 9.5, weight: .bold, design: .rounded)).foregroundColor(BLTheme.sub).tracking(0.6)
+                VStack(spacing: 8) { ForEach(r.folds) { labFoldRow($0, minTrades: r.minTrades, headline: false) } }
+            }
+            Text("Reproducible: \(r.proverLine)" + (r.generatedUTC.isEmpty ? "" : " · ran \(r.generatedUTC)") + " · instrument \(r.symbol)")
+                .font(.system(size: 9, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub).fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func labFoldRow(_ f: BacktestLabFold, minTrades: Int, headline: Bool) -> some View {
+        let tint = f.proven ? BLTheme.green : (f.insufficient ? BLTheme.sub : BLTheme.gold)
+        let status = f.proven ? "OOS CAND" : (f.insufficient ? "THIN" : "NO EDGE")
+        return HStack(spacing: 12) {
+            Image(systemName: f.proven ? "checkmark.seal.fill" : (f.insufficient ? "hourglass" : "xmark.seal"))
+                .font(.system(size: 14, weight: .bold)).foregroundColor(tint)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(headline ? "Whole range" : "Fold \(f.fold)").font(.system(size: 13, weight: .bold, design: .rounded)).foregroundColor(BLTheme.text)
+                Text(f.statLine(minTrades: minTrades)).font(.system(size: 10, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub).monospacedDigit().lineLimit(1)
+            }
+            Spacer()
+            StatusPill(text: status, tint: tint)
+        }
+        .padding(12).background(BLTheme.bg2).clipShape(RoundedRectangle(cornerRadius: 11))
+        .overlay(RoundedRectangle(cornerRadius: 11).stroke(BLTheme.stroke, lineWidth: 1))
+    }
+
+    private func labStatusText(_ r: BacktestLabReport) -> String {
+        switch r.status {
+        case "candidate": return "OOS CANDIDATE"
+        case "no_edge": return "NO EDGE"
+        default: return "INSUFFICIENT"
+        }
+    }
+    private func labStatusTint(_ r: BacktestLabReport) -> Color {
+        switch r.status {
+        case "candidate": return BLTheme.green
+        case "no_edge": return BLTheme.gold
+        default: return BLTheme.sub
+        }
+    }
+
+    private func loadLabSymbols() async {
+        guard feed.isSignedIn else { return }
+        await feed.refreshStatus()
+        let syms = feed.symbols.backtestable
+        await MainActor.run {
+            labSymbols = syms
+            if labSymbol.isEmpty || !syms.contains(labSymbol) { labSymbol = syms.first ?? "" }
+        }
+        await refreshLabBounds()
+    }
+
+    private func refreshLabBounds() async {
+        guard feed.isSignedIn, !labSymbol.isEmpty else { return }
+        let b = await feed.barBounds(symbol: labSymbol)
+        await MainActor.run {
+            if b.count > 0, let lo = b.firstTs, let hi = b.lastTs {
+                let loD = Date(timeIntervalSince1970: TimeInterval(lo))
+                let hiD = Date(timeIntervalSince1970: TimeInterval(hi))
+                labStart = loD; labEnd = hiD
+                let df = DateFormatter(); df.dateStyle = .medium
+                labBoundsNote = "\(b.count) bars captured for \(labSymbol): \(df.string(from: loD)) → \(df.string(from: hiD))."
+            } else {
+                labBoundsNote = "No bars captured for \(labSymbol) yet."
+            }
+        }
+    }
+
+    private func runLab() async {
+        await MainActor.run { labRunning = true }
+        let startTs = labUseRange ? Int(labStart.timeIntervalSince1970) : nil
+        let endTs = labUseRange ? Int(labEnd.timeIntervalSince1970) : nil
+        let r = await feed.runBacktestLab(engine: labEngine, symbol: labSymbol, startTs: startTs, endTs: endTs, folds: labFolds)
+        await MainActor.run { labReport = r; labRunning = false }
+    }
+
+    // MARK: - TR-19 own-silicon parameter-sweep FARM. Pick engine + instrument; the backend fans the
+    // SHIPPED prover's hyperparameter grid across THIS Mac's cores (concurrent.futures) over the
+    // buyer's OWN captured bars — no cloud, no data fee, no network. The whole point is honest over-fit
+    // transparency: it reports the number of cells tried and a Benjamini–Hochberg FDR-corrected p per
+    // cell, NEVER a raw best-cell p, and shows NO aggregate win-rate/$ figure.
+    private var farmPanel: some View {
+        Panel(title: "Own-silicon backtest farm", icon: "cpu.fill", accent: BLTheme.gold) {
+            Text("Sweep an engine's parameters across many settings at once — fanned over this Mac's own performance cores. No cloud, no data fee, nothing downloaded. Because searching many parameter sets inflates significance, every p-value here is Benjamini–Hochberg FDR-corrected across ALL cells tried — a raw best-cell p is never shown. Fewer than \(farmReport?.minTrades ?? 30) OOS trades in a cell shows as insufficient. On your captured bars only — NOT a promise.")
+                .font(.system(size: 11, design: .rounded)).foregroundColor(BLTheme.sub).fixedSize(horizontal: false, vertical: true)
+
+            if !feed.isSignedIn {
+                EmptyState(icon: "person.crop.circle.badge.questionmark", title: "Sign in to run the farm",
+                           hint: "The farm runs entirely on your own local backend and your own captured bars. Connect in the Feeds tab.")
+                GhostButton(label: "Go to Feeds", icon: "globe") { nav.section = .feeds }
+            } else if labSymbols.isEmpty {
+                EmptyState(icon: "square.stack.3d.up.slash", title: "No captured instruments yet",
+                           hint: "Connect your feed and let bars accumulate — the farm can sweep once enough bars are stored. Nothing is downloaded or invented.")
+                GhostButton(label: "Connect my feed", icon: "globe") { nav.section = .feeds }
+            } else {
+                HStack(spacing: 10) {
+                    pickerField("Engine", $farmEngine, EngineRoster.order) { EngineRoster.label(for: $0) }
+                    pickerField("Instrument", $farmSymbol, labSymbols) { $0 }
+                }
+                HStack(spacing: 10) {
+                    GoldButton(label: farmRunning ? "Sweeping on your cores…" : "Run the sweep on my bars", fill: true, icon: "cpu") {
+                        Task { await runFarm() }
+                    }.disabled(farmRunning || farmSymbol.isEmpty)
+                    if let r = farmReport, r.available {
+                        StatusPill(text: farmStatusText(r), tint: farmStatusTint(r))
+                    }
+                }
+                if let r = farmReport { farmResults(r) }
+            }
+        }
+        .onAppear { if farmSymbol.isEmpty { farmSymbol = labSymbols.first ?? "" } }
+        .onChange(of: labSymbols) { syms in if farmSymbol.isEmpty || !syms.contains(farmSymbol) { farmSymbol = syms.first ?? "" } }
+    }
+
+    @ViewBuilder private func farmResults(_ r: BacktestFarmReport) -> some View {
+        if !r.available {
+            EmptyState(icon: "shield.lefthalf.filled", title: "Nothing to sweep yet",
+                       hint: r.reason.isEmpty ? "Not enough captured bars for this instrument." : r.reason)
+        } else {
+            Divider().background(BLTheme.stroke).padding(.vertical, 2)
+            // Mandatory over-fit-transparency banner — verbatim, always shown with results.
+            HStack(alignment: .top, spacing: 6) {
+                Image(systemName: "info.circle.fill").font(.system(size: 11)).foregroundColor(BLTheme.gold)
+                Text("\(r.cellsTried) parameter cells tried on your captured bars only — NOT a promise. \(r.overfitNote)")
+                    .font(.system(size: 11, weight: .semibold, design: .rounded)).foregroundColor(BLTheme.gold).fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(10).frame(maxWidth: .infinity, alignment: .leading)
+            .background(BLTheme.gold.opacity(0.10)).clipShape(RoundedRectangle(cornerRadius: 10))
+            .overlay(RoundedRectangle(cornerRadius: 10).stroke(BLTheme.gold.opacity(0.35), lineWidth: 1))
+
+            HStack(spacing: 12) {
+                Stat(label: "Cells tried", value: "\(r.cellsTried)")
+                Stat(label: "Candidates", value: "\(r.provenCells)")
+                Stat(label: "Insufficient", value: "\(r.cellsInsufficient)")
+                Stat(label: "Compute", value: r.compute.isEmpty ? "—" : r.compute)
+            }
+            if !r.reason.isEmpty {
+                Text(r.reason).font(.system(size: 10.5, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub).fixedSize(horizontal: false, vertical: true)
+            }
+            if let b = r.best {
+                Text("BEST CELL (BY FDR-ADJUSTED p)").font(.system(size: 9.5, weight: .bold, design: .rounded)).foregroundColor(BLTheme.sub).tracking(0.6)
+                farmCellRow(b, headline: true)
+            }
+            let shown = Array(r.cells.prefix(12))
+            if !shown.isEmpty {
+                Text("CELLS (top \(shown.count) of \(r.cellsTried))").font(.system(size: 9.5, weight: .bold, design: .rounded)).foregroundColor(BLTheme.sub).tracking(0.6)
+                VStack(spacing: 8) { ForEach(shown) { farmCellRow($0, headline: false) } }
+            }
+            Text("Reproducible: \(r.proverLine) · \(r.cores) cores" + (r.generatedUTC.isEmpty ? "" : " · ran \(r.generatedUTC)") + " · instrument \(r.symbol)")
+                .font(.system(size: 9, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub).fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func farmCellRow(_ c: BacktestFarmCell, headline: Bool) -> some View {
+        let tint = c.proven ? BLTheme.green : (c.insufficient ? BLTheme.sub : BLTheme.gold)
+        let status = c.proven ? "CAND" : (c.insufficient ? "THIN" : "NO EDGE")
+        return HStack(spacing: 12) {
+            Image(systemName: c.proven ? "checkmark.seal.fill" : (c.insufficient ? "hourglass" : "xmark.seal"))
+                .font(.system(size: 14, weight: .bold)).foregroundColor(tint)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(c.params.isEmpty ? "default" : c.params).font(.system(size: 12, weight: .bold, design: .rounded)).foregroundColor(BLTheme.text).lineLimit(1)
+                Text(c.statLine).font(.system(size: 10, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub).monospacedDigit().lineLimit(1)
+            }
+            Spacer()
+            StatusPill(text: status, tint: tint)
+        }
+        .padding(12).background(headline ? BLTheme.gold.opacity(0.06) : BLTheme.bg2).clipShape(RoundedRectangle(cornerRadius: 11))
+        .overlay(RoundedRectangle(cornerRadius: 11).stroke(headline ? BLTheme.gold.opacity(0.35) : BLTheme.stroke, lineWidth: 1))
+    }
+
+    private func farmStatusText(_ r: BacktestFarmReport) -> String {
+        switch r.status {
+        case "candidate": return "OOS CANDIDATE"
+        case "no_edge": return "NO EDGE"
+        default: return "INSUFFICIENT"
+        }
+    }
+    private func farmStatusTint(_ r: BacktestFarmReport) -> Color {
+        switch r.status {
+        case "candidate": return BLTheme.green
+        case "no_edge": return BLTheme.gold
+        default: return BLTheme.sub
+        }
+    }
+
+    private func runFarm() async {
+        await MainActor.run { farmRunning = true }
+        let r = await feed.runBacktestFarm(engine: farmEngine, symbol: farmSymbol)
+        await MainActor.run { farmReport = r; farmRunning = false }
     }
 
     // MARK: - Walk-forward robustness (in-house — is the edge consistent across time?)

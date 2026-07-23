@@ -3,16 +3,22 @@
   "label": "Reference only \u2014 computed on historical ES data, NOT your account, NOT a promise, no performance guaranteed.",
   "disclaimer": "These verdicts are the edge-gate's honest out-of-sample result on Black Label's own historical ES bars. They are reference research, not your results, not live, and not a guarantee. Your own engine fleet arms only on the bars YOUR feed captures.",
   "source": "Black Label historical ES bars (WealthCharts-captured)",
-  "generated_utc": "2026-07-06T14:35:55Z",
-  "prover_sha": "092c4bea95ec0717",
-  "git_sha": "e680342",
+  "generated_utc": "2026-07-21T23:39:40Z",
+  "prover_sha": "e8895a5b9fca4a8d",
+  "prover_file": "bltd_store.py",
+  "prover_uncommitted": true,
+  "fdr_module": "bltd_analytics.py",
+  "fdr_module_sha": "744c7b7643a08f93",
+  "git_sha": "3bc3a34",
   "significance": {
     "alpha": 0.05,
     "minTrades": 30,
-    "test": "one-sided binomial vs R-geometry breakeven, BH-FDR at grid level"
+    "fdrQ": 0.1,
+    "gridCells": 18,
+    "test": "one-sided binomial vs R-geometry breakeven (alpha=0.05, n>=30), then Benjamini-Hochberg FDR control at q=0.1 across the m=18-cell engine x contract grid"
   },
   "engineCount": 9,
-  "candidateCount": 1,
+  "candidateCount": 0,
   "engines": [
     {
       "engine": "meanrev",
@@ -30,8 +36,8 @@
           "expectancyR": 0.0304,
           "netPts": 38.9494,
           "pEdge": 0.720863,
-          "verdict": "no edge",
-          "reason": ""
+          "reason": "",
+          "verdict": "no edge"
         },
         {
           "symbol": "CM.ESM6",
@@ -44,8 +50,8 @@
           "expectancyR": 0.0289,
           "netPts": 30.4436,
           "pEdge": 0.698945,
-          "verdict": "no edge",
-          "reason": ""
+          "reason": "",
+          "verdict": "no edge"
         }
       ]
     },
@@ -65,8 +71,8 @@
           "expectancyR": 0.353,
           "netPts": 28.5,
           "pEdge": 1.0,
-          "verdict": "no edge",
-          "reason": ""
+          "reason": "",
+          "verdict": "no edge"
         },
         {
           "symbol": "CM.ESM6",
@@ -79,8 +85,8 @@
           "expectancyR": -0.5861,
           "netPts": -45.75,
           "pEdge": 1.0,
-          "verdict": "no edge",
-          "reason": ""
+          "reason": "",
+          "verdict": "no edge"
         }
       ]
     },
@@ -100,8 +106,8 @@
           "expectancyR": 0.353,
           "netPts": 28.5,
           "pEdge": 1.0,
-          "verdict": "no edge",
-          "reason": ""
+          "reason": "",
+          "verdict": "no edge"
         },
         {
           "symbol": "CM.ESM6",
@@ -114,8 +120,8 @@
           "expectancyR": -0.5861,
           "netPts": -45.75,
           "pEdge": 1.0,
-          "verdict": "no edge",
-          "reason": ""
+          "reason": "",
+          "verdict": "no edge"
         }
       ]
     },
@@ -135,8 +141,8 @@
           "expectancyR": 0.0146,
           "netPts": 2.7849,
           "pEdge": 0.428541,
-          "verdict": "no edge",
-          "reason": ""
+          "reason": "",
+          "verdict": "no edge"
         },
         {
           "symbol": "CM.ESM6",
@@ -149,8 +155,8 @@
           "expectancyR": -0.1224,
           "netPts": -16.1466,
           "pEdge": 1.0,
-          "verdict": "no edge",
-          "reason": ""
+          "reason": "",
+          "verdict": "no edge"
         }
       ]
     },
@@ -170,8 +176,8 @@
           "expectancyR": 0.0122,
           "netPts": -3.1883,
           "pEdge": 0.47007,
-          "verdict": "no edge",
-          "reason": ""
+          "reason": "",
+          "verdict": "no edge"
         },
         {
           "symbol": "CM.ESM6",
@@ -184,8 +190,8 @@
           "expectancyR": -0.1071,
           "netPts": -8.3894,
           "pEdge": 1.0,
-          "verdict": "no edge",
-          "reason": ""
+          "reason": "",
+          "verdict": "no edge"
         }
       ]
     },
@@ -205,8 +211,8 @@
           "expectancyR": 0.0184,
           "netPts": 8.7407,
           "pEdge": 0.3852,
-          "verdict": "no edge",
-          "reason": ""
+          "reason": "",
+          "verdict": "no edge"
         },
         {
           "symbol": "CM.ESM6",
@@ -219,8 +225,8 @@
           "expectancyR": -0.01,
           "netPts": -2.6472,
           "pEdge": 1.0,
-          "verdict": "no edge",
-          "reason": ""
+          "reason": "",
+          "verdict": "no edge"
         }
       ]
     },
@@ -240,8 +246,8 @@
           "expectancyR": 0.3333,
           "netPts": 2.2359,
           "pEdge": 1.0,
-          "verdict": "no edge",
-          "reason": ""
+          "reason": "",
+          "verdict": "no edge"
         },
         {
           "symbol": "CM.ESM6",
@@ -254,8 +260,8 @@
           "expectancyR": 0.2,
           "netPts": 0.7556,
           "pEdge": 1.0,
-          "verdict": "no edge",
-          "reason": ""
+          "reason": "",
+          "verdict": "no edge"
         }
       ]
     },
@@ -275,8 +281,8 @@
           "expectancyR": 0.0146,
           "netPts": 2.7849,
           "pEdge": 0.428541,
-          "verdict": "no edge",
-          "reason": ""
+          "reason": "",
+          "verdict": "no edge"
         },
         {
           "symbol": "CM.ESM6",
@@ -289,29 +295,30 @@
           "expectancyR": -0.1224,
           "netPts": -16.1466,
           "pEdge": 1.0,
-          "verdict": "no edge",
-          "reason": ""
+          "reason": "",
+          "verdict": "no edge"
         }
       ]
     },
     {
       "engine": "context_b",
       "label": "context_b",
-      "status": "candidate",
+      "status": "no_edge",
       "contracts": [
         {
           "symbol": "CM.ESU6",
           "bars": 18906,
           "from": "2026-06-19",
           "to": "2026-07-03",
-          "proven": true,
+          "proven": false,
           "trades": 191,
           "winRate": 0.3927,
           "expectancyR": 0.1792,
           "netPts": 24.9104,
           "pEdge": 0.049508,
-          "verdict": "OOS candidate (cleared significance)",
-          "reason": ""
+          "reason": "per-test significant (p=0.050) but rejected by grid-wide FDR control across 18 tests (q=0.10)",
+          "fdrRejected": true,
+          "verdict": "no edge (FDR-rejected)"
         },
         {
           "symbol": "CM.ESM6",
@@ -324,8 +331,8 @@
           "expectancyR": -0.5345,
           "netPts": -26.2801,
           "pEdge": 1.0,
-          "verdict": "no edge",
-          "reason": ""
+          "reason": "",
+          "verdict": "no edge"
         }
       ]
     }

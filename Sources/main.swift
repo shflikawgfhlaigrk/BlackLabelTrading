@@ -85,6 +85,9 @@ final class Nav: ObservableObject {
 struct MainView: View {
     @EnvironmentObject var nav: Nav
     @EnvironmentObject var alerts: AlertStore
+    // Effective motion gate (in-app Motion toggle AND not system Reduce Motion). When off, the
+    // whole-screen tab-switch slide is a "moving thing in the way" — so it becomes an instant swap.
+    @Environment(\.blMotion) private var motion
     var body: some View {
         NavigationSplitView {
             List(selection: Binding(get: { nav.section }, set: { if let v = $0 { nav.section = v } })) {
@@ -154,10 +157,10 @@ struct MainView: View {
                     case .settings:    SettingsScreen()
                     }
                 }
-                .transition(.holoScreen)
+                .transition(motion ? .holoScreen : .identity)
                 .id(nav.section)
             }
-            .animation(.spring(response: 0.45, dampingFraction: 0.85), value: nav.section)
+            .animation(motion ? .spring(response: 0.45, dampingFraction: 0.85) : nil, value: nav.section)
         }
         .frame(minWidth: 1040, minHeight: 700)
         // ⌘K command palette overlay.

@@ -1,0 +1,20 @@
+<svg viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Black Label Trading">
+  <defs>
+    <linearGradient id="blb-hex" x1="30" y1="20" x2="170" y2="180" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#f9e27d"/><stop offset="55%" stop-color="#d4af37"/><stop offset="100%" stop-color="#c9a961"/>
+    </linearGradient>
+    <filter id="blb-glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="1.8" result="blur"/><feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <polygon points="100,14 176,54 176,146 100,186 24,146 24,54" fill="none" stroke="#c9a961" stroke-width="1" opacity="0.28"/>
+  <polygon points="100,12 178,56 178,144 100,188 22,144 22,56" fill="none" stroke="url(#blb-hex)" stroke-width="2.2" opacity="0.9"/>
+  <polygon points="100,32 158,64 158,136 100,168 42,136 42,64" fill="none" stroke="#f9e27d" stroke-width="2.5"/>
+  <g stroke="url(#blb-hex)" stroke-width="2.5" fill="none" stroke-linejoin="round" stroke-linecap="round" filter="url(#blb-glow)">
+    <path d="M84,98 h8 v16 h-8 Z M88,92 v6 M88,114 v6"/>
+    <path d="M100,86 h8 v18 h-8 Z M104,80 v6 M104,104 v6"/>
+    <path d="M78,124 L94,108 L104,116 L122,92 M122,92 l-7,1 M122,92 l-1,7"/>
+  </g>
+  <polygon points="100,18 107,30 100,42 93,30" fill="none" stroke="#f9e27d" stroke-width="1.35" opacity="0.85"/>
+</svg>
+

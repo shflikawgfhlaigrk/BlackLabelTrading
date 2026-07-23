@@ -85,6 +85,7 @@ struct SignalsScreen: View {
     @EnvironmentObject var wc: WealthChartsStore
     @EnvironmentObject var feed: FeedClient
     @EnvironmentObject var nav: Nav
+    @EnvironmentObject var book: PaperBook          // the buyer's own paper ledger feeds the discipline cockpit
     @State private var inp = SignalInputs()
     @State private var committed = false
     @State private var live = LiveFactorSnapshot()
@@ -96,12 +97,28 @@ struct SignalsScreen: View {
     @State private var backendFires: [FireRow] = []
     @State private var fleetLoading = false
     @State private var reference = ReferenceReport.empty   // reference OOS verdicts on historical ES
+    @State private var catalog = InstrumentCatalog.empty    // multi-asset instruments in the buyer's own bars
+    @State private var rerun: GateRerunReport? = nil       // buyer-triggered re-run of the gate on own bars
+    @State private var gateContracts = "1"                 // contract size the buyer wants the prop-firm gate to check
+    @State private var rerunning = false
     @State private var dailyLogPath: String? = nil   // path shown after "Export daily logs"
     @State private var tAccount = "50000"             // order-ticket sizing inputs (your own values)
     @State private var tRiskPct = "1"
     @State private var ticketCopied = false
 
     private var result: SignalResult { SignalEngine.evaluate(inp) }
+    // Discipline cockpit computed from the buyer's OWN closed paper trades against their active
+    // rule profile's caps. Pure compliance math (no aggregate win-rate/$/performance claim).
+    private func cockpitFills() -> [DisciplineFill] {
+        book.closed.compactMap { p in
+            guard let d = p.realizedDollars(), let dt = p.exitDate else { return nil }
+            return DisciplineFill(date: dt, pnl: d, contracts: p.quantity)
+        }
+    }
+    private var cockpit: DisciplineCockpit {
+        DisciplineCockpit.compute(fills: cockpitFills(), profile: model.activeProfile,
+                                  startingBalance: book.startingBalance, now: Date())
+    }
     private var gates: [GateCheck] { GateEngine.evaluate(inp, result) }
     private var tfVotes: [TimeframeVote] { ConsensusEngine.votes(inp) }
     private var tfAgree: Int { ConsensusEngine.agreeing(tfVotes, with: result.direction) }
@@ -116,12 +133,34 @@ struct SignalsScreen: View {
                     StatusPill(text: live.hasData ? "Live" : "Awaiting feed", tint: live.hasData ? BLTheme.green : BLTheme.gold)
                 }
 
+                // FIRST-CLASS "NO EDGE TODAY" verdict — the buyer's live gate result on THEIR OWN
+                // captured bars, promoted to the top of the dashboard with per-engine reject reasons
+                // front-and-center. This is the honesty wedge: the tool tells you plainly when none
+                // of your engines has an edge today, rather than manufacturing a signal.
+                noEdgeHero
+
                 // Reachable local account-reference entry point from the main dashboard.
                 wealthChartsBanner
+
+                // DISCIPLINE COCKPIT — live daily-loss + trailing-drawdown meters, a Tiltmeter, and
+                // risk-of-ruin, all computed from the buyer's OWN paper ledger against the caps THEY
+                // entered. When a hard cap is breached it AUTO-MUTES the signal display below. Pure
+                // compliance math on the buyer's own numbers — zero aggregate win-rate/$/P&L claim.
+                DisciplineCockpitPanel(cockpit: cockpit) { nav.section = .firms }
 
                 // The real edge-gated engine fleet (backend /api/screen + /api/fires) — every
                 // engine's honest OOS verdict on the buyer's OWN captured bars.
                 engineFleet
+
+                // FIRST-CLASS MULTI-ASSET PICKER (TR-05): every instrument in the buyer's OWN captured
+                // bars — beyond ES — classified by asset class, with which ES-tuned modules apply. The
+                // full fleet + edge-gate run per-instrument (never pooled). Honest "only ES captured so
+                // far" state; never a hardcoded list of instruments the buyer doesn't have.
+                multiAssetPanel
+
+                // One-click reproducible re-run of the SAME edge-gate over the buyer's own bars —
+                // prover_sha + full n / W / L / max-drawdown / p-value. Buyer-verifiable, no cherry-picking.
+                rerunGatePanel
 
                 // REFERENCE ONLY: the same edge-gate run on Black Label's OWN historical ES bars, so
                 // a cold buyer sees the gate produce a real, earned verdict before they've captured a
@@ -132,8 +171,17 @@ struct SignalsScreen: View {
                 // live factor inputs, so it renders ONLY when real captured data exists — otherwise a
                 // cold-start buyer would see a fabricated default plan (ES @ 5000, $50/pt). Honest
                 // empty state until the buyer's own feed produces bars.
-                if live.hasData {
+                if live.hasData && cockpit.muteSignals {
+                    // AUTO-MUTE: the buyer breached a hard cap they set — hide the trade plan for the
+                    // session. Their own rule profile enforcing itself; never places or blocks an order.
+                    signalsMutedCard
+                } else if live.hasData {
                     signalCard
+
+                    // Prop-firm rule gate — annotates THIS trade plan against the buyer's active
+                    // funded-eval profile (their own caps) and hard-gates it when it would breach.
+                    // Reuses the honesty spine: engine/reason surface, zero aggregate P&L or win-rate.
+                    profileGateBanner
 
                     // Multi-timeframe consensus strip + 13-gate risk checklist.
                     HStack(alignment: .top, spacing: 16) {
@@ -182,7 +230,7 @@ struct SignalsScreen: View {
                             ForEach(SignalFactor.allCases) { f in liveFactorRow(f) }
                         } else {
                             EmptyState(icon: "antenna.radiowaves.left.and.right",
-                                       title: factorsLoading ? "Reading your live bars…" : "Awaiting webhook data",
+                                       title: factorsLoading ? "Reading your live bars…" : "Waiting for your live prices",
                                        hint: "Factors compute automatically once your own captured bars are available (≥\(LiveFactorEngine.minBars) bars). Read-only by design — nothing is shown until it's real.")
                         }
                     }
@@ -315,7 +363,197 @@ struct SignalsScreen: View {
         let rows = await feed.engineScreen()
         let fires = await feed.recentFires()
         let ref = await feed.referenceReport()
-        await MainActor.run { fleet = rows; backendFires = fires; reference = ref; fleetLoading = false }
+        let cat = await feed.instrumentCatalog()
+        await MainActor.run { fleet = rows; backendFires = fires; reference = ref; catalog = cat; fleetLoading = false }
+    }
+
+    // FIRST-CLASS "NO EDGE TODAY" hero. A pure roll-up (GateVerdict.compute) of the SAME engine
+    // fleet rows the panel below shows — promoted to the top so the honest verdict is the first
+    // thing a buyer reads. Empty store => honest "no bars captured yet" (never a manufactured
+    // signal). NO aggregate win-rate / P&L / promise — just how many engines have no edge today.
+    private var noEdgeHero: some View {
+        let v = GateVerdict.compute(fleet)
+        let accent = v.candidates > 0 ? BLTheme.green : BLTheme.gold
+        return VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 14) {
+                Image(systemName: !v.hasData ? "antenna.radiowaves.left.and.right"
+                      : (v.candidates > 0 ? "checkmark.seal.fill" : "shield.lefthalf.filled"))
+                    .font(.system(size: 21, weight: .black)).foregroundColor(Color(hex: 0x1A1305))
+                    .frame(width: 46, height: 46)
+                    .background(v.candidates > 0
+                                ? AnyShapeStyle(LinearGradient(colors: [BLTheme.green, BLTheme.green.opacity(0.7)], startPoint: .top, endPoint: .bottom))
+                                : AnyShapeStyle(BLTheme.goldGrad))
+                    .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
+                    .shadow(color: accent.opacity(0.35), radius: 8, y: 2)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(v.headline).font(.system(size: 18, weight: .heavy, design: .rounded)).foregroundColor(BLTheme.text)
+                    Text(v.subline).font(.system(size: 11.5, weight: .medium, design: .rounded))
+                        .foregroundColor(BLTheme.sub).fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer()
+                if v.hasData {
+                    StatusPill(text: v.isNoEdge ? "NO EDGE TODAY" : "\(v.candidates) OOS CAND",
+                               tint: v.isNoEdge ? BLTheme.gold : BLTheme.green)
+                }
+            }
+            if !v.hasData {
+                Text("The gate verdict is computed only from your own captured bars — nothing is shown until it's real.")
+                    .font(.system(size: 11.5, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+                    .fixedSize(horizontal: false, vertical: true)
+                GoldButton(label: "Connect my feed", icon: "globe") { nav.section = .feeds }
+            } else if !v.rejects.isEmpty {
+                Divider().background(BLTheme.stroke).padding(.vertical, 1)
+                Text("WHY — PER-ENGINE, ON YOUR BARS")
+                    .font(.system(size: 9.5, weight: .bold, design: .rounded)).foregroundColor(BLTheme.sub).tracking(0.5)
+                VStack(spacing: 6) { ForEach(v.rejects) { rejectRow($0) } }
+            }
+        }
+        .padding(18)
+        .holoCard(radius: 16)
+    }
+
+    private func rejectRow(_ r: GateReject) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "xmark.seal").font(.system(size: 12, weight: .bold)).foregroundColor(BLTheme.sub).padding(.top, 1)
+            Text(EngineRoster.label(for: r.engine)).font(.system(size: 11.5, weight: .bold, design: .rounded))
+                .foregroundColor(BLTheme.text).frame(width: 118, alignment: .leading)
+            Text(r.reason).font(.system(size: 10.5, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+        }
+        .padding(.vertical, 6).padding(.horizontal, 10).background(BLTheme.bg2).clipShape(RoundedRectangle(cornerRadius: 9))
+    }
+
+    // FIRST-CLASS MULTI-ASSET PICKER (TR-05). Enumerates the instruments in the buyer's OWN captured
+    // bars — beyond ES — from GET /api/instruments (never a hardcoded list). Each instrument shows its
+    // asset class, captured bar count, live state, dollar-per-point (only when the spec is known), and
+    // an HONEST per-instrument module note: on non-ES instruments Session + SMT are labeled ES-only and
+    // never run with wrong math. The fleet + edge-gate run per-instrument; "Re-run the edge gate on my
+    // bars" below judges every one of these on its own bars, never pooled.
+    private var multiAssetPanel: some View {
+        Panel(title: "My instruments (multi-asset)", icon: "square.grid.2x2.fill", accent: BLTheme.gold) {
+            Text(catalog.available ? catalog.label
+                 : "Every instrument you stream — ES, NQ/YM index futures, CL/GC, or SPY/QQQ ETFs — is analyzed on its OWN bars by the full engine fleet and the edge-gate. Points shown; dollars only where the contract spec is known.")
+                .font(.system(size: 11, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 8) {
+                Text(catalog.headline)
+                    .font(.system(size: 11.5, weight: .bold, design: .rounded)).foregroundColor(BLTheme.text)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 0)
+                if catalog.available {
+                    StatusPill(text: "\(catalog.count) instr · \(catalog.nonEsCount) non-ES",
+                               tint: catalog.nonEsCount > 0 ? BLTheme.green : BLTheme.gold)
+                }
+            }
+            if !catalog.available {
+                EmptyState(icon: "square.grid.2x2",
+                           title: "No instruments captured yet",
+                           hint: catalog.reason ?? "Connect your feed and let bars accumulate — every instrument you stream will appear here, each analyzed on its own bars.")
+            } else {
+                if catalog.onlyES {
+                    Text("Only ES captured so far — capture NQ/YM/CL/ETFs on your feed and they will appear here, each judged on their own bars (never pooled with ES).")
+                        .font(.system(size: 10.5, weight: .medium, design: .rounded)).foregroundColor(BLTheme.gold.opacity(0.85))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Divider().background(BLTheme.stroke).padding(.vertical, 2)
+                VStack(spacing: 8) { ForEach(catalog.instruments) { instrumentRow($0) } }
+                Text(catalog.esModulesNote)
+                    .font(.system(size: 9, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private func instrumentRow(_ i: InstrumentInfo) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: i.esModules ? "star.circle.fill" : "circle.grid.cross")
+                .font(.system(size: 14, weight: .bold)).foregroundColor(i.esModules ? BLTheme.gold : BLTheme.sub).frame(width: 18)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(i.display).font(.system(size: 13, weight: .bold, design: .rounded)).foregroundColor(BLTheme.text)
+                    Text(i.assetClassLabel).font(.system(size: 9.5, weight: .heavy, design: .rounded))
+                        .foregroundColor(BLTheme.sub).padding(.horizontal, 6).padding(.vertical, 1)
+                        .background(BLTheme.panel2).clipShape(Capsule())
+                    if i.live { Text("LIVE").font(.system(size: 8.5, weight: .heavy, design: .rounded)).foregroundColor(BLTheme.green) }
+                }
+                Text("\(i.bars) bars · \(i.dollarNote) · \(i.moduleNote)")
+                    .font(.system(size: 10, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+                    .monospacedDigit().lineLimit(1)
+            }
+            Spacer()
+            StatusPill(text: i.esModules ? "ES-tuned modules on" : "Session/SMT ES-only",
+                       tint: i.esModules ? BLTheme.gold : BLTheme.sub)
+        }
+        .padding(12).background(BLTheme.panel2).clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 11, style: .continuous).stroke(BLTheme.stroke, lineWidth: 1))
+    }
+
+    // One-click, buyer-reproducible re-run of the edge-gate over the buyer's OWN captured bars.
+    // Reuses the SHIPPED provers via GET /api/gate/rerun and shows prover_sha + n / W / L /
+    // max-drawdown / p-value per engine. NO cherry-picking, NO $ figures, NO win-rate marketing.
+    private var rerunGatePanel: some View {
+        Panel(title: "Re-run the edge gate on my bars", icon: "arrow.clockwise.circle.fill", accent: BLTheme.gold) {
+            Text("Runs the SAME shipped provers over YOUR captured bars — every engine, every instrument you stream, no cherry-picking. Shows the prover fingerprint (sha256 of the gate source), the OOS trade count, wins / losses, max drawdown in R, and the one-sided binomial p-value. Reproducible by you: shasum -a 256 bltd_store.py.")
+                .font(.system(size: 11, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 10) {
+                GoldButton(label: rerunning ? "Re-running the gate…" : "Re-run the edge gate on my bars",
+                           icon: "arrow.clockwise") { Task { await runRerun() } }
+                    .disabled(rerunning)
+                if let r = rerun, r.available {
+                    Spacer()
+                    StatusPill(text: "\(r.candidateCount) cand · \(r.noEdgeCount) no edge · \(r.insufficientCount) thin",
+                               tint: r.candidateCount > 0 ? BLTheme.green : BLTheme.gold)
+                }
+            }
+            if let r = rerun {
+                if !r.available {
+                    EmptyState(icon: "shield.lefthalf.filled", title: "Nothing to re-run yet",
+                               hint: r.reason ?? "Connect your feed and let bars accumulate, then re-run the gate on your own data.")
+                } else {
+                    Divider().background(BLTheme.stroke).padding(.vertical, 2)
+                    VStack(spacing: 8) { ForEach(r.engines) { rerunRow($0, minTrades: r.minTrades) } }
+                    rerunProvenance(r)
+                }
+            }
+        }
+    }
+
+    private func rerunRow(_ e: GateRerunEngine, minTrades: Int) -> some View {
+        let cand = e.isCandidate
+        let tint = cand ? BLTheme.green : (e.isInsufficient ? BLTheme.sub : BLTheme.gold)
+        let status = cand ? "OOS CAND" : (e.isInsufficient ? "THIN" : "NO EDGE")
+        return HStack(spacing: 12) {
+            Image(systemName: cand ? "checkmark.seal.fill" : "xmark.seal")
+                .font(.system(size: 14, weight: .bold)).foregroundColor(tint)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(EngineRoster.label(for: e.engine)).font(.system(size: 13, weight: .bold, design: .rounded)).foregroundColor(BLTheme.text)
+                if let b = e.best {
+                    Text(b.statLine(minTrades: minTrades))
+                        .font(.system(size: 10, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+                        .monospacedDigit().lineLimit(1)
+                }
+            }
+            Spacer()
+            StatusPill(text: status, tint: tint)
+        }
+        .padding(12).background(BLTheme.panel2).clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 11, style: .continuous).stroke(BLTheme.stroke, lineWidth: 1))
+    }
+
+    private func rerunProvenance(_ r: GateRerunReport) -> some View {
+        let ran = r.generatedUTC.isEmpty ? "" : " · ran " + r.generatedUTC
+        let syms = r.symbols.isEmpty ? "" : " · your symbols: " + r.symbols.joined(separator: ", ")
+        return Text("Reproducible: " + r.proverLine + ran + syms)
+            .font(.system(size: 9, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private func runRerun() async {
+        rerunning = true
+        let r = await feed.rerunGate()
+        await MainActor.run { rerun = r; rerunning = false }
     }
 
     // The edge-gated engine fleet, grouped by engine with its real status. NEVER hardcodes a
@@ -489,6 +727,106 @@ struct SignalsScreen: View {
         }
         .padding(16)
         .holoCard(radius: 16)
+    }
+
+    // Prop-firm rule gate. Evaluates the CURRENT trade plan (stop distance + $/pt) at the buyer's
+    // chosen contract size against their ACTIVE rule profile (the caps THEY entered). Shows an honest
+    // "within limits at N — max M contracts" or a HARD red breach with the specific reason. No
+    // performance/win-rate/$ claim — purely the buyer's own risk math against their own firm limits.
+    private var profileGateBanner: some View {
+        let profile = model.activeProfile
+        let n = max(1, Int(gateContracts) ?? 1)
+        let d = RuleProfileGate.evaluate(riskPoints: result.riskPoints, pointValue: result.pointValue,
+                                         contracts: n, profile: profile)
+        let breach = d.isBreach
+        let accent: Color = {
+            switch d.verdict {
+            case .breach: return BLTheme.red
+            case .withinLimits: return BLTheme.green
+            default: return BLTheme.gold
+            }
+        }()
+        return Panel(title: "Prop-firm rule gate", icon: "shield.lefthalf.filled", accent: accent) {
+            if profile == nil {
+                HStack {
+                    Text("No prop-firm profile selected. Add your funded-eval firm's limits to gate this signal against your daily-loss, trailing-drawdown, and position caps.")
+                        .font(.system(size: 11.5, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer()
+                    GhostButton(label: "Set up profiles", icon: "building.columns.fill") { nav.section = .firms }
+                }
+            } else if d.verdict == .emptyProfile {
+                HStack {
+                    Text("“\(profile!.name)” has no limits set yet. Enter your firm's daily-loss / trailing-drawdown / position caps to gate this signal.")
+                        .font(.system(size: 11.5, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer()
+                    GhostButton(label: "Edit profile", icon: "pencil") { nav.section = .firms }
+                }
+            } else {
+                HStack(spacing: 10) {
+                    Image(systemName: breach ? "exclamationmark.octagon.fill" : "checkmark.shield.fill")
+                        .font(.system(size: 15, weight: .bold)).foregroundColor(accent)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(profile!.name).font(.system(size: 13, weight: .bold, design: .rounded)).foregroundColor(BLTheme.text)
+                        Text(d.annotation).font(.system(size: 11, weight: .semibold, design: .rounded)).foregroundColor(accent)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer()
+                    StatusPill(text: breach ? "BREACH" : (d.verdict == .noSignal ? "NO SIGNAL" : "WITHIN LIMITS"), tint: accent)
+                }
+                // Contract-size input the gate is evaluated at.
+                HStack(spacing: 12) {
+                    Field(title: "Contracts to check", text: $gateContracts, prompt: "1")
+                        .frame(maxWidth: 180)
+                    if d.dollarRiskAtSize > 0 {
+                        Stat(label: "One stop-out risk", value: RuleProfileGate.money(d.dollarRiskAtSize),
+                             tint: breach ? BLTheme.red : BLTheme.text)
+                    }
+                    Spacer()
+                }
+                // Hard visual gate: every breach reason, spelled out.
+                if breach {
+                    VStack(alignment: .leading, spacing: 5) {
+                        ForEach(d.reasons, id: \.self) { reason in
+                            HStack(spacing: 7) {
+                                Image(systemName: "xmark.circle.fill").font(.system(size: 11)).foregroundColor(BLTheme.red)
+                                Text(reason).font(.system(size: 11, weight: .medium, design: .rounded)).foregroundColor(BLTheme.text)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                        }
+                    }
+                    .padding(10).frame(maxWidth: .infinity, alignment: .leading)
+                    .background(BLTheme.red.opacity(0.10)).clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(BLTheme.red.opacity(0.4), lineWidth: 1))
+                }
+                Text("Limits are the caps you entered for \(profile!.name)\(profile!.sourceURL.isEmpty ? "" : " · \(profile!.sourceURL)") — confirm current terms on the firm's site. This gate is a risk annotation on your own plan; it never places or blocks an order.")
+                    .font(.system(size: 10, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    // Shown INSTEAD of the trade plan when the discipline cockpit auto-mutes (a hard cap breached).
+    private var signalsMutedCard: some View {
+        Panel(title: "Signal display muted", icon: "bell.slash.fill", accent: BLTheme.red) {
+            HStack(spacing: 10) {
+                Image(systemName: "exclamationmark.octagon.fill").font(.system(size: 16, weight: .bold)).foregroundColor(BLTheme.red)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Discipline stop — you hit a cap you set")
+                        .font(.system(size: 13, weight: .bold, design: .rounded)).foregroundColor(BLTheme.text)
+                    Text(cockpit.muteReason)
+                        .font(.system(size: 11.5, weight: .semibold, design: .rounded)).foregroundColor(BLTheme.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer()
+                StatusPill(text: "Muted", tint: BLTheme.red)
+            }
+            Text("The trade plan is intentionally hidden until your next session. This is your own rule profile enforcing itself — it never places or blocks an order.")
+                .font(.system(size: 10.5, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+                .fixedSize(horizontal: false, vertical: true)
+            GhostButton(label: "Review profile", icon: "building.columns.fill") { nav.section = .firms }
+        }
     }
 
     // Hero card.
@@ -706,6 +1044,9 @@ struct SignalsScreen: View {
             if let v = v {
                 Text(String(format: "%+.2f", v)).font(.system(size: 13, weight: .bold, design: .rounded)).monospacedDigit()
                     .foregroundColor(v > 0.05 ? BLTheme.green : (v < -0.05 ? BLTheme.red : BLTheme.sub))
+            } else if live.esOnlyAbsent.contains(f.rawValue) {
+                // TR-05 (c): honest, explicit reason on non-ES instruments — never silent wrong math.
+                Text("ES-only module (n/a here)").font(.system(size: 10, weight: .heavy, design: .rounded)).foregroundColor(BLTheme.gold.opacity(0.85))
             } else {
                 Text("no live data").font(.system(size: 10, weight: .heavy, design: .rounded)).foregroundColor(BLTheme.sub.opacity(0.8))
             }
@@ -1082,11 +1423,334 @@ struct CalculatorsScreen: View {
 
 // MARK: - Firms (prop firm reference)
 struct FirmsScreen: View {
+    @EnvironmentObject var model: AppModel
+    @EnvironmentObject var book: PaperBook
+    private var cockpit: DisciplineCockpit {
+        let fills: [DisciplineFill] = book.closed.compactMap { p in
+            guard let d = p.realizedDollars(), let dt = p.exitDate else { return nil }
+            return DisciplineFill(date: dt, pnl: d, contracts: p.quantity)
+        }
+        return DisciplineCockpit.compute(fills: fills, profile: model.activeProfile,
+                                         startingBalance: book.startingBalance, now: Date())
+    }
     var body: some View {
         ScrollView { VStack(alignment: .leading, spacing: 16) {
-            ScreenTitle(title: "Prop Firms", subtitle: "Futures evaluation firms and their rules — confirm current terms on each firm's site.", icon: "building.columns.fill")
-            ForEach(FirmData.all) { f in FirmRow(firm: f) }
+            ScreenTitle(title: "Prop-firm rule profiles",
+                        subtitle: "Enter YOUR funded-eval firm's limits — then Signals annotates and gates every trade plan against them. We ship no firm numbers: confirm current terms on the firm's site and enter them yourself.",
+                        icon: "building.columns.fill")
+
+            // Live discipline cockpit for the active profile — meters, Tiltmeter, risk of ruin, all
+            // computed from the buyer's own paper ledger against the caps they entered.
+            DisciplineCockpitPanel(cockpit: cockpit)
+
+            // Active profile — the one gating displayed signals.
+            Panel(title: "Active profile", icon: "shield.lefthalf.filled") {
+                if model.profiles.isEmpty {
+                    EmptyState(icon: "shield",
+                               title: "No rule profiles yet",
+                               hint: "Add a blank firm template or a custom profile below, then enter your own daily-loss, trailing-drawdown, and position caps. Signals will gate each trade plan against the active profile.")
+                } else {
+                    Picker(selection: $model.activeProfileID) {
+                        Text("None — no gating").tag(UUID?.none)
+                        ForEach(model.profiles) { p in
+                            Text(p.name.isEmpty ? "Untitled profile" : p.name).tag(UUID?.some(p.id))
+                        }
+                    } label: { EmptyView() }
+                    .pickerStyle(.menu).labelsHidden().frame(maxWidth: 320, alignment: .leading)
+                    if let a = model.activeProfile {
+                        Text(a.hasLimits
+                             ? "Signals is gating trade plans against “\(a.name)”."
+                             : "“\(a.name)” has no limits set yet — edit it below to enable gating.")
+                            .font(.system(size: 11.5, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+                    } else {
+                        Text("Gating is off — no profile is active.").font(.system(size: 11.5, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+                    }
+                }
+            }
+
+            // Add a profile — sourced firm presets (cited, pre-filled) + blank firm templates + a
+            // custom blank. Sourced numbers come from each firm's OWN page (2026-07-12); every field
+            // stays editable, and a 0 cell is deliberately user-entered (see each preset's note).
+            Panel(title: "Add a profile", icon: "plus.circle.fill") {
+                Text("Sourced presets pre-fill from each firm's own rules page (confirm before you trade — rules change). Templates start blank. Every number stays editable.")
+                    .font(.system(size: 11.5, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 10) {
+                    Menu {
+                        ForEach(RuleProfilePresets.sourcedByFirm, id: \.firm) { group in
+                            Menu(group.firm) {
+                                ForEach(group.presets) { p in
+                                    Button(p.accountLabel) { model.upsertProfile(p.makeProfile()) }
+                                }
+                            }
+                        }
+                    } label: {
+                        HStack(spacing: 6) { Image(systemName: "checkmark.seal.fill"); Text("Sourced firm preset") }
+                            .font(.system(size: 13, weight: .semibold, design: .rounded)).foregroundColor(BLTheme.text)
+                            .padding(.vertical, 9).padding(.horizontal, 16)
+                            .background(BLTheme.bg2).clipShape(Capsule())
+                            .overlay(Capsule().stroke(BLTheme.gold.opacity(0.5), lineWidth: 1))
+                    }.menuStyle(.borderlessButton).fixedSize()
+                    Menu {
+                        ForEach(RuleProfilePresets.templates) { t in
+                            Button(t.name) { model.upsertProfile(RuleProfilePresets.profile(for: t.name)) }
+                        }
+                    } label: {
+                        HStack(spacing: 6) { Image(systemName: "building.columns.fill"); Text("Blank firm template") }
+                            .font(.system(size: 13, weight: .semibold, design: .rounded)).foregroundColor(BLTheme.text)
+                            .padding(.vertical, 9).padding(.horizontal, 16)
+                            .background(BLTheme.bg2).clipShape(Capsule())
+                            .overlay(Capsule().stroke(BLTheme.gold.opacity(0.3), lineWidth: 1))
+                    }.menuStyle(.borderlessButton).fixedSize()
+                    GhostButton(label: "Custom profile", icon: "square.and.pencil") {
+                        model.upsertProfile(RuleProfilePresets.custom())
+                    }
+                    Spacer()
+                }
+            }
+
+            // One editor card per profile.
+            ForEach(model.profiles) { p in ProfileEditorCard(profile: p) }
+
+            // Reference: the same futures firms as qualitative reference only — no numbers here.
+            Panel(title: "Reference: futures firms", icon: "list.bullet") {
+                Text("Qualitative reference only (no numbers). Confirm current terms on each firm's site, then enter them into a profile above.")
+                    .font(.system(size: 11.5, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+                    .fixedSize(horizontal: false, vertical: true)
+                ForEach(FirmData.all) { f in FirmRow(firm: f) }
+            }
         }.padding(24) }
+    }
+}
+
+// Editor for a single rule profile. Local string state so typing never churns the store; Save
+// commits the parsed numbers back to the model. Every field is the buyer's own — nothing invented.
+struct ProfileEditorCard: View {
+    @EnvironmentObject var model: AppModel
+    let profile: RuleProfile
+    @State private var name: String
+    @State private var dailyLoss: String
+    @State private var trailing: String
+    @State private var maxPos: String
+    @State private var scaling: String
+    @State private var pointValue: String
+    @State private var source: String
+    @State private var saved = false
+
+    init(profile: RuleProfile) {
+        self.profile = profile
+        _name = State(initialValue: profile.name)
+        _dailyLoss = State(initialValue: profile.dailyLossLimit > 0 ? RuleProfileCardFmt.num(profile.dailyLossLimit) : "")
+        _trailing = State(initialValue: profile.trailingDrawdown > 0 ? RuleProfileCardFmt.num(profile.trailingDrawdown) : "")
+        _maxPos = State(initialValue: profile.maxPositionSize > 0 ? RuleProfileCardFmt.num(profile.maxPositionSize) : "")
+        _scaling = State(initialValue: profile.contractScaling > 0 ? RuleProfileCardFmt.num(profile.contractScaling) : "")
+        _pointValue = State(initialValue: profile.pointValue > 0 ? RuleProfileCardFmt.num(profile.pointValue) : "")
+        _source = State(initialValue: profile.sourceURL)
+    }
+
+    private var isActive: Bool { model.activeProfileID == profile.id }
+
+    var body: some View {
+        Panel(title: name.isEmpty ? "Untitled profile" : name,
+              icon: "doc.text.fill",
+              accent: isActive ? BLTheme.green : BLTheme.gold) {
+            HStack {
+                if isActive { StatusPill(text: "Active", tint: BLTheme.green) }
+                Spacer()
+                GhostButton(label: isActive ? "Active" : "Make active", icon: isActive ? "checkmark" : "shield") {
+                    model.setActiveProfile(profile)
+                }
+                GhostButton(label: "Delete", icon: "trash", tint: BLTheme.red) { model.deleteProfile(profile) }
+            }
+            Field(title: "Profile name", text: $name, prompt: "e.g. Topstep 50K")
+            HStack(spacing: 12) {
+                Field(title: "Daily loss limit ($)", text: $dailyLoss, prompt: "your firm's number")
+                Field(title: "Trailing drawdown ($)", text: $trailing, prompt: "your firm's number")
+            }
+            HStack(spacing: 12) {
+                Field(title: "Max position (contracts)", text: $maxPos, prompt: "e.g. 5")
+                Field(title: "Scaling-plan cap (contracts)", text: $scaling, prompt: "e.g. 3")
+                Field(title: "$ per point / contract", text: $pointValue, prompt: "e.g. 50 (ES)")
+            }
+            Field(title: "Source URL (the firm's terms you confirmed)", text: $source, prompt: "https://…")
+            Text("Leave a field blank to skip that cap. Enter numbers from the firm's own terms — confirm current terms on the firm's site.")
+                .font(.system(size: 10, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 10) {
+                GoldButton(label: "Save profile", icon: "checkmark") {
+                    var p = profile
+                    p.name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+                    p.dailyLossLimit = max(0, Double(dailyLoss) ?? 0)
+                    p.trailingDrawdown = max(0, Double(trailing) ?? 0)
+                    p.maxPositionSize = max(0, Double(maxPos) ?? 0)
+                    p.contractScaling = max(0, Double(scaling) ?? 0)
+                    p.pointValue = max(0, Double(pointValue) ?? 0)
+                    p.sourceURL = source.trimmingCharacters(in: .whitespacesAndNewlines)
+                    model.upsertProfile(p)
+                    withAnimation { saved = true }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { withAnimation { saved = false } }
+                }
+                if saved { Text("Saved.").font(.system(size: 11, weight: .semibold, design: .rounded)).foregroundColor(BLTheme.green) }
+                Spacer()
+            }
+        }
+    }
+}
+
+enum RuleProfileCardFmt {
+    static func num(_ v: Double) -> String { v == v.rounded() ? String(Int(v)) : String(v) }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DISCIPLINE COCKPIT UI — renders the pure-logic DisciplineCockpit (RuleProfile.swift) as live
+// gauges. Every value is the buyer's own compliance math against caps THEY entered: NO aggregate
+// win-rate / P&L / performance figure is shown (§5.1 / H1). Shared by Signals + Firms screens.
+struct DisciplineMeterBar: View {
+    let label: String
+    let meter: DisciplineCockpit.Meter
+    private var tint: Color {
+        if meter.isBreached { return BLTheme.red }
+        return meter.fraction >= 0.75 ? BLTheme.gold : BLTheme.green
+    }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack {
+                Text(label).font(.system(size: 11.5, weight: .semibold, design: .rounded)).foregroundColor(BLTheme.sub)
+                Spacer()
+                if meter.isSet {
+                    Text("\(RuleProfileGate.money(meter.used)) / \(RuleProfileGate.money(meter.limit))")
+                        .font(.system(size: 12, weight: .bold, design: .rounded)).foregroundColor(tint)
+                } else {
+                    Text("not set").font(.system(size: 11, weight: .semibold, design: .rounded)).foregroundColor(BLTheme.sub)
+                }
+            }
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(BLTheme.bg2).frame(height: 8)
+                    Capsule().fill(tint)
+                        .frame(width: max(0, min(1, meter.isSet ? meter.fraction : 0)) * geo.size.width, height: 8)
+                }
+            }.frame(height: 8)
+            if meter.isBreached {
+                Text("Cap breached").font(.system(size: 10, weight: .bold, design: .rounded)).foregroundColor(BLTheme.red)
+            } else if meter.isSet {
+                Text("\(RuleProfileGate.money(max(0, meter.remaining))) of room left")
+                    .font(.system(size: 10, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+            } else {
+                Text("Enter this cap on your active profile to gauge it")
+                    .font(.system(size: 10, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+            }
+        }
+    }
+}
+
+struct DisciplineCockpitPanel: View {
+    let cockpit: DisciplineCockpit
+    var onManageProfile: () -> Void = {}
+
+    private var accent: Color {
+        if cockpit.muteSignals { return BLTheme.red }
+        if cockpit.tilt.level == .high || cockpit.dailyLoss.fraction >= 0.75 || cockpit.trailingDrawdown.fraction >= 0.75 {
+            return BLTheme.gold
+        }
+        return BLTheme.green
+    }
+    private var tiltTint: Color {
+        switch cockpit.tilt.level {
+        case .high: return BLTheme.red
+        case .elevated: return BLTheme.gold
+        default: return BLTheme.green
+        }
+    }
+
+    var body: some View {
+        Panel(title: "Discipline cockpit", icon: "gauge.with.dots.needle.bottom.50percent", accent: accent) {
+            if !cockpit.hasData {
+                EmptyState(icon: "gauge.with.dots.needle.bottom.50percent",
+                           title: "No trades to grade yet",
+                           hint: "Log trades in Paper Trade and the cockpit grades your discipline live — daily-loss and trailing-drawdown meters, a Tiltmeter, and risk of ruin, all against your active rule profile's caps. Nothing is shown until it's your own real data.")
+            } else {
+                if cockpit.muteSignals {
+                    HStack(spacing: 9) {
+                        Image(systemName: "bell.slash.fill").font(.system(size: 13, weight: .bold)).foregroundColor(BLTheme.red)
+                        Text(cockpit.muteReason)
+                            .font(.system(size: 11.5, weight: .bold, design: .rounded)).foregroundColor(BLTheme.red)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Spacer()
+                    }
+                    .padding(10).frame(maxWidth: .infinity, alignment: .leading)
+                    .background(BLTheme.red.opacity(0.10)).clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(BLTheme.red.opacity(0.4), lineWidth: 1))
+                }
+                if !cockpit.hasProfile {
+                    HStack(spacing: 8) {
+                        Text("No active profile caps — enter your funded-eval firm's daily-loss and trailing-drawdown limits to arm the meters.")
+                            .font(.system(size: 11, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Spacer()
+                        GhostButton(label: "Set caps", icon: "building.columns.fill", action: onManageProfile)
+                    }
+                }
+                DisciplineMeterBar(label: "Daily loss used", meter: cockpit.dailyLoss)
+                DisciplineMeterBar(label: "Trailing drawdown", meter: cockpit.trailingDrawdown)
+
+                Divider().background(BLTheme.stroke).padding(.vertical, 2)
+                // Tiltmeter — behavioral escalation vs the buyer's OWN baseline (frequency + size).
+                HStack {
+                    Text("Tiltmeter").font(.system(size: 11.5, weight: .semibold, design: .rounded)).foregroundColor(BLTheme.sub)
+                    Spacer()
+                    StatusPill(text: cockpit.tilt.level.rawValue, tint: cockpit.tilt.level == .insufficient ? BLTheme.sub : tiltTint)
+                }
+                if cockpit.tilt.level == .insufficient {
+                    Text("Needs at least \(DisciplineCockpit.minBaselineDays) prior trading days to set your baseline — no invented tilt until then.")
+                        .font(.system(size: 10, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    GeometryReader { geo in
+                        ZStack(alignment: .leading) {
+                            Capsule().fill(BLTheme.bg2).frame(height: 8)
+                            Capsule().fill(tiltTint).frame(width: max(0, min(1, cockpit.tilt.gauge)) * geo.size.width, height: 8)
+                        }
+                    }.frame(height: 8)
+                    ForEach(cockpit.tilt.reasons, id: \.self) { reason in
+                        HStack(spacing: 6) {
+                            Image(systemName: "arrow.up.right").font(.system(size: 10, weight: .bold)).foregroundColor(tiltTint)
+                            Text(reason).font(.system(size: 10.5, weight: .medium, design: .rounded)).foregroundColor(BLTheme.text)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                    if cockpit.tilt.reasons.isEmpty {
+                        Text("Trading in line with your own baseline pace and size.")
+                            .font(.system(size: 10, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+                    }
+                }
+
+                Divider().background(BLTheme.stroke).padding(.vertical, 2)
+                // Risk of ruin — probability of hitting the buyer's OWN floor at their current risk.
+                switch cockpit.ruin.state {
+                case .computed:
+                    Stat(label: "Risk of ruin (your numbers)",
+                         value: String(format: "%.1f%%", cockpit.ruin.probability * 100),
+                         tint: cockpit.ruin.probability >= 0.25 ? BLTheme.red : (cockpit.ruin.probability >= 0.05 ? BLTheme.gold : BLTheme.green))
+                    Text(cockpit.ruin.note)
+                        .font(.system(size: 10, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+                        .fixedSize(horizontal: false, vertical: true)
+                case .noEdge:
+                    Stat(label: "Risk of ruin (your numbers)", value: "≈ 100%", tint: BLTheme.red)
+                    Text(cockpit.ruin.note)
+                        .font(.system(size: 10, weight: .medium, design: .rounded)).foregroundColor(BLTheme.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                case .insufficient:
+                    Text("Risk of ruin: " + cockpit.ruin.note)
+                        .font(.system(size: 10.5, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Text("All figures are computed from your own paper ledger against the caps you entered — a compliance/risk view, not a performance record. Never auto-trades.")
+                    .font(.system(size: 9.5, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
     }
 }
 
@@ -1122,6 +1786,9 @@ struct SettingsScreen: View {
     @State private var googleSaved = false
     @State private var feedURLDraft = ""
     @State private var feedSaved = false
+    // TR-17: neutral, honest refund line until a founder-ratified refund policy exists. NO invented
+    // guarantee ships here (§5.1) — swap this string for the ratified policy copy once Michael sets one.
+    static let refundPolicyLine = "Refunds: if something isn't right, email us — we handle billing issues case by case with a human, not an auto-decline."
     var body: some View {
         ScrollView { VStack(alignment: .leading, spacing: 20) {
             ScreenTitle(title: "Settings", subtitle: "Account, connections, and app info.", icon: "gearshape.fill")
@@ -1175,6 +1842,12 @@ struct SettingsScreen: View {
             }
             .onAppear { feedURLDraft = feed.baseURL; Task { await feed.refreshStatus() } }
 
+            // TR-06 — honest edge-gate alerts to an endpoint the buyer OWNS (off by default).
+            EdgeGateAlertsPanel()
+
+            // TR-20 — feed-cost transparency + provable no-network posture.
+            FeedCostPanel()
+
             // Make the Google sign-in option configurable rather than silently hidden.
             Panel(title: "Sign-in providers", icon: "globe") {
                 Text("Both the Apple and Google buttons always appear on the login screen. Apple sign-in runs for real in the signed (provisioned) build; email/password and guest always work. To make the Google button do a real login, paste your own Google DESKTOP OAuth client ID below — it's stored on this Mac, never bundled. A Web client ID will NOT work for the app's loopback flow; create a \"Desktop\" client in the Google Cloud console.")
@@ -1204,6 +1877,28 @@ struct SettingsScreen: View {
                 productRow("Outbound", "see blacklabelbots.com", "Lead gen and outreach — scoped intro before a monthly lane opens.", BLTheme.sub, "Intro")
                 Text("Current pricing lives on blacklabelbots.com (kept there so it's never stale in the app). This app is a scenario-scoring dashboard for the engine method — it scores factors you set, runs the 13 gates, and keeps an honestly-graded session ledger on this Mac. It is not a broker execution record or track record.")
                     .font(.system(size: 11.5, design: .rounded)).foregroundColor(BLTheme.sub).fixedSize(horizontal: false, vertical: true).padding(.top, 4)
+            }
+            // TR-17 — HONEST renewal / refund / support posture, in-app. Answers the BBB-documented
+            // subscription-renewal-trap pain (TradingView/LuxAlgo/TrendSpider/Tickeron) with the plain
+            // truth, and deliberately makes NO refund PROMISE the company has not ratified.
+            // ⚠️ FOUNDER INPUT NEEDED: replace `refundPolicyLine` below with ratified refund-policy copy
+            // once Michael decides one (30-day? pro-rata? none?). Until then it stays a neutral,
+            // reachable "email a human" — never an invented guarantee (§5.1).
+            Panel(title: "Billing, renewal & support", icon: "creditcard") {
+                Text("Cancel anytime. Your plan does not roll you into a renewal trap — manage or cancel it yourself; there is no phone maze and no retention gauntlet.")
+                    .font(.system(size: 12.5, design: .rounded)).foregroundColor(BLTheme.text).fixedSize(horizontal: false, vertical: true)
+                Text(Self.refundPolicyLine)
+                    .font(.system(size: 12, design: .rounded)).foregroundColor(BLTheme.sub).fixedSize(horizontal: false, vertical: true)
+                Text("Billing questions go to a real person, not a chatbot wall: info@blacklabelbots.com.")
+                    .font(.system(size: 12, design: .rounded)).foregroundColor(BLTheme.sub).fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 8) {
+                    GhostButton(label: "Manage / cancel plan", icon: "arrow.up.right.square") {
+                        if let url = URL(string: "https://blacklabelbots.com/dashboard") { NSWorkspace.shared.open(url) }
+                    }
+                    GhostButton(label: "Email support", icon: "envelope") {
+                        if let url = URL(string: "mailto:info@blacklabelbots.com") { NSWorkspace.shared.open(url) }
+                    }
+                }
             }
             Panel(title: "About", icon: "info.circle") {
                 Text("Black Label Trading v1.0").font(.system(size: 13, weight: .bold, design: .rounded)).foregroundColor(BLTheme.text)
@@ -1237,6 +1932,118 @@ struct SettingsScreen: View {
             StatusPill(text: status, tint: tint)
         }
         .padding(.vertical, 4)
+    }
+}
+
+// MARK: - TR-06 Edge-gate alerts (honest push to an endpoint the BUYER owns)
+// Posts the edge-gate VERDICT — including the honest "no edge on your bars today" — to the buyer's
+// OWN ntfy topic / webhook / Pushover, never through a Black Label relay. OFF by default; with no
+// endpoint the backend makes ZERO network calls. A push can never become an order.
+struct EdgeGateAlertsPanel: View {
+    @EnvironmentObject var feed: FeedClient
+    @State private var status = AlertStatus.empty
+    @State private var enabled = false
+    @State private var provider = "ntfy"
+    @State private var endpoint = ""
+    @State private var pushToken = ""
+    @State private var pushUser = ""
+    @State private var saved = false
+    @State private var sendMsg: String? = nil
+    @State private var sendOK = false
+    @State private var busy = false
+    private let providers = ["ntfy", "pushover", "webhook"]
+
+    var body: some View {
+        Panel(title: "Edge-gate alerts", icon: "bell.badge") {
+            Text("Get the edge-gate's verdict pushed to a channel YOU own — including the honest \u{201C}no edge on your bars today.\u{201D} It posts only to the endpoint you set below, never to a Black Label server, and never sends a win-rate or P&L. A push is information out; it can never place a trade.")
+                .font(.system(size: 11.5, design: .rounded)).foregroundColor(BLTheme.sub).fixedSize(horizontal: false, vertical: true)
+            Toggle(isOn: $enabled) {
+                Text("Enable edge-gate alerts").font(.system(size: 12.5, weight: .semibold, design: .rounded)).foregroundColor(BLTheme.text)
+            }.tint(BLTheme.gold)
+            HStack(spacing: 8) {
+                Text("CHANNEL").font(.system(size: 10, weight: .bold, design: .rounded)).foregroundColor(BLTheme.sub).tracking(0.6)
+                Picker("", selection: $provider) { ForEach(providers, id: \.self) { Text($0).tag($0) } }
+                    .pickerStyle(.segmented).labelsHidden().frame(width: 240)
+                Spacer()
+            }
+            Field(title: provider == "pushover" ? "Endpoint (optional — blank uses Pushover API)" : "Your endpoint URL (https://…)",
+                  text: $endpoint, prompt: provider == "ntfy" ? "https://ntfy.sh/your-topic" : "https://…")
+            if provider == "pushover" {
+                Field(title: "Pushover app token", text: $pushToken, prompt: "your own app token")
+                Field(title: "Pushover user key", text: $pushUser, prompt: "your own user key")
+            }
+            HStack(spacing: 8) {
+                GoldButton(label: "Save", icon: "checkmark") {
+                    busy = true
+                    Task {
+                        let ok = await feed.saveAlertConfig(enabled: enabled, endpoint: endpoint,
+                                                            provider: provider, pushoverToken: pushToken,
+                                                            pushoverUser: pushUser)
+                        status = await feed.alertStatus()
+                        busy = false
+                        withAnimation { saved = ok }
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { withAnimation { saved = false } }
+                    }
+                }
+                GhostButton(label: "Send test", icon: "paperplane") {
+                    busy = true; sendMsg = nil
+                    Task {
+                        let r = await feed.testAlert()
+                        busy = false
+                        sendOK = r.sent
+                        // Honest status: "posted to your endpoint", never "delivered".
+                        sendMsg = r.networked ? (r.sent ? "Posted to your endpoint." : r.reason)
+                                              : "No endpoint configured — nothing was sent (0 network calls)."
+                    }
+                }
+                if saved { Text("Saved.").font(.system(size: 11, weight: .semibold, design: .rounded)).foregroundColor(BLTheme.green) }
+                if busy { Text("…").font(.system(size: 12, design: .rounded)).foregroundColor(BLTheme.sub) }
+            }
+            if let m = sendMsg {
+                Text(m).font(.system(size: 11.5, weight: .semibold, design: .rounded))
+                    .foregroundColor(sendOK ? BLTheme.green : BLTheme.sub).fixedSize(horizontal: false, vertical: true)
+            }
+            HStack(spacing: 6) {
+                Circle().fill(status.configured && status.enabled ? BLTheme.green : BLTheme.sub).frame(width: 8, height: 8)
+                Text(statusLine).font(.system(size: 11, design: .rounded)).foregroundColor(BLTheme.sub)
+            }
+        }
+        .onAppear {
+            Task {
+                status = await feed.alertStatus()
+                enabled = status.enabled
+                provider = status.provider.isEmpty ? "ntfy" : status.provider
+                endpoint = status.endpoint
+            }
+        }
+    }
+    private var statusLine: String {
+        if !status.enabled { return "Alerts off — no network calls are made." }
+        if !status.configured { return "On, but no endpoint set — nothing is sent yet." }
+        return "On — posting to your \(status.provider) endpoint." + (status.egressOk ? "" : " (endpoint must be https://)")
+    }
+}
+
+// MARK: - TR-20 Feed cost & network transparency (the plain truth, provable)
+struct FeedCostPanel: View {
+    var body: some View {
+        Panel(title: "Feed cost & network", icon: "lock.shield") {
+            Text("You already own the feed. Black Label Trading reads YOUR own WealthCharts or TopstepX session in a product-owned browser on this Mac — it does not resell data and there is no subscription you pay us for quotes. Because the bars come from your already-open session, there is $0 extra CME real-time add-on to buy on our side — you are on your entitlement, not ours.")
+                .font(.system(size: 11.5, design: .rounded)).foregroundColor(BLTheme.sub).fixedSize(horizontal: false, vertical: true)
+            Divider().background(BLTheme.stroke)
+            Text("This app phones home to nobody.").font(.system(size: 12.5, weight: .bold, design: .rounded)).foregroundColor(BLTheme.text)
+            bullet("Your captured bars, journal, and gate verdicts stay on this Mac.")
+            bullet("Outbound connections go only to localhost, the broker/feed YOU connect (with your own credentials), and the alert endpoint YOU configure.")
+            bullet("No Black Label server ever receives your data. No analytics, no telemetry, no tracker.")
+            Text("Provable, not just promised: a build-time test (backend/test_egress.py) fails the release if any egress destination is a Black Label server or a tracker; the signed app declares network.client (outbound only) and no inbound server entitlement. Details in docs/EGRESS-AND-FEED-COST.md.")
+                .font(.system(size: 11, design: .rounded)).foregroundColor(BLTheme.sub).fixedSize(horizontal: false, vertical: true).padding(.top, 2)
+        }
+    }
+    @ViewBuilder private func bullet(_ s: String) -> some View {
+        HStack(alignment: .top, spacing: 6) {
+            Text("•").font(.system(size: 12, weight: .bold, design: .rounded)).foregroundColor(BLTheme.gold)
+            Text(s).font(.system(size: 11.5, design: .rounded)).foregroundColor(BLTheme.sub).fixedSize(horizontal: false, vertical: true)
+        }
     }
 }
 

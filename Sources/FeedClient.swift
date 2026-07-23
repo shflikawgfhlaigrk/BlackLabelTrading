@@ -35,6 +35,8 @@ final class FeedClient: ObservableObject {
     }
     private var token: String? = nil
     private var signedIn: Bool { token != nil }
+    // Public read of the session state for view gating (the token itself stays private).
+    var isSignedIn: Bool { signedIn }
 
     private static let urlKey = "com.blacklabel.trading.feedURL"
     static let defaultURL = "http://127.0.0.1:8787"
@@ -98,27 +100,67 @@ final class FeedClient: ObservableObject {
         }
     }
 
-    // Unauthenticated GET for PUBLIC routes only (the reference artifact). No Bearer token — a cold
-    // buyer who has not signed in can still read Black Label's reference OOS verdicts.
-    private func getJSONPublic(_ path: String) async -> [String: Any]? {
-        guard let u = url(path) else { return nil }
+    // Authed POST returning the decoded JSON body (nil on transport/HTTP failure).
+    private func postJSON(_ path: String, _ body: [String: Any]) async -> [String: Any]? {
+        guard let req0 = authed(path) else { return nil }
+        var req = req0; req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
         do {
-            let (data, resp) = try await session.data(for: URLRequest(url: u))
+            let (data, resp) = try await session.data(for: req)
             guard (resp as? HTTPURLResponse)?.statusCode == 200 else { return nil }
             return try JSONSerialization.jsonObject(with: data) as? [String: Any]
         } catch {
+            lastError = friendly(error)
             return nil
         }
     }
 
+    // MARK: - TR-06 honest edge-gate alerts. Posts the gate VERDICT (incl. "no edge") to an endpoint
+    // the buyer OWNS. OFF by default; no endpoint => the backend makes zero network calls. A push can
+    // NEVER become an order (the alert path imports nothing from the execution engine).
+
+    /// Token-free view of the alert config for the settings UI.
+    func alertStatus() async -> AlertStatus {
+        guard signedIn, let o = await getJSON("/api/alerts/status") else { return .empty }
+        return AlertStatus.decode(o)
+    }
+
+    /// Persist the buyer's alert settings (through /api/config; alert keys only).
+    @discardableResult
+    func saveAlertConfig(enabled: Bool, endpoint: String, provider: String,
+                         pushoverToken: String, pushoverUser: String) async -> Bool {
+        let patch: [String: Any] = [
+            "alertEnabled": enabled,
+            "alertEndpoint": endpoint.trimmingCharacters(in: .whitespacesAndNewlines),
+            "alertProvider": provider,
+            "alertPushoverToken": pushoverToken.trimmingCharacters(in: .whitespacesAndNewlines),
+            "alertPushoverUser": pushoverUser.trimmingCharacters(in: .whitespacesAndNewlines),
+        ]
+        return await postJSON("/api/config", patch) != nil
+    }
+
+    /// Fire a TEST alert to the configured endpoint. Returns the honest result (posted / not-sent).
+    func testAlert() async -> AlertSendResult {
+        guard signedIn, let o = await postJSON("/api/alerts/test", [:]) else { return .unreachable }
+        return AlertSendResult.decode(o)
+    }
+
+    /// Post the current edge-gate verdict for the buyer's bars to their endpoint now.
+    func sendGateAlert() async -> AlertSendResult {
+        guard signedIn, let o = await postJSON("/api/alerts/send", [:]) else { return .unreachable }
+        return AlertSendResult.decode(o)
+    }
+
     // MARK: - Reference OOS verdicts (GET /api/reference): Black Label's edge-gate result on OUR OWN
     // historical ES bars, so a cold buyer sees a real, earned verdict before they've captured a
-    // single bar. REFERENCE ONLY — historical ES, not the buyer's account, not a promise. Public
-    // route (no sign-in needed). Ensures the bundled backend is up first, then decodes; an absent
-    // artifact returns .empty (honest pending state), never a fabricated verdict.
+    // single bar. REFERENCE ONLY — historical ES, not the buyer's account, not a promise. AUTHED
+    // route: the backend fails closed on this artifact (no unauthenticated scrape of a signed
+    // verdict), so we send the per-launch Bearer token like every other read. connect() runs before
+    // the reference screen loads, so the token is present; if not, .empty (honest pending state).
     func referenceReport() async -> ReferenceReport {
         await ensureBackendRunning()
-        guard let obj = await getJSONPublic("/api/reference") else { return .empty }
+        guard signedIn, let obj = await getJSON("/api/reference") else { return .empty }
         return ReferenceReport.decode(obj)
     }
 
@@ -237,6 +279,65 @@ final class FeedClient: ObservableObject {
     func engineScreen() async -> [EngineRow] {
         guard signedIn, let obj = await getJSON("/api/screen") else { return [] }
         return EngineRoster.decode(obj)
+    }
+
+    // MARK: - Buyer-triggered gate re-run (GET /api/gate/rerun): re-runs the SHIPPED edge-gate
+    // provers over the buyer's OWN captured bars on demand and returns the full reproducible
+    // statistics (n / W / L / max-drawdown-R / p-value per engine + prover_sha). Empty store or a
+    // signed-out session -> honest empty report (available == false), never a fabricated verdict.
+    func rerunGate() async -> GateRerunReport {
+        guard signedIn, let obj = await getJSON("/api/gate/rerun") else { return .empty }
+        return GateRerunReport.decode(obj)
+    }
+
+    // MARK: - Instrument catalog (GET /api/instruments): the first-class multi-asset picker source.
+    // Enumerates the instruments actually in the buyer's OWN captured bars (never a hardcoded list),
+    // each classified + labeled for which ES-tuned modules apply. Honest onlyES / empty states.
+    func instrumentCatalog() async -> InstrumentCatalog {
+        guard signedIn, let obj = await getJSON("/api/instruments") else { return .empty }
+        return InstrumentCatalog.decode(obj)
+    }
+
+    // MARK: - No-code backtest lab (GET /api/backtest/run): runs the SHIPPED prover on ONE
+    // (engine, symbol) over the buyer's OWN captured bars, optionally date-scoped, split into folds.
+    // Returns per-fold n / W / L / max-drawdown-R / p + prover_sha — never a fabricated headline.
+    // Signed-out or unreachable backend -> honest empty report (available == false).
+    func runBacktestLab(engine: String, symbol: String,
+                        startTs: Int? = nil, endTs: Int? = nil, folds: Int = 1) async -> BacktestLabReport {
+        let s = symbol.trimmingCharacters(in: .whitespaces)
+        guard signedIn, !s.isEmpty, !engine.isEmpty else { return .empty }
+        var path = "/api/backtest/run?engine=\(enc(engine))&symbol=\(enc(s))&folds=\(max(1, folds))"
+        if let a = startTs { path += "&start=\(a)" }
+        if let b = endTs { path += "&end=\(b)" }
+        guard let obj = await getJSON(path) else { return .empty }
+        return BacktestLabReport.decode(obj)
+    }
+
+    // MARK: - TR-19 own-silicon parameter-sweep FARM (GET /api/backtest/farm): fans the SHIPPED
+    // prover's hyperparameter grid across this Mac's cores over the buyer's OWN bars. Per-cell
+    // n / W / L / max-drawdown-R + a BH-FDR-corrected p across the whole grid + prover_sha. No cloud,
+    // no data fee, no aggregate win-rate/$ figure. Signed-out / unreachable -> honest empty report.
+    func runBacktestFarm(engine: String, symbol: String,
+                         startTs: Int? = nil, endTs: Int? = nil) async -> BacktestFarmReport {
+        let s = symbol.trimmingCharacters(in: .whitespaces)
+        guard signedIn, !s.isEmpty, !engine.isEmpty else { return .empty }
+        var path = "/api/backtest/farm?engine=\(enc(engine))&symbol=\(enc(s))"
+        if let a = startTs { path += "&start=\(a)" }
+        if let b = endTs { path += "&end=\(b)" }
+        guard let obj = await getJSON(path) else { return .empty }
+        return BacktestFarmReport.decode(obj)
+    }
+
+    // First/last captured epoch + count for a symbol (GET /api/backtest/bounds) — the lab's honest
+    // date-range default (the real span of the buyer's OWN data). Empty store -> zeros.
+    func barBounds(symbol: String) async -> (count: Int, firstTs: Int?, lastTs: Int?) {
+        let s = symbol.trimmingCharacters(in: .whitespaces)
+        guard signedIn, !s.isEmpty, let obj = await getJSON("/api/backtest/bounds?symbol=\(enc(s))") else {
+            return (0, nil, nil)
+        }
+        let first = FeedBars.num(obj["firstTs"] as Any).map { Int($0) }
+        let last = FeedBars.num(obj["lastTs"] as Any).map { Int($0) }
+        return (Int(FeedBars.num(obj["count"] as Any) ?? 0), first, last)
     }
 
     // MARK: - Signal journal (GET /api/fires): real edge-gated fires recorded from the live feed.

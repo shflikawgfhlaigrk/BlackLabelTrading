@@ -324,6 +324,91 @@ enum EngineRoster {
     }
 }
 
+// MARK: - Live gate verdict for the buyer's OWN bars (the "NO EDGE TODAY" hero).
+// A pure roll-up of the engine fleet (decoded EngineRows from GET /api/screen) into the single
+// honest headline a buyer needs first: how many of their engines have NO edge on their captured
+// bars today, how many are still warming, and how many (if any) cleared an OOS candidate. It
+// NEVER fabricates — an empty fleet (no captured bars) is `hasData == false`, and the counts are
+// grouped straight from the real per-engine rows. No aggregate win-rate, no P&L, no promise.
+struct GateReject: Equatable, Identifiable {
+    var engine: String       // engine id (label via EngineRoster.label)
+    var reason: String       // the engine's honest reject/why-no-edge line
+    var id: String { engine }
+}
+
+struct GateVerdict: Equatable {
+    var hasData: Bool        // false when no bars captured yet (fleet empty)
+    var evaluated: Int       // engines actually evaluated on the buyer's bars
+    var candidates: Int      // engines with >=1 OOS candidate (edge cleared significance)
+    var warming: Int         // engines still warming (insufficient bars)
+    var noEdge: Int          // engines evaluated with a sufficient sample but no edge
+    var rejects: [GateReject]   // per no-edge/warming engine, the honest reason (candidates excluded)
+
+    // Headline: the blunt truth first. Zero proven edges is the norm and the tool says so plainly.
+    var headline: String {
+        if !hasData { return "No bars captured yet" }
+        if candidates > 0 {
+            return "\(candidates) of \(evaluated) engine\(evaluated == 1 ? "" : "s"): OOS candidate on your bars today"
+        }
+        return "\(noEdge + warming) of \(evaluated) engine\(evaluated == 1 ? "" : "s"): no edge on your bars today"
+    }
+
+    var subline: String {
+        if !hasData {
+            return "Connect your feed and let bars accumulate — the gate verdict is computed only from your own captured bars."
+        }
+        var parts: [String] = []
+        if candidates > 0 { parts.append("\(candidates) OOS candidate\(candidates == 1 ? "" : "s") (research only, not proven live)") }
+        if noEdge > 0 { parts.append("\(noEdge) no edge") }
+        if warming > 0 { parts.append("\(warming) still warming") }
+        return parts.joined(separator: " · ")
+    }
+
+    // True when the honest verdict is "no engine has an edge on your bars right now".
+    var isNoEdge: Bool { hasData && candidates == 0 }
+
+    // Group the fleet by engine and roll each up to a single honest status. `fleet` is the decoded
+    // /api/screen rows for the buyer's own bars; an engine "has edge" if ANY of its symbol rows
+    // cleared the gate, is "warming" if all its rows are warming, else "no edge".
+    static func compute(_ fleet: [EngineRow]) -> GateVerdict {
+        if fleet.isEmpty {
+            return GateVerdict(hasData: false, evaluated: 0, candidates: 0, warming: 0, noEdge: 0, rejects: [])
+        }
+        // Preserve roster order for a stable, non-arbitrary reject list.
+        var order: [String] = []
+        var byEngine: [String: [EngineRow]] = [:]
+        for r in fleet {
+            if byEngine[r.engine] == nil { order.append(r.engine) }
+            byEngine[r.engine, default: []].append(r)
+        }
+        let ordered = EngineRoster.order.filter { byEngine[$0] != nil }
+            + order.filter { !EngineRoster.order.contains($0) }
+        var candidates = 0, warming = 0, noEdge = 0
+        var rejects: [GateReject] = []
+        for eng in ordered {
+            let rows = byEngine[eng] ?? []
+            let hasEdge = rows.contains { $0.edge }
+            let allWarming = !rows.isEmpty && rows.allSatisfy { $0.warming }
+            if hasEdge {
+                candidates += 1
+                continue                       // candidates are surfaced elsewhere, not as "rejects"
+            } else if allWarming {
+                warming += 1
+            } else {
+                noEdge += 1
+            }
+            // Best reason to show: the row with the largest OOS sample (most trades) is the most
+            // informative "why no edge"; fall back to the first row's reason.
+            let best = rows.max(by: { $0.trades < $1.trades }) ?? rows.first
+            let reason = best?.reason.isEmpty == false ? best!.reason
+                : (allWarming ? "warming — not enough of your bars yet" : "no edge on your captured bars")
+            rejects.append(GateReject(engine: eng, reason: reason))
+        }
+        return GateVerdict(hasData: true, evaluated: ordered.count,
+                           candidates: candidates, warming: warming, noEdge: noEdge, rejects: rejects)
+    }
+}
+
 // MARK: - Reference OOS verdicts from GET /api/reference.
 // Black Label's edge-gate result computed on OUR OWN historical ES bars by the shipped provers —
 // so a cold buyer (no captured bars yet) can see the gate produce a real, earned verdict. This is
@@ -410,6 +495,445 @@ struct ReferenceReport: Equatable {
     }
 }
 
+// MARK: - Buyer-triggered gate re-run from GET /api/gate/rerun.
+// The one-click "re-run the edge gate on MY bars" result: the SAME shipped provers (SIG_MIN_N=30,
+// one-sided binomial p<0.05, grid-wide FDR) run live over the buyer's OWN captured bars, stamped
+// with the prover-source sha256 so it is reproducible (`shasum -a 256 bltd_store.py`). Every field
+// is decoded straight from the artifact — no aggregate win-rate, no equity, no $ claim, no promise.
+// A thin sample decodes as `insufficient` (n < minTrades); an empty store as `available == false`.
+struct GateRerunContract: Equatable, Identifiable {
+    var symbol: String
+    var bars: Int
+    var trades: Int          // n — OOS trades
+    var wins: Int
+    var losses: Int
+    var winRate: Double
+    var netPts: Double
+    var expectancyR: Double
+    var maxDrawdownR: Double
+    var pEdge: Double
+    var proven: Bool
+    var insufficient: Bool
+    var fdrRejected: Bool
+    var reason: String
+    var id: String { symbol }
+
+    // Reproducible one-line stat block for the UI — the raw numbers, no interpretation.
+    // e.g. "n=51 · 33W/18L · net +12.30 pts · maxDD 4.00R · p=0.001". When insufficient, n is shown
+    // honestly with the "< min" note instead of a p-value that can't be trusted.
+    func statLine(minTrades: Int) -> String {
+        if trades == 0 { return "n=0 · no trades triggered on your bars" }
+        let base = "n=\(trades) · \(wins)W/\(losses)L · net \(String(format: "%+.2f", netPts)) pts · maxDD \(String(format: "%.2f", maxDrawdownR))R"
+        if insufficient { return base + " · p n/a (n<\(minTrades))" }
+        return base + " · p=\(String(format: "%.3f", pEdge))"
+    }
+}
+
+struct GateRerunEngine: Equatable, Identifiable {
+    var engine: String
+    var status: String       // "candidate" | "no_edge" | "insufficient"
+    var contracts: [GateRerunContract]
+    var id: String { engine }
+    var isCandidate: Bool { status == "candidate" }
+    var isInsufficient: Bool { status == "insufficient" }
+    // The contract to headline: the proven one if any, else the largest real sample, else the first.
+    var best: GateRerunContract? {
+        contracts.first(where: { $0.proven })
+            ?? contracts.max(by: { $0.trades < $1.trades })
+            ?? contracts.first
+    }
+}
+
+struct GateRerunReport: Equatable {
+    var available: Bool
+    var label: String
+    var source: String
+    var proverSHA: String
+    var minTrades: Int
+    var alpha: Double
+    var test: String
+    var generatedUTC: String
+    var symbols: [String]
+    var engineCount: Int
+    var candidateCount: Int
+    var noEdgeCount: Int
+    var insufficientCount: Int
+    var engines: [GateRerunEngine]
+    var reason: String?
+
+    static let empty = GateRerunReport(
+        available: false,
+        label: "Re-run of the edge-gate on YOUR captured bars — reproducible, not a promise, no performance guaranteed.",
+        source: "", proverSHA: "", minTrades: 30, alpha: 0.05, test: "", generatedUTC: "",
+        symbols: [], engineCount: 0, candidateCount: 0, noEdgeCount: 0, insufficientCount: 0,
+        engines: [], reason: nil)
+
+    // Provenance line — the whole run is reproducible from this.
+    var proverLine: String {
+        "prover \(proverSHA.isEmpty ? "—" : proverSHA) · one-sided binomial p<\(String(format: "%.2f", alpha)) · min n \(minTrades)"
+    }
+
+    static func decode(_ obj: [String: Any]) -> GateRerunReport {
+        let available = (obj["available"] as? Bool) ?? false
+        var out = GateRerunReport.empty
+        out.available = available
+        out.label = (obj["label"] as? String) ?? out.label
+        out.source = (obj["source"] as? String) ?? ""
+        out.proverSHA = (obj["prover_sha"] as? String) ?? ""
+        out.minTrades = Int(FeedBars.num(obj["sigMinN"] as Any) ?? 30)
+        out.alpha = FeedBars.num(obj["alpha"] as Any) ?? 0.05
+        out.test = (obj["test"] as? String) ?? ""
+        out.generatedUTC = (obj["generatedUTC"] as? String) ?? ""
+        out.symbols = (obj["symbols"] as? [String]) ?? []
+        out.engineCount = Int(FeedBars.num(obj["engineCount"] as Any) ?? 0)
+        out.candidateCount = Int(FeedBars.num(obj["candidateCount"] as Any) ?? 0)
+        out.noEdgeCount = Int(FeedBars.num(obj["noEdgeCount"] as Any) ?? 0)
+        out.insufficientCount = Int(FeedBars.num(obj["insufficientCount"] as Any) ?? 0)
+        out.reason = obj["reason"] as? String
+        out.engines = ((obj["engines"] as? [[String: Any]]) ?? []).compactMap { e in
+            guard let id = e["engine"] as? String else { return nil }
+            let contracts: [GateRerunContract] = ((e["contracts"] as? [[String: Any]]) ?? []).compactMap { c in
+                guard let sym = c["symbol"] as? String, TradingSymbolScope.inScope(sym) else { return nil }
+                return GateRerunContract(
+                    symbol: sym,
+                    bars: Int(FeedBars.num(c["bars"] as Any) ?? 0),
+                    trades: Int(FeedBars.num(c["trades"] as Any) ?? 0),
+                    wins: Int(FeedBars.num(c["wins"] as Any) ?? 0),
+                    losses: Int(FeedBars.num(c["losses"] as Any) ?? 0),
+                    winRate: FeedBars.num(c["winRate"] as Any) ?? 0,
+                    netPts: FeedBars.num(c["netPts"] as Any) ?? 0,
+                    expectancyR: FeedBars.num(c["expectancyR"] as Any) ?? 0,
+                    maxDrawdownR: FeedBars.num(c["maxDrawdownR"] as Any) ?? 0,
+                    pEdge: FeedBars.num(c["pEdge"] as Any) ?? 1.0,
+                    proven: (c["proven"] as? Bool) ?? false,
+                    insufficient: (c["insufficient"] as? Bool) ?? false,
+                    fdrRejected: (c["fdrRejected"] as? Bool) ?? false,
+                    reason: (c["reason"] as? String) ?? "")
+            }
+            return GateRerunEngine(engine: id,
+                                   status: (e["status"] as? String) ?? "no_edge",
+                                   contracts: contracts)
+        }
+        return out
+    }
+}
+
+// MARK: - Instrument catalog from GET /api/instruments (TR-05 multi-asset product layer).
+// Enumerates the instruments actually present in the buyer's OWN captured bars, each classified by
+// asset class + whether the ES-tuned modules apply. NEVER a hardcoded list — the backend derives it
+// from the bars table, so it only ever names instruments the buyer really has. `onlyES` is the honest
+// "only ES captured so far" state (not an empty promise of multi-asset coverage).
+struct InstrumentInfo: Equatable, Identifiable {
+    var symbol: String        // raw captured symbol (venue prefix preserved), e.g. "CM.MNQU6"
+    var display: String       // clean token, e.g. "MNQU6"
+    var root: String          // futures root / ticker, e.g. "MNQ"
+    var assetClass: String    // us_index_future / energy_future / metal_future / equity_etf / other …
+    var pointValue: Double?   // $ per 1.00 point when the contract spec is known, else nil (points only)
+    var esFamily: Bool
+    var esModules: Bool       // whether the ES-tuned Session/SMT modules apply (== esFamily)
+    var bars: Int
+    var live: Bool
+    var backtestable: Bool
+    var id: String { symbol }
+
+    // Human asset-class label for the picker.
+    var assetClassLabel: String {
+        switch assetClass {
+        case "us_index_future": return "US index future"
+        case "energy_future":   return "Energy future"
+        case "metal_future":    return "Metal future"
+        case "rates_future":    return "Rates future"
+        case "fx_future":       return "FX future"
+        case "crypto_future":   return "Crypto future"
+        case "other_future":    return "Future"
+        case "equity_etf":      return "Equity / ETF"
+        default:                return "Other"
+        }
+    }
+    // Honest per-instrument module note (never silent wrong math).
+    var moduleNote: String {
+        esModules ? "All modules apply (ES-tuned Session + SMT active)"
+                  : "Session + SMT are ES-only — absent here; all other modules apply"
+    }
+    var dollarNote: String {
+        if let pv = pointValue {
+            let s = pv == pv.rounded() ? String(Int(pv)) : String(format: "%.2f", pv)
+            return "$\(s)/pt"
+        }
+        return "points only (no contract multiplier)"
+    }
+}
+
+struct InstrumentCatalog: Equatable {
+    var available: Bool
+    var count: Int
+    var esFamilyCount: Int
+    var nonEsCount: Int
+    var onlyES: Bool
+    var label: String
+    var esModulesNote: String
+    var instruments: [InstrumentInfo]
+    var reason: String?
+
+    static let empty = InstrumentCatalog(
+        available: false, count: 0, esFamilyCount: 0, nonEsCount: 0, onlyES: false,
+        label: "", esModulesNote: "", instruments: [], reason: nil)
+
+    // Honest headline for the picker header.
+    var headline: String {
+        if !available { return "No instruments captured yet — connect your feed and let bars accumulate." }
+        if onlyES { return "Only ES captured so far — connect your feed and capture NQ/YM/CL/ETFs to analyze them here." }
+        return "\(count) instrument\(count == 1 ? "" : "s") captured · \(nonEsCount) non-ES · each analyzed on its own bars."
+    }
+
+    static func decode(_ obj: [String: Any]) -> InstrumentCatalog {
+        var out = InstrumentCatalog.empty
+        out.available = (obj["available"] as? Bool) ?? false
+        out.count = Int(FeedBars.num(obj["count"] as Any) ?? 0)
+        out.esFamilyCount = Int(FeedBars.num(obj["esFamilyCount"] as Any) ?? 0)
+        out.nonEsCount = Int(FeedBars.num(obj["nonEsCount"] as Any) ?? 0)
+        out.onlyES = (obj["onlyES"] as? Bool) ?? false
+        out.label = (obj["label"] as? String) ?? ""
+        out.esModulesNote = (obj["esModulesNote"] as? String) ?? ""
+        out.reason = obj["reason"] as? String
+        out.instruments = ((obj["instruments"] as? [[String: Any]]) ?? []).compactMap { i in
+            guard let sym = i["symbol"] as? String, TradingSymbolScope.inScope(sym) else { return nil }
+            return InstrumentInfo(
+                symbol: sym,
+                display: (i["display"] as? String) ?? TradingSymbolScope.displaySymbol(sym),
+                root: (i["root"] as? String) ?? "",
+                assetClass: (i["assetClass"] as? String) ?? "other",
+                pointValue: (i["pointValue"] as? NSNull) == nil ? FeedBars.num(i["pointValue"] as Any) : nil,
+                esFamily: (i["esFamily"] as? Bool) ?? false,
+                esModules: (i["esModules"] as? Bool) ?? false,
+                bars: Int(FeedBars.num(i["bars"] as Any) ?? 0),
+                live: (i["live"] as? Bool) ?? false,
+                backtestable: (i["backtestable"] as? Bool) ?? false)
+        }
+        return out
+    }
+}
+
+// MARK: - No-code backtest lab from GET /api/backtest/run.
+// The buyer picks ONE engine + ONE instrument + an optional date range; the backend runs the SAME
+// shipped prover (bltd_store.PROVERS) on their OWN captured bars, split into contiguous folds, and
+// returns per-fold n / W / L / max-drawdown-R / p-value + the prover sha256. NO aggregate win-rate,
+// NO equity, NO $ figure, NO promise — the buyer's own edge math on their own chosen slice. A fold
+// with fewer than minTrades OOS trades decodes as `insufficient` (significance not assessed).
+struct BacktestLabFold: Equatable, Identifiable {
+    var fold: Int
+    var bars: Int
+    var trades: Int          // n — OOS trades
+    var wins: Int
+    var losses: Int
+    var winRate: Double
+    var netPts: Double
+    var expectancyR: Double
+    var maxDrawdownR: Double
+    var pEdge: Double
+    var proven: Bool
+    var insufficient: Bool
+    var reason: String
+    var id: Int { fold }
+
+    // Raw, reproducible stat line — no interpretation, no headline metric.
+    func statLine(minTrades: Int) -> String {
+        if trades == 0 { return "n=0 · no trades triggered on your bars" }
+        let base = "n=\(trades) · \(wins)W/\(losses)L · net \(String(format: "%+.2f", netPts)) pts · maxDD \(String(format: "%.2f", maxDrawdownR))R"
+        if insufficient { return base + " · p n/a (n<\(minTrades))" }
+        return base + " · p=\(String(format: "%.3f", pEdge))"
+    }
+}
+
+struct BacktestLabReport: Equatable {
+    var available: Bool
+    var engine: String
+    var symbol: String
+    var label: String
+    var source: String
+    var proverSHA: String
+    var minTrades: Int
+    var alpha: Double
+    var test: String
+    var generatedUTC: String
+    var totalBars: Int
+    var status: String       // "candidate" | "no_edge" | "insufficient"
+    var whole: BacktestLabFold?
+    var folds: [BacktestLabFold]
+    var reason: String
+
+    static let empty = BacktestLabReport(
+        available: false, engine: "", symbol: "",
+        label: "Run of the SHIPPED edge-gate prover on YOUR captured bars only — reproducible, not a promise, no performance guaranteed.",
+        source: "", proverSHA: "", minTrades: 30, alpha: 0.05, test: "", generatedUTC: "",
+        totalBars: 0, status: "insufficient", whole: nil, folds: [], reason: "")
+
+    var proverLine: String {
+        "prover \(proverSHA.isEmpty ? "—" : proverSHA) · one-sided binomial p<\(String(format: "%.2f", alpha)) · min n \(minTrades)"
+    }
+
+    private static func decodeFold(_ f: [String: Any]) -> BacktestLabFold {
+        BacktestLabFold(
+            fold: Int(FeedBars.num(f["fold"] as Any) ?? 0),
+            bars: Int(FeedBars.num(f["bars"] as Any) ?? 0),
+            trades: Int(FeedBars.num(f["trades"] as Any) ?? 0),
+            wins: Int(FeedBars.num(f["wins"] as Any) ?? 0),
+            losses: Int(FeedBars.num(f["losses"] as Any) ?? 0),
+            winRate: FeedBars.num(f["winRate"] as Any) ?? 0,
+            netPts: FeedBars.num(f["netPts"] as Any) ?? 0,
+            expectancyR: FeedBars.num(f["expectancyR"] as Any) ?? 0,
+            maxDrawdownR: FeedBars.num(f["maxDrawdownR"] as Any) ?? 0,
+            pEdge: FeedBars.num(f["pEdge"] as Any) ?? 1.0,
+            proven: (f["proven"] as? Bool) ?? false,
+            insufficient: (f["insufficient"] as? Bool) ?? false,
+            reason: (f["reason"] as? String) ?? "")
+    }
+
+    static func decode(_ obj: [String: Any]) -> BacktestLabReport {
+        var out = BacktestLabReport.empty
+        out.available = (obj["available"] as? Bool) ?? false
+        out.engine = (obj["engine"] as? String) ?? ""
+        out.symbol = (obj["symbol"] as? String) ?? ""
+        out.label = (obj["label"] as? String) ?? out.label
+        out.source = (obj["source"] as? String) ?? ""
+        out.proverSHA = (obj["prover_sha"] as? String) ?? ""
+        out.minTrades = Int(FeedBars.num(obj["sigMinN"] as Any) ?? 30)
+        out.alpha = FeedBars.num(obj["alpha"] as Any) ?? 0.05
+        out.test = (obj["test"] as? String) ?? ""
+        out.generatedUTC = (obj["generatedUTC"] as? String) ?? ""
+        out.totalBars = Int(FeedBars.num(obj["totalBars"] as Any) ?? 0)
+        out.status = (obj["status"] as? String) ?? "insufficient"
+        out.reason = (obj["reason"] as? String) ?? ""
+        if let w = obj["whole"] as? [String: Any] { out.whole = decodeFold(w) }
+        out.folds = ((obj["folds"] as? [[String: Any]]) ?? []).map { decodeFold($0) }
+        return out
+    }
+}
+
+// MARK: - TR-19 own-silicon parameter-sweep backtest FARM from GET /api/backtest/farm.
+// The buyer picks ONE engine + ONE instrument; the backend fans the SHIPPED prover's hyperparameter
+// grid across this Mac's cores over their OWN captured bars — no cloud, no data fee, no egress. Every
+// cell reports n / W / L / max-drawdown-R and a Benjamini–Hochberg FDR-corrected p across the WHOLE
+// grid (`pEdgeAdj`). A raw best-cell p is NEVER surfaced (that would be a multiple-comparisons lie);
+// there is NO aggregate win-rate / equity / $ figure. A cell with < minTrades OOS trades decodes as
+// `insufficient`. "On your captured bars only — NOT a promise."
+struct BacktestFarmCell: Equatable, Identifiable {
+    var index: Int
+    var params: String       // human-readable parameter set, e.g. "lookback=20 · mrZ=2.0"
+    var trades: Int
+    var wins: Int
+    var losses: Int
+    var netPts: Double
+    var maxDrawdownR: Double
+    var pEdgeAdj: Double      // BH-FDR-corrected — the ONLY p shown as significance
+    var proven: Bool
+    var insufficient: Bool
+    var reason: String
+    var id: Int { index }
+
+    // Raw, reproducible stat line — trade count + FDR-adjusted p, never a headline win-rate/$.
+    var statLine: String {
+        if trades == 0 { return "n=0 · no trades on your bars" }
+        let base = "n=\(trades) · \(wins)W/\(losses)L · net \(String(format: "%+.2f", netPts)) pts · maxDD \(String(format: "%.2f", maxDrawdownR))R"
+        if insufficient { return base + " · p n/a (n<min)" }
+        return base + " · FDR-adj p=\(String(format: "%.3f", pEdgeAdj))"
+    }
+}
+
+struct BacktestFarmReport: Equatable {
+    var available: Bool
+    var engine: String
+    var symbol: String
+    var label: String
+    var overfitNote: String
+    var proverSHA: String
+    var minTrades: Int
+    var alpha: Double
+    var fdrQ: Double
+    var compute: String       // "process-pool (N workers)" | "serial …" — honest, never faked
+    var cores: Int
+    var generatedUTC: String
+    var totalBars: Int
+    var cellsTried: Int
+    var provenCells: Int
+    var cellsInsufficient: Int
+    var cellsSufficient: Int
+    var gridSize: Int
+    var gridTruncated: Bool
+    var status: String        // "candidate" | "no_edge" | "insufficient"
+    var best: BacktestFarmCell?
+    var cells: [BacktestFarmCell]
+    var reason: String
+
+    static let empty = BacktestFarmReport(
+        available: false, engine: "", symbol: "",
+        label: "Parameter sweep of the SHIPPED edge-gate prover on YOUR captured bars only — reproducible, NOT a promise, no performance guaranteed.",
+        overfitNote: "Best-of-N parameter search inflates significance. Every p is Benjamini–Hochberg FDR-corrected across all cells tried; a raw best-cell p is never shown.",
+        proverSHA: "", minTrades: 30, alpha: 0.05, fdrQ: 0.10, compute: "", cores: 0,
+        generatedUTC: "", totalBars: 0, cellsTried: 0, provenCells: 0, cellsInsufficient: 0,
+        cellsSufficient: 0, gridSize: 0, gridTruncated: false, status: "insufficient",
+        best: nil, cells: [], reason: "")
+
+    var proverLine: String {
+        "prover \(proverSHA.isEmpty ? "—" : proverSHA) · BH-FDR q≤\(String(format: "%.2f", fdrQ)) · min n \(minTrades)"
+    }
+
+    private static func paramString(_ p: [String: Any]) -> String {
+        p.keys.sorted().map { k -> String in
+            let v = p[k]
+            if let d = FeedBars.num(v as Any) {
+                // integers without a trailing ".0"; floats to 2dp
+                return d == d.rounded() ? "\(k)=\(Int(d))" : "\(k)=\(String(format: "%.2f", d))"
+            }
+            return "\(k)=\(v ?? "")"
+        }.joined(separator: " · ")
+    }
+
+    private static func decodeCell(_ c: [String: Any], _ idx: Int) -> BacktestFarmCell {
+        BacktestFarmCell(
+            index: idx,
+            params: paramString((c["params"] as? [String: Any]) ?? [:]),
+            trades: Int(FeedBars.num(c["trades"] as Any) ?? 0),
+            wins: Int(FeedBars.num(c["wins"] as Any) ?? 0),
+            losses: Int(FeedBars.num(c["losses"] as Any) ?? 0),
+            netPts: FeedBars.num(c["netPts"] as Any) ?? 0,
+            maxDrawdownR: FeedBars.num(c["maxDrawdownR"] as Any) ?? 0,
+            pEdgeAdj: FeedBars.num(c["pEdgeAdj"] as Any) ?? 1.0,
+            proven: (c["proven"] as? Bool) ?? false,
+            insufficient: (c["insufficient"] as? Bool) ?? false,
+            reason: (c["reason"] as? String) ?? "")
+    }
+
+    static func decode(_ obj: [String: Any]) -> BacktestFarmReport {
+        var out = BacktestFarmReport.empty
+        out.available = (obj["available"] as? Bool) ?? false
+        out.engine = (obj["engine"] as? String) ?? ""
+        out.symbol = (obj["symbol"] as? String) ?? ""
+        out.label = (obj["label"] as? String) ?? out.label
+        out.overfitNote = (obj["overfitNote"] as? String) ?? out.overfitNote
+        out.proverSHA = (obj["prover_sha"] as? String) ?? ""
+        out.minTrades = Int(FeedBars.num(obj["sigMinN"] as Any) ?? 30)
+        out.alpha = FeedBars.num(obj["alpha"] as Any) ?? 0.05
+        out.fdrQ = FeedBars.num(obj["fdrQ"] as Any) ?? 0.10
+        out.compute = (obj["compute"] as? String) ?? ""
+        out.cores = Int(FeedBars.num(obj["cores"] as Any) ?? 0)
+        out.generatedUTC = (obj["generatedUTC"] as? String) ?? ""
+        out.totalBars = Int(FeedBars.num(obj["totalBars"] as Any) ?? 0)
+        out.cellsTried = Int(FeedBars.num(obj["cellsTried"] as Any) ?? 0)
+        out.provenCells = Int(FeedBars.num(obj["provenCells"] as Any) ?? 0)
+        out.cellsInsufficient = Int(FeedBars.num(obj["cellsInsufficient"] as Any) ?? 0)
+        out.cellsSufficient = Int(FeedBars.num(obj["cellsSufficient"] as Any) ?? 0)
+        out.gridSize = Int(FeedBars.num(obj["gridSize"] as Any) ?? 0)
+        out.gridTruncated = (obj["gridTruncated"] as? Bool) ?? false
+        out.status = (obj["status"] as? String) ?? "insufficient"
+        out.reason = (obj["reason"] as? String) ?? ""
+        let rawCells = (obj["cells"] as? [[String: Any]]) ?? []
+        out.cells = rawCells.enumerated().map { decodeCell($1, $0) }
+        if let b = obj["best"] as? [String: Any] { out.best = decodeCell(b, -1) }
+        return out
+    }
+}
+
 // MARK: - Signal journal from GET /api/fires.
 // Real recorded (non-synthetic) edge-gated fires, newest first. outcome/pnl are nil until the
 // daemon grades the signal (honest — never an invented result for an open signal). A row with no
@@ -449,5 +973,55 @@ enum FireFeed {
                 ts: r["ts"] as? String,
                 tsEpoch: FeedBars.num(r["tsEpoch"] as Any))
         }
+    }
+}
+
+// MARK: - TR-06 honest alert models (decoded from /api/alerts/*).
+
+/// Token-free view of the alert configuration (GET /api/alerts/status). Never carries the Pushover
+/// token/user or a raw endpoint query — the backend redacts before it reaches here.
+struct AlertStatus: Equatable {
+    var enabled: Bool
+    var provider: String
+    var endpoint: String
+    var configured: Bool
+    var egressOk: Bool
+    var pushoverConfigured: Bool
+    var note: String
+
+    static let empty = AlertStatus(enabled: false, provider: "ntfy", endpoint: "",
+                                   configured: false, egressOk: false, pushoverConfigured: false,
+                                   note: "")
+
+    static func decode(_ obj: [String: Any]) -> AlertStatus {
+        AlertStatus(
+            enabled: (obj["enabled"] as? Bool) ?? false,
+            provider: (obj["provider"] as? String) ?? "ntfy",
+            endpoint: (obj["endpoint"] as? String) ?? "",
+            configured: (obj["configured"] as? Bool) ?? false,
+            egressOk: (obj["egressOk"] as? Bool) ?? false,
+            pushoverConfigured: (obj["pushoverConfigured"] as? Bool) ?? false,
+            note: (obj["note"] as? String) ?? "")
+    }
+}
+
+/// The honest result of a test / send (POST /api/alerts/{test,send}). `sent` means the buyer's
+/// endpoint accepted the POST — "posted", never "delivered". `networked` is false when the app made
+/// no network call at all (off / no endpoint), which is the provable no-egress state.
+struct AlertSendResult: Equatable {
+    var sent: Bool
+    var networked: Bool
+    var reason: String
+    var summary: String
+
+    static let unreachable = AlertSendResult(sent: false, networked: false,
+                                             reason: "backend unreachable", summary: "")
+
+    static func decode(_ obj: [String: Any]) -> AlertSendResult {
+        AlertSendResult(
+            sent: (obj["sent"] as? Bool) ?? false,
+            networked: (obj["networked"] as? Bool) ?? false,
+            reason: (obj["reason"] as? String) ?? "",
+            summary: (obj["summary"] as? String) ?? "")
     }
 }

@@ -1468,6 +1468,62 @@ func testNoAPIWebhookIngestionContract() {
        "feed UI does not ask for prop-account API credentials")
 }
 
+// entitlementKeys — the <key> names GRANTED by an entitlements plist, judged by the <dict> alone.
+// XML comments are stripped first: the rationale comment in app-developerid.entitlements deliberately
+// NAMES allow-dyld-environment-variables to explain why it is withheld, so a whole-file substring
+// check would read that prose as a grant and fire on a clean tree. Only a real <key> counts.
+func entitlementKeys(_ rel: String) -> [String] {
+    var text = source(rel)
+    while let open = text.range(of: "<!--"),
+          let close = text.range(of: "-->", range: open.upperBound..<text.endIndex) {
+        text.removeSubrange(open.lowerBound..<close.upperBound)
+    }
+    var keys: [String] = []
+    var rest = Substring(text)
+    while let open = rest.range(of: "<key>"),
+          let close = rest.range(of: "</key>", range: open.upperBound..<rest.endIndex) {
+        keys.append(String(rest[open.upperBound..<close.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines))
+        rest = rest[close.upperBound...]
+    }
+    return keys
+}
+
+// ===== Entitlements hardening (b25) — the bytes the Developer-ID ship signs with =====
+// allow-dyld-environment-variables must stay ABSENT. It governs DYLD_* variables only; nothing in the
+// app sets one — launch-backend.sh passes PYTHONPATH, a plain interpreter var the hardened runtime
+// never strips. Granting it alongside disable-library-validation (which the bundled CPython genuinely
+// needs) would re-open DYLD_INSERT_LIBRARIES injection of unsigned dylibs into a notarized,
+// Developer-ID-trusted process. disable-library-validation must stay PRESENT or the backend can't load
+// its .so extensions. Both halves are asserted per file: absence alone would pass on an empty read.
+func testEntitlementsHardeningContract() {
+    let dyldEnv = "com.apple.security.cs.allow-dyld-environment-variables"
+    let libVal = "com.apple.security.cs.disable-library-validation"
+
+    for file in ["Sources/app-developerid.entitlements", "Sources/app.entitlements"] {
+        let keys = entitlementKeys(file)
+        // Positive control: a wrong/empty path yields no keys, which would otherwise read as
+        // "no forbidden entitlement granted" — i.e. clean by vacuity.
+        ok(!keys.isEmpty, "[entitlements] \(file) parsed at least one granted key")
+        ok(keys.contains(libVal), "[entitlements] \(file) GRANTS disable-library-validation")
+        ok(!keys.contains(dyldEnv), "[entitlements] \(file) does NOT grant allow-dyld-environment-variables")
+        ok(!keys.contains("com.apple.security.app-sandbox"),
+           "[entitlements] \(file) does NOT grant app-sandbox (would break the backend spawn)")
+    }
+
+    // The reason the entitlement is not needed, asserted against the launcher it describes.
+    let launcher = source("backend/launch-backend.sh")
+    ok(launcher.contains("export PYTHONPATH="),
+       "[entitlements] launcher imports bundled modules via PYTHONPATH")
+    ok(!launcher.contains("DYLD_"),
+       "[entitlements] launcher sets no DYLD_* variable, so no dyld-env entitlement is needed")
+
+    // The rationale must survive in the shipped file — a future reader who deletes it loses the
+    // reason and re-grants the entitlement. Asserted on the raw text, not the parsed keys.
+    let raw = source("Sources/app-developerid.entitlements")
+    ok(raw.contains("intentionally NOT granted"),
+       "[entitlements] Developer-ID file documents why the dyld-env entitlement is withheld")
+}
+
 // ===== ChartRender — headless chart + engine-trade overlay (edge-gate transparency) =====
 // Locks that the renderer survives every honest input shape: a full fire (entry/stop/target), a
 // fire with nil legs (no stop/no target), a CLOSED fire (outcome set), and empty bars (no-data
@@ -1608,6 +1664,600 @@ func testFireFeedDecode() {
     eqi(FireFeed.decode(["fires": []]).count, 0, "empty fires honest")
 }
 
+// ===== "NO EDGE TODAY" hero verdict + buyer-triggered gate re-run (own bars) =====
+func testGateVerdictNoEdgeAndReasons() {
+    // 3 engines on the buyer's bars: one no-edge (sufficient sample), one warming, one candidate.
+    let fleet = [
+        EngineRow(engine: "meanrev", symbol: "CM.ESU6", edge: false, warming: false,
+                  winRate: 0.5, netPts: -3.0, expectancyR: -0.1, trades: 44, bars: 300,
+                  reason: "no edge — win 50.0% / net -3.00 pts on 44 OOS trades (p=0.610)"),
+        EngineRow(engine: "breakout", symbol: "CM.ESU6", edge: false, warming: true,
+                  winRate: 0.0, netPts: 0.0, expectancyR: 0.0, trades: 0, bars: 20, reason: "warming (20 bars)"),
+        EngineRow(engine: "momentum", symbol: "CM.ESU6", edge: true, warming: false,
+                  winRate: 0.7, netPts: 12.0, expectancyR: 0.4, trades: 40, bars: 300, reason: "OOS candidate"),
+    ]
+    let v = GateVerdict.compute(fleet)
+    ok(v.hasData, "verdict has data when fleet non-empty")
+    eqi(v.evaluated, 3, "verdict evaluated engine count")
+    eqi(v.candidates, 1, "verdict candidate count")
+    eqi(v.warming, 1, "verdict warming count")
+    eqi(v.noEdge, 1, "verdict no-edge count")
+    ok(!v.isNoEdge, "candidate present -> not a blanket no-edge verdict")
+    // candidate engine is NOT listed as a reject; the no-edge + warming ones are, in roster order.
+    eqi(v.rejects.count, 2, "rejects exclude candidate engines")
+    ok(v.rejects.first?.engine == "meanrev", "rejects preserve roster order (meanrev first)")
+    ok(v.rejects.contains { $0.engine == "meanrev" && $0.reason.contains("no edge") }, "reject carries honest reason")
+    ok(v.headline.contains("OOS candidate"), "headline surfaces the candidate")
+}
+
+func testGateVerdictAllNoEdgeHeadline() {
+    let fleet = [
+        EngineRow(engine: "meanrev", symbol: "CM.ESU6", edge: false, warming: false,
+                  winRate: 0.5, netPts: -1.0, expectancyR: 0.0, trades: 50, bars: 300, reason: "no edge"),
+        EngineRow(engine: "regime", symbol: "CM.ESU6", edge: false, warming: false,
+                  winRate: 0.48, netPts: -2.0, expectancyR: 0.0, trades: 60, bars: 300, reason: "no edge"),
+    ]
+    let v = GateVerdict.compute(fleet)
+    ok(v.isNoEdge, "no candidates -> blanket no-edge verdict")
+    ok(v.headline.contains("no edge on your bars today"), "no-edge headline is blunt and honest")
+    eqi(v.candidates, 0, "no-edge verdict has zero candidates")
+}
+
+func testGateVerdictEmptyStoreHonest() {
+    let v = GateVerdict.compute([])
+    ok(!v.hasData, "empty fleet -> hasData false (no fabricated verdict)")
+    eqi(v.evaluated, 0, "empty fleet evaluates zero engines")
+    ok(v.headline == "No bars captured yet", "empty headline is honest")
+    ok(v.rejects.isEmpty, "empty fleet has no reject rows")
+}
+
+// ===== Prop-firm rule profiles (item 7) — the profile-gating decision =====
+// A signal with a 2-pt stop at $50/pt/contract => $100 risk per contract.
+func testRuleProfileGateWithinLimitsAndMax() {
+    let p = RuleProfile(name: "Topstep 50K", dailyLossLimit: 500, trailingDrawdown: 2000,
+                        maxPositionSize: 5, contractScaling: 0, pointValue: 50, sourceURL: "")
+    let d = RuleProfileGate.evaluate(riskPoints: 2, pointValue: 50, contracts: 1, profile: p)
+    ok(d.verdict == .withinLimits, "1 contract respects every cap -> within limits")
+    ok(d.reasons.isEmpty, "within limits has no breach reasons")
+    eq(d.dollarRiskAtSize, 100, "one stop-out risk = 2pt * $50 * 1")
+    // maxContracts = min(maxPos 5, floor(dailyLoss 500/100)=5, floor(trailing 2000/100)=20) = 5
+    eqi(d.maxContracts, 5, "max contracts within all set limits")
+    ok(d.annotation.contains("Within limits") && d.annotation.contains("max 5"), "annotation states within + max")
+    ok(!d.isBreach, "within limits is not a breach")
+}
+
+func testRuleProfileGateBreach() {
+    let p = RuleProfile(name: "Topstep 50K", dailyLossLimit: 500, trailingDrawdown: 2000,
+                        maxPositionSize: 5, contractScaling: 0, pointValue: 50, sourceURL: "")
+    // 6 contracts => $600 (> $500 daily-loss) AND position 6 > max 5 => two breach reasons.
+    let d = RuleProfileGate.evaluate(riskPoints: 2, pointValue: 50, contracts: 6, profile: p)
+    ok(d.verdict == .breach, "over-cap size is a breach")
+    ok(d.isBreach, "isBreach true on breach")
+    eqi(d.reasons.count, 2, "both the position and daily-loss caps are breached")
+    ok(d.reasons.contains { $0.contains("max position") }, "position-cap breach reason present")
+    ok(d.reasons.contains { $0.contains("daily-loss") }, "daily-loss breach reason present")
+    eqi(d.maxContracts, 5, "breach still reports the largest within-limits size")
+    ok(d.annotation.hasPrefix("Breach:"), "breach annotation is prefixed Breach:")
+    // A stop-out big enough that even one contract breaches -> maxContracts 0.
+    let tight = RuleProfile(name: "tight", dailyLossLimit: 50, trailingDrawdown: 0,
+                            maxPositionSize: 0, contractScaling: 0, pointValue: 50, sourceURL: "")
+    let d0 = RuleProfileGate.evaluate(riskPoints: 2, pointValue: 50, contracts: 1, profile: tight)
+    ok(d0.verdict == .breach, "1 contract over the daily-loss cap is a breach")
+    eqi(d0.maxContracts, 0, "no contract count fits an over-tight cap")
+    ok(d0.annotation.contains("0 contracts"), "annotation states 0 contracts fit")
+}
+
+func testRuleProfileGateEdgeOfCap() {
+    let p = RuleProfile(name: "edge", dailyLossLimit: 500, trailingDrawdown: 2000,
+                        maxPositionSize: 5, contractScaling: 0, pointValue: 50, sourceURL: "")
+    // Exactly at the caps: $500 == daily-loss and 5 == max position -> within (uses > for breach).
+    let d = RuleProfileGate.evaluate(riskPoints: 2, pointValue: 50, contracts: 5, profile: p)
+    ok(d.verdict == .withinLimits, "hitting the cap exactly is within limits, not a breach")
+    eq(d.dollarRiskAtSize, 500, "edge-of-cap dollar risk equals the daily-loss limit")
+    eqi(d.maxContracts, 5, "edge-of-cap max contracts = the cap")
+    // One more contract tips it over.
+    let over = RuleProfileGate.evaluate(riskPoints: 2, pointValue: 50, contracts: 6, profile: p)
+    ok(over.verdict == .breach, "one contract past the cap breaches")
+}
+
+func testRuleProfileGateEmptyNoProfileNoSignal() {
+    // Empty profile: selected but no caps entered -> honest emptyProfile, never a fake pass.
+    let blank = RuleProfilePresets.profile(for: "Apex Trader Funding")
+    ok(!blank.hasLimits, "a blank firm template ships with no limits set")
+    let de = RuleProfileGate.evaluate(riskPoints: 2, pointValue: 50, contracts: 1, profile: blank)
+    ok(de.verdict == .emptyProfile, "profile with no caps -> emptyProfile verdict")
+    ok(de.annotation.contains("no limits set"), "empty-profile annotation is honest")
+    // No profile selected at all.
+    let dn = RuleProfileGate.evaluate(riskPoints: 2, pointValue: 50, contracts: 1, profile: nil)
+    ok(dn.verdict == .noProfile, "nil profile -> noProfile verdict")
+    // A real profile but no computable signal (flat / zero stop distance).
+    let p = RuleProfile(name: "x", dailyLossLimit: 500, trailingDrawdown: 0,
+                        maxPositionSize: 0, contractScaling: 0, pointValue: 50, sourceURL: "")
+    let ds = RuleProfileGate.evaluate(riskPoints: 0, pointValue: 50, contracts: 1, profile: p)
+    ok(ds.verdict == .noSignal, "no stop distance -> noSignal (never a fabricated pass)")
+    // $/pt falls back to the signal's when the profile leaves it unset.
+    let noPV = RuleProfile(name: "noPV", dailyLossLimit: 500, trailingDrawdown: 0,
+                           maxPositionSize: 0, contractScaling: 0, pointValue: 0, sourceURL: "")
+    let dfb = RuleProfileGate.evaluate(riskPoints: 2, pointValue: 50, contracts: 1, profile: noPV)
+    ok(dfb.verdict == .withinLimits, "profile $/pt falls back to the signal's when unset")
+    eq(dfb.dollarRiskAtSize, 100, "fallback $/pt computes the correct dollar risk")
+    // Scaling-plan cap is enforced independently of the absolute position cap.
+    let scale = RuleProfile(name: "scale", dailyLossLimit: 0, trailingDrawdown: 0,
+                            maxPositionSize: 0, contractScaling: 3, pointValue: 50, sourceURL: "")
+    let dsc = RuleProfileGate.evaluate(riskPoints: 2, pointValue: 50, contracts: 4, profile: scale)
+    ok(dsc.verdict == .breach && dsc.reasons.contains { $0.contains("scaling-plan") }, "scaling-plan cap breaches independently")
+    eqi(dsc.maxContracts, 3, "scaling-plan cap sets the max contracts")
+}
+
+// Sourced prop-firm presets (from propfirm-rules-v2-2026-07-12.md): the pre-filled, cited values
+// and the §5.1 encoding rule (0 cells stay user-entered; every field editable; firm-domain source).
+func testSourcedPropFirmPresets() {
+    let presets = RuleProfilePresets.sourcedPresets
+    ok(!presets.isEmpty, "sourced presets ship with cited firm values")
+
+    func find(_ firm: String, _ size: String) -> RuleProfilePresets.SourcedPreset? {
+        presets.first { $0.firm == firm && $0.accountLabel == size }
+    }
+
+    // 50K anchors — every number traces to the firm's own page (2026-07-12).
+    guard let apex = find("Apex Intraday PA", "50K") else { ok(false, "Apex 50K preset present"); return }
+    eq(apex.trailingDrawdown, 2000, "Apex Intraday PA 50K trailing DD = $2,000 (sourced)")
+    eq(apex.maxPositionSize, 4, "Apex Intraday PA 50K max position = 4 (sourced)")
+    eq(apex.dailyLossLimit, 0, "Apex daily-loss is tier-based -> user-entered (0), not fabricated")
+
+    guard let tradeify = find("Tradeify Growth", "50K") else { ok(false, "Tradeify 50K preset present"); return }
+    eq(tradeify.dailyLossLimit, 1250, "Tradeify Growth 50K daily-loss = $1,250 (sourced)")
+    eq(tradeify.trailingDrawdown, 2000, "Tradeify Growth 50K trailing DD = $2,000 (sourced)")
+    eq(tradeify.maxPositionSize, 4, "Tradeify Growth 50K max position = 4 (sourced)")
+
+    guard let tpt = find("Take Profit Trader", "50K") else { ok(false, "TPT 50K preset present"); return }
+    eq(tpt.dailyLossLimit, 0, "TPT has no daily-loss limit -> 0 (honest, not fabricated)")
+    eq(tpt.trailingDrawdown, 2000, "TPT 50K trailing DD = $2,000 (sourced)")
+    eq(tpt.maxPositionSize, 6, "TPT 50K max position = 6 (sourced)")
+
+    // v3 (2026-07-14): TPT per-size table now firm-Zendesk sourced at ALL five sizes.
+    guard let tpt25 = find("Take Profit Trader", "25K") else { ok(false, "TPT 25K preset present"); return }
+    eq(tpt25.trailingDrawdown, 1500, "TPT 25K trailing DD = $1,500 (v3 sourced)")
+    eq(tpt25.maxPositionSize, 3, "TPT 25K max position = 3 (v3 sourced)")
+    guard let tpt75 = find("Take Profit Trader", "75K") else { ok(false, "TPT 75K preset present"); return }
+    eq(tpt75.trailingDrawdown, 2500, "TPT 75K trailing DD = $2,500 (v3 sourced)")
+    eq(tpt75.maxPositionSize, 9, "TPT 75K max position = 9 (v3 sourced)")
+    guard let tpt100 = find("Take Profit Trader", "100K") else { ok(false, "TPT 100K preset present"); return }
+    eq(tpt100.trailingDrawdown, 3000, "TPT 100K trailing DD = $3,000 (v3 sourced)")
+    eq(tpt100.maxPositionSize, 12, "TPT 100K max position = 12 (v3 sourced)")
+    guard let tpt150 = find("Take Profit Trader", "150K") else { ok(false, "TPT 150K preset present"); return }
+    eq(tpt150.trailingDrawdown, 4500, "TPT 150K trailing DD = $4,500 (v3 sourced)")
+    eq(tpt150.maxPositionSize, 15, "TPT 150K max position = 15 (v3 sourced)")
+
+    guard let fn = find("FundedNext Flex", "50K") else { ok(false, "FundedNext 50K preset present"); return }
+    eq(fn.trailingDrawdown, 1500, "FundedNext Flex 50K trailing DD = $1,500 (sourced)")
+    eq(fn.maxPositionSize, 3, "FundedNext Flex 50K max position = 3 (sourced)")
+
+    // v3: FundedNext Bolt (50K only) — DLL $1,000 soft breach / max loss $2,000 EOD trailing / 3 mini.
+    guard let bolt = find("FundedNext Bolt", "50K") else { ok(false, "FundedNext Bolt 50K preset present"); return }
+    eq(bolt.dailyLossLimit, 1000, "FundedNext Bolt 50K daily-loss = $1,000 (v3 sourced, soft breach)")
+    eq(bolt.trailingDrawdown, 2000, "FundedNext Bolt 50K max loss / trailing DD = $2,000 (v3 sourced)")
+    eq(bolt.maxPositionSize, 3, "FundedNext Bolt 50K max position = 3 minis (v3 sourced)")
+
+    // v3 (firm page updated 2026-06-18): Tradeify 25K Growth trailing RESOLVED to $1,000 (v2 N/A retired).
+    guard let t25 = find("Tradeify Growth", "25K") else { ok(false, "Tradeify 25K preset present"); return }
+    eq(t25.trailingDrawdown, 1000, "Tradeify 25K Growth trailing DD = $1,000 (v3 sourced; lock @ $26,100)")
+    eq(t25.dailyLossLimit, 600, "Tradeify 25K daily-loss = $600 (sourced)")
+
+    // Invariants across EVERY sourced preset: a firm-domain source, at least one real cap, editable,
+    // and it actually gates a signal (proves the pre-fill flows into the same honest gate math).
+    for p in presets {
+        ok(p.sourceURL.hasPrefix("https://"), "\(p.id): carries an https firm-source URL")
+        let prof = p.makeProfile()
+        ok(prof.sourceURL == p.sourceURL, "\(p.id): profile keeps the cited source URL")
+        ok(prof.hasLimits, "\(p.id): sourced preset has at least one real cap set")
+        eq(prof.contractScaling, 0, "\(p.id): scaling stays user-entered (buyer's funded tier)")
+        eq(prof.pointValue, 0, "\(p.id): $/pt stays user-entered (buyer's instrument)")
+        // A stop-out sized to breach the trailing cap must be caught by the same gate.
+        if prof.trailingDrawdown > 0 {
+            let contracts = Int(prof.trailingDrawdown / 100) + 2   // > cap at $/pt=1, riskPoints=100
+            let d = RuleProfileGate.evaluate(riskPoints: 100, pointValue: 1, contracts: contracts, profile: prof)
+            ok(d.verdict == .breach, "\(p.id): an over-cap stop-out breaches the sourced trailing DD")
+        }
+    }
+
+    // Grouping keeps size order within each firm (for the UI submenu).
+    let groups = RuleProfilePresets.sourcedByFirm
+    ok(groups.contains { $0.firm == "Apex Intraday PA" && $0.presets.count == 4 }, "Apex groups its 4 sourced sizes")
+}
+
+// §5.1 citation invariant: NO uncited number ships. Every non-zero preset field must carry a
+// firm-primary sourceURL, and every cell the research marked [unverified-blocked] / tier-based must
+// stay 0 (user-entered) — never a guessed value. This is the no-fabrication contract for the pre-fill.
+func testSourcedPresetCitationInvariant() {
+    let presets = RuleProfilePresets.sourcedPresets
+    ok(!presets.isEmpty, "citation invariant runs over shipped sourced presets")
+
+    for p in presets {
+        // Any encoded (non-zero) cap MUST be backed by a non-empty, firm-domain https source.
+        let hasAnyNonZero = p.dailyLossLimit > 0 || p.trailingDrawdown > 0
+            || p.maxPositionSize > 0
+        if hasAnyNonZero {
+            ok(!p.sourceURL.isEmpty, "\(p.id): a non-zero preset field is backed by a non-empty sourceURL")
+            ok(p.sourceURL.hasPrefix("https://"), "\(p.id): sourceURL is an https firm-primary page")
+        }
+        // The pre-filled profile must carry that same citation and never invent contractScaling/pointValue.
+        let prof = p.makeProfile()
+        if prof.dailyLossLimit > 0 || prof.trailingDrawdown > 0 || prof.maxPositionSize > 0 {
+            ok(!prof.sourceURL.isEmpty, "\(p.id): pre-filled profile keeps a non-empty citation for its caps")
+        }
+        eq(prof.contractScaling, 0, "\(p.id): contractScaling stays 0 (uncited, buyer's funded tier)")
+        eq(prof.pointValue, 0, "\(p.id): pointValue stays 0 (uncited, buyer's instrument)")
+    }
+
+    // The exact cells company-researcher marked unverified-blocked / tier-based MUST be zero — never guessed.
+    func cell(_ firm: String, _ size: String) -> RuleProfilePresets.SourcedPreset? {
+        presets.first { $0.firm == firm && $0.accountLabel == size }
+    }
+    // Apex Intraday PA daily-loss is scaling-tier-based at EVERY size → user-entered (0). Apex EOD/Legacy
+    // per-size dollars stay [unverified-blocked] (firm renders them as an image / Zendesk 403) → not encoded at all.
+    for size in ["25K", "50K", "100K", "150K"] {
+        if let a = cell("Apex Intraday PA", size) {
+            eq(a.dailyLossLimit, 0, "Apex \(size): tier-based daily-loss stays 0 (uncited)")
+        }
+    }
+    ok(!presets.contains { $0.firm.contains("Apex") && ($0.firm.contains("EOD") || $0.firm.contains("Legacy")) },
+       "Apex EOD/Legacy per-size stays [unverified-blocked] — no guessed dollars encoded")
+    // v3 (firm page updated 2026-06-18): Tradeify 25K Growth trailing is now firm-sourced = $1,000 (not N/A),
+    // and it must carry a firm-primary citation like any encoded cap.
+    if let t = cell("Tradeify Growth", "25K") {
+        eq(t.trailingDrawdown, 1000, "Tradeify 25K Growth trailing = $1,000 (v3 firm-sourced, lock @ $26,100)")
+        ok(t.sourceURL.hasPrefix("https://"), "Tradeify 25K trailing carries a firm-primary citation")
+    }
+    // v3: Take Profit Trader now renders ALL five sizes from its firm Zendesk help center → all pre-filled.
+    let tptSizes = presets.filter { $0.firm == "Take Profit Trader" }.map { $0.accountLabel }
+    ok(tptSizes == ["25K", "50K", "75K", "100K", "150K"], "TPT: all five firm-Zendesk-sourced sizes are pre-filled (v3)")
+    // Take Profit Trader has no daily-loss limit on any account → 0 (honest, not fabricated) at every size.
+    for size in tptSizes {
+        if let tpt = cell("Take Profit Trader", size) { eq(tpt.dailyLossLimit, 0, "TPT \(size) daily-loss stays 0 (firm has none)") }
+    }
+
+    // TEETH (regression lock): the invariant's core guard — a non-zero cap with an empty sourceURL — must be
+    // exactly what gets rejected. Plant such a preset locally and assert the guard predicate would fire on it.
+    // (Proves the citation invariant still has teeth without polluting the shipped `sourcedPresets`.)
+    let planted = RuleProfilePresets.SourcedPreset(firm: "PLANTED-UNCITED", accountLabel: "X",
+        dailyLossLimit: 999, trailingDrawdown: 0, maxPositionSize: 0, sourceURL: "", note: "planted teeth check")
+    let plantedHasNonZero = planted.dailyLossLimit > 0 || planted.trailingDrawdown > 0 || planted.maxPositionSize > 0
+    ok(plantedHasNonZero && planted.sourceURL.isEmpty,
+       "citation-invariant teeth: a non-zero cap with an empty sourceURL is exactly what the guard rejects")
+    ok(!presets.contains { p in
+            (p.dailyLossLimit > 0 || p.trailingDrawdown > 0 || p.maxPositionSize > 0) && p.sourceURL.isEmpty
+        }, "no shipped sourced preset carries an uncited (empty-sourceURL) non-zero cap")
+}
+
+// ===== TR-18 Discipline cockpit (pure compliance math on the buyer's OWN fills) =====
+// A deterministic UTC calendar so startOfDay bucketing is timezone-independent in the test.
+let cockpitCal: Calendar = { var c = Calendar(identifier: .gregorian); c.timeZone = TimeZone(identifier: "UTC")!; return c }()
+
+func testDisciplineCockpitMetersAndMute() {
+    // now = day(0). "today" fills sit a few hours earlier the SAME UTC day.
+    let now = day(0)
+    // --- within limits: one −$400 loss today, no drawdown breach ---
+    let pA = RuleProfile(name: "Topstep 50K", dailyLossLimit: 1000, trailingDrawdown: 2000, pointValue: 50)
+    let a = DisciplineCockpit.compute(
+        fills: [DisciplineFill(date: now.addingTimeInterval(-3600), pnl: -400, contracts: 1)],
+        profile: pA, startingBalance: 50_000, now: now, calendar: cockpitCal)
+    ok(a.hasData && a.hasProfile, "cockpit sees the buyer's data + active profile")
+    eq(a.dailyLoss.used, 400, "daily-loss meter = today's realized loss")
+    eq(a.dailyLoss.limit, 1000, "daily-loss cap is the buyer's own number")
+    eq(a.dailyLoss.fraction, 0.4, "daily-loss fraction")
+    eq(a.trailingDrawdown.used, 400, "trailing DD = peak−equity on the buyer's own curve")
+    ok(!a.muteSignals, "within limits -> signals not muted")
+
+    // --- daily-loss BREACH: two −$600 losses same day = −$1200 > $1000 cap ---
+    let b = DisciplineCockpit.compute(
+        fills: [DisciplineFill(date: now.addingTimeInterval(-7200), pnl: -600, contracts: 1),
+                DisciplineFill(date: now.addingTimeInterval(-3600), pnl: -600, contracts: 1)],
+        profile: pA, startingBalance: 50_000, now: now, calendar: cockpitCal)
+    ok(b.dailyLoss.isBreached, "daily-loss cap breached at −$1200")
+    ok(b.muteSignals && b.muteReason.contains("Daily-loss limit"), "daily breach mutes the signal display")
+
+    // --- trailing-drawdown BREACH isolated (no daily cap set): +3000 then −2100 => DD 2100 > 2000 ---
+    let pT = RuleProfile(name: "Apex", dailyLossLimit: 0, trailingDrawdown: 2000, pointValue: 50)
+    let t = DisciplineCockpit.compute(
+        fills: [DisciplineFill(date: day(-1), pnl: 3000, contracts: 1),
+                DisciplineFill(date: now.addingTimeInterval(-3600), pnl: -2100, contracts: 1)],
+        profile: pT, startingBalance: 50_000, now: now, calendar: cockpitCal)
+    eq(t.trailingDrawdown.used, 2100, "trailing DD tracks the running peak (53000) minus equity (50900)")
+    ok(!t.dailyLoss.isSet, "unset daily-loss cap is honestly not gating")
+    ok(t.muteSignals && t.muteReason.contains("Trailing drawdown"), "trailing DD breach mutes signals")
+}
+
+func testDisciplineCockpitTiltmeter() {
+    let now = day(0)
+    var fills: [DisciplineFill] = []
+    // 3 prior active days, 2 trades each (baseline count = 2, baseline size = 1 contract).
+    for d in [-3, -2, -1] {
+        fills.append(DisciplineFill(date: day(d), pnl: 10, contracts: 1))
+        fills.append(DisciplineFill(date: day(d).addingTimeInterval(60), pnl: -10, contracts: 1))
+    }
+    // Today: 5 trades at 3 contracts each -> freq 5/2 = 2.5×, size 3/1 = 3× -> HIGH tilt.
+    for i in 0..<5 { fills.append(DisciplineFill(date: now.addingTimeInterval(Double(-i) * 600 - 600), pnl: 5, contracts: 3)) }
+    let c = DisciplineCockpit.compute(fills: fills, profile: nil, startingBalance: 50_000, now: now, calendar: cockpitCal)
+    eqi(c.tilt.tradeCountToday, 5, "today trade count")
+    eq(c.tilt.baselineTradesPerDay, 2, "baseline = median prior active-day count")
+    eq(c.tilt.freqRatio, 2.5, "frequency escalation ratio")
+    eq(c.tilt.baselineContracts, 1, "baseline contract size = median prior size")
+    eq(c.tilt.sizeRatio, 3, "size escalation ratio")
+    ok(c.tilt.level == .high, "2.5× freq / 3× size -> HIGH tilt")
+    eq(c.tilt.gauge, 1, "gauge caps at 1 for >=2× escalation")
+    ok(c.tilt.reasons.count == 2, "both frequency and size escalation are called out")
+    // Fewer than 2 prior active days -> honestly insufficient (never a fabricated baseline).
+    let thin = DisciplineCockpit.compute(fills: [DisciplineFill(date: day(-1), pnl: 5, contracts: 1),
+                                                 DisciplineFill(date: now, pnl: 5, contracts: 1)],
+                                         profile: nil, startingBalance: 50_000, now: now, calendar: cockpitCal)
+    ok(thin.tilt.level == .insufficient, "one prior day -> insufficient baseline, no invented tilt")
+}
+
+func testDisciplineCockpitRiskOfRuin() {
+    let now = day(0)
+    // Even-money system: reduces EXACTLY to the classic gambler's ruin (q/p)^U.
+    // 4 losses then 6 wins of ±$100 (net +$200): equity ends at its peak -> currentDD = 0.
+    let seq: [Double] = [-100, -100, -100, -100, 100, 100, 100, 100, 100, 100]
+    let fills = seq.enumerated().map { DisciplineFill(date: day(-10 + $0.offset), pnl: $0.element, contracts: 1) }
+    let p = RuleProfile(name: "eval", dailyLossLimit: 0, trailingDrawdown: 400, pointValue: 50)
+    let c = DisciplineCockpit.compute(fills: fills, profile: p, startingBalance: 50_000, now: now, calendar: cockpitCal)
+    ok(c.trailingDrawdown.used == 0, "equity ends at peak -> no live drawdown")
+    ok(c.ruin.state == .computed, "risk of ruin computed on the buyer's own 10 decided trades")
+    eq(c.ruin.unitsToFloor, 4, "buffer $400 / avg loss $100 = 4 units to floor")
+    // W=0.6, b=1 -> z=0.2 -> (0.8/1.2)^4 = (2/3)^4 = 16/81.
+    eq(c.ruin.probability, 16.0/81.0, "even-money RoR reduces to (q/p)^U", tol: 1e-9)
+
+    // No positive edge -> ruin is certain over time (probability 1), honestly labeled.
+    let losing = ([100.0, 100, 100] + Array(repeating: -100.0, count: 7)).enumerated()
+        .map { DisciplineFill(date: day(-10 + $0.offset), pnl: $0.element, contracts: 1) }
+    let cl = DisciplineCockpit.compute(fills: losing, profile: p, startingBalance: 50_000, now: now, calendar: cockpitCal)
+    ok(cl.ruin.state == .noEdge && cl.ruin.probability == 1.0, "non-positive edge -> RoR = 1 (no fabricated hope)")
+
+    // Fewer than the minimum decided trades -> honestly insufficient.
+    let few = (0..<5).map { DisciplineFill(date: day(-5 + $0), pnl: $0 % 2 == 0 ? 100 : -100, contracts: 1) }
+    let cf = DisciplineCockpit.compute(fills: few, profile: p, startingBalance: 50_000, now: now, calendar: cockpitCal)
+    ok(cf.ruin.state == .insufficient, "thin sample -> insufficient, never an invented ruin number")
+}
+
+func testDisciplineCockpitEmptyHonest() {
+    let c = DisciplineCockpit.compute(fills: [], profile: nil, startingBalance: 50_000, now: day(0), calendar: cockpitCal)
+    ok(!c.hasData, "empty ledger -> hasData false")
+    ok(!c.hasProfile, "no profile -> hasProfile false")
+    ok(!c.dailyLoss.isSet && !c.trailingDrawdown.isSet, "no caps -> meters honestly not set")
+    ok(!c.muteSignals, "nothing to breach -> signals not muted")
+    ok(c.tilt.level == .insufficient, "no history -> tilt insufficient")
+    ok(c.ruin.state == .insufficient, "no trades -> ruin insufficient")
+}
+
+// ===== TR-13 non-repaint (client mirror): a live tick folds ONLY into the forming bar =====
+func testNonRepaintClosedBarsSwiftMirror() {
+    // The backend emits CLOSED buckets only (ohlc_bars drops the still-forming bucket). The client
+    // decodes that closed series and a live last-price folds into the FORMING (last) bar alone —
+    // never repainting a prior closed bar and never fabricating a future candle. This mirrors the
+    // backend non-repaint test and answers the "does it repaint?" takedown on the client side.
+    let obj: [String: Any] = ["symbol": "CM.ESU6", "bars": [
+        [100.0, 101.0, 99.0, 100.5, 1_700_000_000.0],
+        [100.5, 102.0, 100.0, 101.5, 1_700_000_015.0],
+        [101.5, 103.0, 101.0, 102.5, 1_700_000_030.0],
+    ]]
+    let bars = FeedBars.decode(obj)
+    eqi(bars.count, 3, "closed bars decode (forming bucket already excluded server-side)")
+
+    // A newer tick moves only the last (forming) bar; count never grows -> no invented future candle.
+    let tick = LiveTick(symbol: "CM.ESU6", price: 104, ts: Date(timeIntervalSince1970: 1_700_000_040))
+    let folded = LiveFold.apply(tick, to: bars)
+    eqi(folded.count, bars.count, "a live tick never fabricates a new bar")
+    ok(folded[0] == bars[0] && folded[1] == bars[1], "prior CLOSED bars do not repaint on a new tick")
+    eq(folded.last!.close, 104, "only the forming bar's close revises")
+    eq(folded.last!.high, 104, "forming bar high widens to the tick")
+
+    // A tick OLDER than the forming bar never rewrites history.
+    let stale = LiveFold.apply(LiveTick(symbol: "CM.ESU6", price: 1, ts: Date(timeIntervalSince1970: 1_700_000_020)), to: bars)
+    ok(stale == bars, "older tick is ignored — the closed series is frozen")
+
+    // Re-decoding the SAME closed payload is field-for-field identical: a prior signal's bars never revise.
+    let bars2 = FeedBars.decode(obj)
+    ok(bars2.count == bars.count && zip(bars, bars2).allSatisfy {
+        $0.date == $1.date && $0.open == $1.open && $0.high == $1.high && $0.low == $1.low && $0.close == $1.close
+    }, "closed-bar decode is deterministic (non-repainting)")
+}
+
+// ===== TR-05 multi-asset: InstrumentCatalog decode + honest per-instrument module labels =====
+func testInstrumentCatalogDecodeAndModuleLabels() {
+    let obj: [String: Any] = [
+        "available": true, "count": 3, "esFamilyCount": 1, "nonEsCount": 2, "onlyES": false,
+        "label": "Instruments captured from YOUR own feed", "esModulesNote": "Session and SMT are ES-tuned",
+        "instruments": [
+            ["symbol": "CM.ESU6", "display": "ESU6", "root": "ES", "assetClass": "us_index_future",
+             "pointValue": 50.0, "esFamily": true, "esModules": true, "bars": 400, "live": true, "backtestable": true],
+            ["symbol": "CM.MNQU6", "display": "MNQU6", "root": "MNQ", "assetClass": "us_index_future",
+             "pointValue": 2.0, "esFamily": false, "esModules": false, "bars": 300, "live": true, "backtestable": true],
+            ["symbol": "US.SPY", "display": "SPY", "root": "SPY", "assetClass": "equity_etf",
+             "pointValue": NSNull(), "esFamily": false, "esModules": false, "bars": 120, "live": false, "backtestable": true],
+        ],
+    ]
+    let cat = InstrumentCatalog.decode(obj)
+    ok(cat.available && cat.count == 3, "catalog decode available + count")
+    eqi(cat.nonEsCount, 2, "two non-ES instruments decoded")
+    ok(!cat.onlyES, "onlyES false when non-ES present")
+    ok(cat.headline.contains("non-ES"), "headline surfaces non-ES coverage")
+    let es = cat.instruments[0], mnq = cat.instruments[1], spy = cat.instruments[2]
+    // ES: ES-tuned modules apply; dollars known.
+    ok(es.esModules && es.moduleNote.contains("ES-tuned Session + SMT active"), "ES row: modules apply")
+    ok(es.dollarNote == "$50/pt", "ES row: known dollar/pt")
+    // MNQ: non-ES future — Session/SMT labeled ES-only, never silent wrong math; dollars still known.
+    ok(!mnq.esModules && mnq.moduleNote.contains("Session + SMT are ES-only"), "MNQ row: ES-only modules labeled")
+    ok(mnq.dollarNote == "$2/pt", "MNQ row: known dollar/pt")
+    // SPY: ETF — NO fabricated futures multiplier (points only).
+    ok(spy.pointValue == nil && spy.dollarNote.contains("points only"), "SPY row: no fabricated multiplier")
+    ok(spy.assetClassLabel == "Equity / ETF", "SPY row: honest asset class")
+    // Honest onlyES state.
+    let onlyES = InstrumentCatalog.decode(["available": true, "count": 1, "esFamilyCount": 1,
+        "nonEsCount": 0, "onlyES": true, "instruments": [
+            ["symbol": "CM.ESU6", "display": "ESU6", "root": "ES", "assetClass": "us_index_future",
+             "pointValue": 50.0, "esFamily": true, "esModules": true, "bars": 60, "live": true, "backtestable": true]]])
+    ok(onlyES.onlyES && onlyES.headline.contains("Only ES captured"), "onlyES honest headline")
+    // Honest empty state.
+    let empty = InstrumentCatalog.decode(["available": false, "reason": "no instruments captured yet"])
+    ok(!empty.available && empty.headline.contains("No instruments captured"), "empty catalog honest")
+}
+
+// ===== TR-05 (c): ES-tuned Session/SMT modules are labeled ES-only on non-ES instruments =====
+func testEsOnlyModuleLabeling() {
+    func mkBars(_ n: Int, base: Double = 100) -> [Bar] {
+        (0..<n).map { i in
+            let p = base + Double(i) * 0.1
+            return Bar(date: Date(timeIntervalSince1970: 1_700_000_000 + Double(i) * 60),
+                       open: p, high: p + 0.3, low: p - 0.3, close: p + 0.1, volume: 1000)
+        }
+    }
+    let bars = mkBars(60), nq = mkBars(60, base: 200)
+    let sessionKey = SignalFactor.session.rawValue, smtKey = SignalFactor.smt.rawValue
+    // Non-ES instrument: Session + SMT are recorded as ES-only-absent and NOT computed (no wrong math).
+    let nonEs = LiveFactorEngine.compute(bars: bars, nqBars: nq, fires: [], now: Date(), esFamily: false)
+    ok(nonEs.esOnlyAbsent == LiveFactorEngine.esOnlyFactors, "non-ES: Session+SMT flagged ES-only")
+    ok(!nonEs.available.contains(sessionKey) && !nonEs.available.contains(smtKey),
+       "non-ES: ES-only modules are absent, never fabricated")
+    // ES instrument: Session applies (computed from RSI); no ES-only-absent labels.
+    let es = LiveFactorEngine.compute(bars: bars, nqBars: nq, fires: [], now: Date(), esFamily: true)
+    ok(es.esOnlyAbsent.isEmpty, "ES: no ES-only-absent labels")
+    ok(es.available.contains(sessionKey), "ES: Session module active")
+}
+
+// ===== TR-07 charting: Stochastic math + the checked-in parity bar =====
+func testStochasticAndParityBar() {
+    func mkBars(_ n: Int) -> [Bar] {
+        (0..<n).map { i in
+            let p = 100.0 + sin(Double(i) / 5) * 5      // oscillating so %K sweeps its range
+            return Bar(date: Date(timeIntervalSince1970: 1_700_000_000 + Double(i) * 60),
+                       open: p, high: p + 1, low: p - 1, close: p, volume: 1000)
+        }
+    }
+    let s = ChartIndicators.stochastic(mkBars(60), period: 14, dPeriod: 3)
+    let kVals = s.k.compactMap { $0 }
+    ok(!kVals.isEmpty, "stochastic %K produced")
+    ok(kVals.allSatisfy { $0 >= 0 && $0 <= 100 }, "%K bounded to [0,100]")
+    ok(s.d.compactMap { $0 }.count > 0, "%D (SMA of %K) produced")
+    // Flat range → nil, never a fabricated reading (no divide-by-zero).
+    let flat = (0..<20).map { _ in Bar(date: Date(), open: 100, high: 100, low: 100, close: 100, volume: 0) }
+    ok(ChartIndicators.stochastic(flat).k.compactMap { $0 }.isEmpty, "flat range yields no fabricated %K")
+    // The checked-in parity bar meets both floors (≥8 indicators, ≥5 timeframes).
+    ok(ChartParityBar.meetsBar, "parity bar met")
+    ok(ChartParityBar.indicators.count >= ChartParityBar.minIndicators, "≥8 indicators defined")
+    ok(ChartParityBar.timeframes.count >= ChartParityBar.minTimeframes, "≥5 timeframes defined")
+    ok(ChartParityBar.indicators.contains("Stochastic"), "Stochastic is in the parity set")
+    ok(Set(ChartParityBar.indicators).count == ChartParityBar.indicators.count, "no duplicate indicators")
+}
+
+// ===== TR-07 charting: the headless render path draws the full parity indicator set (incl. stochastic) =====
+func testChartRenderParityIndicators() {
+    let bars = (0..<120).map { i -> Bar in
+        let p = 100.0 + sin(Double(i) / 6) * 4
+        return Bar(date: Date(timeIntervalSince1970: 1_700_000_000 + Double(i) * 60),
+                   open: p, high: p + 1, low: p - 1, close: p + 0.2, volume: 1000)
+    }
+    let dir = tmpBase.appendingPathComponent("parity-\(UUID().uuidString)")
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    let path = dir.appendingPathComponent("parity.png").path
+    // Full parity set including the new Stochastic sub-pane — must render on the shared path (both charts).
+    let ind = RenderIndicators(ema1: 9, ema2: 21, sma: 50, vwapWindow: 40, rsiPeriod: 14, macd: true,
+        atrPeriod: 14, stochastic: (period: 14, d: 3), bollinger: (period: 20, k: 2))
+    ok(ChartRender.renderPNG(bars: bars, symbol: "CM.ESU6", title: "parity", indicators: ind, to: path),
+       "render full 9-indicator parity set returns true")
+    ok(FileManager.default.fileExists(atPath: path), "parity PNG written")
+}
+
+func testGateRerunDecodeAndStatFormatting() {
+    let obj: [String: Any] = [
+        "available": true, "prover_sha": "3e818b54f842ebcf", "sigMinN": 30, "alpha": 0.05,
+        "test": "one-sided binomial vs R-geometry breakeven", "source": "your own captured bars",
+        "generatedUTC": "2026-07-11T04:00:00Z", "symbols": ["CM.ESU6"],
+        "engineCount": 2, "candidateCount": 0, "noEdgeCount": 1, "insufficientCount": 1,
+        "engines": [
+            ["engine": "meanrev", "status": "no_edge", "contracts": [
+                ["symbol": "CM.ESU6", "bars": 400, "trades": 51, "wins": 24, "losses": 27,
+                 "winRate": 0.4706, "netPts": -6.5, "expectancyR": -0.05, "maxDrawdownR": 8.0,
+                 "pEdge": 0.61, "proven": false, "insufficient": false,
+                 "reason": "no edge — win 47.1% / net -6.50 pts on 51 OOS trades (p=0.610, need p<0.05)"]]],
+            ["engine": "channel", "status": "insufficient", "contracts": [
+                ["symbol": "CM.ESU6", "bars": 60, "trades": 8, "wins": 4, "losses": 4,
+                 "winRate": 0.5, "netPts": 1.0, "expectancyR": 0.05, "maxDrawdownR": 2.0,
+                 "pEdge": 1.0, "proven": false, "insufficient": true,
+                 "reason": "insufficient sample — 8 OOS trades, need ≥30"]]],
+        ],
+    ]
+    let r = GateRerunReport.decode(obj)
+    ok(r.available, "rerun decode available")
+    ok(r.proverSHA == "3e818b54f842ebcf", "prover_sha decoded")
+    eqi(r.minTrades, 30, "sigMinN decoded")
+    eqi(r.engines.count, 2, "both engines decoded")
+    eqi(r.candidateCount, 0, "zero candidates decoded")
+    // no_edge engine best contract stat line shows n / W/L / net / maxDD / p — reproducible numbers.
+    let mr = r.engines[0].best!
+    let line = mr.statLine(minTrades: r.minTrades)
+    ok(line.contains("n=51"), "stat line shows n")
+    ok(line.contains("24W/27L"), "stat line shows W/L")
+    ok(line.contains("maxDD 8.00R"), "stat line shows max drawdown in R")
+    ok(line.contains("p=0.610"), "stat line shows p-value for a sufficient sample")
+    // insufficient engine: p is shown as n/a (not a misleading p-value on a thin sample).
+    let ch = r.engines[1].best!
+    ok(ch.insufficient, "thin sample flagged insufficient")
+    ok(ch.statLine(minTrades: r.minTrades).contains("p n/a (n<30)"), "thin sample hides untrustworthy p")
+    ok(r.proverLine.contains("3e818b54f842ebcf") && r.proverLine.contains("min n 30"), "prover line is reproducible")
+    // Honest empty decode.
+    let empty = GateRerunReport.decode(["available": false, "reason": "no bars captured yet"])
+    ok(!empty.available && empty.reason == "no bars captured yet", "empty rerun decode honest")
+}
+
+// ===== No-code backtest lab (item 10): BacktestLabReport.decode + per-fold stat formatting =====
+// The lab runs the SAME shipped prover on the buyer's OWN captured bars, date-scoped, split into
+// folds. These lock the decode contract + honest 'insufficient'/'no aggregate figure' guarantees.
+func testBacktestLabDecodeAndFolds() {
+    let obj: [String: Any] = [
+        "available": true, "engine": "meanrev", "symbol": "CM.ESU6",
+        "prover_sha": "3e818b54f842ebcf", "sigMinN": 30, "alpha": 0.05,
+        "test": "one-sided binomial vs R-geometry breakeven", "source": "your own captured bars",
+        "generatedUTC": "2026-07-11T04:00:00Z", "totalBars": 600, "status": "no_edge",
+        "whole": ["fold": 0, "bars": 600, "trades": 51, "wins": 24, "losses": 27,
+                  "winRate": 0.4706, "netPts": -6.5, "expectancyR": -0.05, "maxDrawdownR": 8.0,
+                  "pEdge": 0.61, "proven": false, "insufficient": false,
+                  "reason": "no edge — win 47.1% / net -6.50 pts on 51 OOS trades (p=0.610, need p<0.05)"],
+        "folds": [
+            ["fold": 1, "bars": 300, "trades": 34, "wins": 15, "losses": 19,
+             "winRate": 0.44, "netPts": -4.0, "expectancyR": -0.08, "maxDrawdownR": 6.0,
+             "pEdge": 0.72, "proven": false, "insufficient": false, "reason": "no edge"],
+            ["fold": 2, "bars": 300, "trades": 12, "wins": 6, "losses": 6,
+             "winRate": 0.5, "netPts": 1.0, "expectancyR": 0.03, "maxDrawdownR": 2.0,
+             "pEdge": 1.0, "proven": false, "insufficient": true,
+             "reason": "insufficient sample — 12 OOS trades, need ≥30"],
+        ],
+    ]
+    let r = BacktestLabReport.decode(obj)
+    ok(r.available, "lab decode available")
+    ok(r.engine == "meanrev" && r.symbol == "CM.ESU6", "engine + instrument decoded")
+    ok(r.proverSHA == "3e818b54f842ebcf", "lab prover_sha decoded")
+    eqi(r.minTrades, 30, "lab sigMinN decoded")
+    eqi(r.totalBars, 600, "lab totalBars decoded")
+    eqi(r.folds.count, 2, "both folds decoded")
+    // Whole-range stat line shows n / W/L / net / maxDD / p — reproducible numbers, no headline metric.
+    let w = r.whole!
+    let line = w.statLine(minTrades: r.minTrades)
+    ok(line.contains("n=51"), "lab whole-range shows n")
+    ok(line.contains("24W/27L"), "lab whole-range shows W/L")
+    ok(line.contains("maxDD 8.00R"), "lab whole-range shows max drawdown in R")
+    ok(line.contains("p=0.610"), "lab whole-range shows p for a sufficient sample")
+    // Thin fold: p is n/a (never a misleading p-value on < min-n), and it is never 'proven'.
+    let thin = r.folds[1]
+    ok(thin.insufficient && !thin.proven, "thin fold flagged insufficient, never proven")
+    ok(thin.statLine(minTrades: r.minTrades).contains("p n/a (n<30)"), "thin fold hides untrustworthy p")
+    ok(r.proverLine.contains("3e818b54f842ebcf") && r.proverLine.contains("min n 30"), "lab prover line reproducible")
+    // Honest empty decode — an unavailable report carries no fabricated numbers.
+    let empty = BacktestLabReport.decode(["available": false, "reason": "insufficient bars — only 4 captured"])
+    ok(!empty.available && empty.whole == nil && empty.folds.isEmpty, "empty lab decode honest")
+    ok(empty.reason.contains("insufficient bars"), "empty lab keeps honest reason")
+}
+
 // ===== In-app auto-updater (pure core: version compare, sha256, manifest decode, check window) =====
 // Mirrors the proven Black Label Real Estate testUpdater(). App-shell updater only — it never
 // touches the engines, the feed, the edge-gate, or any signal; these are the headless-verifiable
@@ -1737,29 +2387,29 @@ func testWindowLaunchOrderingContract() {
 }
 
 func testBuildNumberContract() {
-    let expectedBuild = "<key>CFBundleVersion</key><string>15</string>"
+    let expectedBuild = "<key>CFBundleVersion</key><string>25</string>"
     for file in ["build.command", "build-signed.command"] {
         guard let src = try? String(contentsOfFile: file, encoding: .utf8) else {
             ok(false, "[source] \(file) readable for build-number contract"); continue
         }
-        ok(src.contains(expectedBuild), "[source] \(file) stamps Trading build 15")
+        ok(src.contains(expectedBuild), "[source] \(file) stamps Trading build 25")
         ok(src.contains("universal2") && src.contains("build_trd_arch arm64") &&
            src.contains("build_trd_arch x86_64") && src.contains("lipo -create"),
            "[source] \(file) builds a universal2 Trading binary")
     }
     if let src = try? String(contentsOfFile: "build-developer-id.sh", encoding: .utf8) {
-        ok(src.contains("BUILD_NUMBER=\"${BUILD_NUMBER:-15}\""), "[source] Developer-ID build defaults to Trading build 15")
+        ok(src.contains("BUILD_NUMBER=\"${BUILD_NUMBER:-25}\""), "[source] Developer-ID build defaults to Trading build 25")
     } else {
         ok(false, "[source] build-developer-id.sh readable for build-number contract")
     }
     if let plist = try? String(contentsOfFile: "Sources/Info.plist", encoding: .utf8) {
-        ok(plist.contains("<key>CFBundleVersion</key>\n\t<string>15</string>"),
-           "[source] Sources/Info.plist CFBundleVersion is 15")
+        ok(plist.contains("<key>CFBundleVersion</key>\n\t<string>25</string>"),
+           "[source] Sources/Info.plist CFBundleVersion is 25")
     } else {
         ok(false, "[source] Sources/Info.plist readable for build-number contract")
     }
     if let project = try? String(contentsOfFile: "project.yml", encoding: .utf8) {
-        ok(project.contains("CFBundleVersion: \"15\""), "[source] project.yml CFBundleVersion is 15")
+        ok(project.contains("CFBundleVersion: \"25\""), "[source] project.yml CFBundleVersion is 25")
     } else {
         ok(false, "[source] project.yml readable for build-number contract")
     }
@@ -1786,11 +2436,42 @@ testFeedSymbolsPicker()
 testTradingSymbolScope()
 testProductSurfaceSymbolScopeContract()
 testNoAPIWebhookIngestionContract()
+testEntitlementsHardeningContract()
 
 // Engine roster + fire feed decode (the /api/screen + /api/fires wire contract)
 testEngineRosterDecode()
 testEngineLabels()
 testFireFeedDecode()
+testGateVerdictNoEdgeAndReasons()
+testGateVerdictAllNoEdgeHeadline()
+testGateVerdictEmptyStoreHonest()
+testGateRerunDecodeAndStatFormatting()
+
+// TR-05 multi-asset: instrument catalog decode + per-instrument module labels + ES-only labeling +
+// TR-07 charting depth: stochastic math, the checked-in parity bar, and the parity render path.
+testInstrumentCatalogDecodeAndModuleLabels()
+testEsOnlyModuleLabeling()
+testStochasticAndParityBar()
+testChartRenderParityIndicators()
+
+// No-code backtest lab (item 10): decode + per-fold honest stat formatting on the buyer's own bars.
+testBacktestLabDecodeAndFolds()
+
+// Prop-firm rule profiles (item 7): the profile-gating decision on the buyer's own caps.
+testRuleProfileGateWithinLimitsAndMax()
+testRuleProfileGateBreach()
+testRuleProfileGateEdgeOfCap()
+testRuleProfileGateEmptyNoProfileNoSignal()
+testSourcedPropFirmPresets()
+testSourcedPresetCitationInvariant()
+
+// TR-18 discipline cockpit (live compliance gauges on the buyer's own fills) + TR-13 client-side
+// non-repaint mirror (a live tick folds only into the forming bar; closed bars never repaint).
+testDisciplineCockpitMetersAndMute()
+testDisciplineCockpitTiltmeter()
+testDisciplineCockpitRiskOfRuin()
+testDisciplineCockpitEmptyHonest()
+testNonRepaintClosedBarsSwiftMirror()
 
 // In-app auto-updater pure core (version compare, sha256, manifest decode, daily-check window)
 testUpdater()
