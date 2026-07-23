@@ -7,7 +7,7 @@
 set -uo pipefail
 cd "$(dirname "$0")"
 
-FILES=(test_engines.py test_feeds.py test_api.py test_exec.py test_topstep_bridge.py test_store_scope.py test_claim_linter.py test_alerts.py test_egress.py test_farm.py)
+FILES=(test_engines.py test_feeds.py test_api.py test_exec.py test_topstep_bridge.py test_store_scope.py test_claim_linter.py test_alerts.py test_egress.py test_farm.py test_reference_fdr.py test_reference_auth.py)
 
 if python3 -c "import pytest" 2>/dev/null; then
   # pytest emits ONE combined "N passed[, M failed]" summary line — run-all.sh parses it directly.

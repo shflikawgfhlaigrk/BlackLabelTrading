@@ -653,15 +653,19 @@ class H(BaseHTTPRequestHandler):
         g = lambda k, d="": (q.get(k, [d])[0] or d)  # noqa: E731
         if u.path == "/health":
             return self._send(200, {"ok": True, "ts": time.time(), "store": "pg" if USING_PG else "own"})
-        # Reference OOS verdicts are public research (Black Label's own ES history, no buyer data),
-        # so they are served BEFORE the auth gate — a cold buyer who has not signed in can still see
-        # that the edge-gate produces a real, earned verdict. Read-only static artifact.
-        if u.path == "/api/reference":
-            return self._send(200, _load_reference())
         if not u.path.startswith("/api/"):
             return self._send(404, {"error": "not found"})
         if not self._authed():
             return self._send(401, {"error": "unauthorized"})
+        # Reference OOS verdicts (Black Label's own ES history, no buyer data) render in the app as an
+        # EARNED edge-gate verdict ("no edge" / candidate). They were once served BEFORE this auth
+        # gate as "public research", which let a cold, UNAUTHENTICATED GET on :8787 scrape a signed
+        # verdict the server cannot attribute to a buyer session — a fail-open (trading-analyst
+        # 2026-07-23). FAIL CLOSED: the reference artifact requires the same per-launch Bearer token
+        # as every other /api/* read. The app already holds that token before its reference screen
+        # loads (FeedClient.connect() runs first), so no honest pre-signin surface is lost.
+        if u.path == "/api/reference":
+            return self._send(200, _load_reference())
         try:
             if u.path == "/api/meta":
                 return self._send(200, STORE.meta())
