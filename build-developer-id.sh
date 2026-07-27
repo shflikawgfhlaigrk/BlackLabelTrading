@@ -11,10 +11,10 @@
 #   ./build-developer-id.sh                 # build + sign (Developer ID if available, else adhoc)
 #   ./build-developer-id.sh --no-submit     # explicit default: no Apple contact
 #   ./build-developer-id.sh --submit        # notarize + staple (requires Michael approval)
-#   ./build-developer-id.sh --install       # also install to /Applications
+#   ./build-developer-id.sh --submit --install  # notarize, staple, verify, then install
 #   ./build-developer-id.sh --launch-test   # build, sign, launch, prove backend up, then quit
 #
-# Optional autonomous execution (default OFF, paper-first). Ships NO data and NO creds — the SQLite
+# Signals-only runtime. Ships NO data, broker-order adapter, or credentials — the SQLite
 # store is created empty at runtime; broker creds live in the buyer's Keychain only.
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -31,11 +31,12 @@ BUNDLE_ID="com.blacklabel.trading"
 TEAM="745ZPGFRA5"
 ENTS="$SRC/app-developerid.entitlements"
 NOTARY_PROFILE="${NOTARY_PROFILE:-BL_NOTARY}"
-BUILD_NUMBER="${BUILD_NUMBER:-25}"
-PY_RUNTIME_SRC="${BLTD_PYTHON_RUNTIME:-$ROOT/vendor/python-runtime}"
+BUILD_NUMBER="${BUILD_NUMBER:-27}"
+PY_RUNTIME_SRC="$ROOT/vendor/python-runtime"
 SUBMIT="${SUBMIT:-0}"
 INSTALL=0
 LAUNCH_TEST=0
+STAPLED_VERIFIED=0
 
 for arg in "$@"; do
   case "$arg" in
@@ -47,6 +48,7 @@ for arg in "$@"; do
       echo "Usage: $0 [--submit|--no-submit|--build-only] [--install] [--launch-test]"
       echo "  default: build + sign + verify only (no Apple contact)"
       echo "  --submit: also notarize + staple (requires Michael's approval)"
+      echo "  --install: atomically install after notarization (requires --submit)"
       exit 0 ;;
     *)
       echo "Unknown argument: $arg" >&2
@@ -55,7 +57,15 @@ for arg in "$@"; do
   esac
 done
 
+if [ "$INSTALL" = "1" ] && [ "$SUBMIT" != "1" ]; then
+  echo "FAIL: --install requires --submit; canonical installs must be notarized and stapled first" >&2
+  exit 64
+fi
+
 [ -f "$ENTS" ] || { echo "FAIL: missing $ENTS" >&2; exit 1; }
+
+echo "==> Signals-only release contract (source preflight)"
+bash "$ROOT/Tests/signals-only-release-contract.sh"
 
 # --- resolve a signing identity: prefer a real Developer ID Application cert ---------------------
 # Developer ID is the correct identity for out-of-store distribution + notarization. If none is in
@@ -63,7 +73,12 @@ done
 # launches; the report flags Developer ID + notarization as the remaining human step.
 SIGN_MODE="adhoc"
 IDENTITY="-"
-DEVID_LINE="$(security find-identity -v -p codesigning 2>/dev/null | grep -m1 'Developer ID Application' || true)"
+DEVID_LINE="$(
+  security find-identity -v -p codesigning 2>/dev/null |
+    grep 'Developer ID Application' |
+    grep -F "($TEAM)" |
+    head -n 1 || true
+)"
 if [ -n "$DEVID_LINE" ]; then
   IDENTITY="$(echo "$DEVID_LINE" | sed -E 's/^[[:space:]]*[0-9]+\)[[:space:]]+([0-9A-F]+).*/\1/')"
   SIGN_MODE="developerid"
@@ -85,7 +100,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 echo "==> Compiling Sources/*.swift (universal2: arm64 + x86_64)"
 SWIFT_FILES=( "$SRC"/*.swift )
 TRD_FRAMEWORKS=( -framework SwiftUI -framework AppKit -framework Charts
-  -framework AuthenticationServices -framework CryptoKit -framework UserNotifications -framework LocalAuthentication )
+  -framework AuthenticationServices -framework CryptoKit -framework UserNotifications )
 build_trd_arch () {
   local arch="$1"
   echo "==> Compiling ${arch} (deployment target macOS 13.0)"
@@ -134,16 +149,30 @@ printf 'APPL????' > "$APP/Contents/PkgInfo"
 [ -f "$SRC/PrivacyInfo.xcprivacy" ] || { echo "FAIL: missing $SRC/PrivacyInfo.xcprivacy" >&2; exit 1; }
 cp -f "$SRC/PrivacyInfo.xcprivacy" "$APP/Contents/Resources/PrivacyInfo.xcprivacy"
 
-# --- reuse installed icon/assets/fonts if present ---
-for res in AppIcon.icns Assets.car; do
-  [ -f "/Applications/$APPNAME.app/Contents/Resources/$res" ] && cp -f "/Applications/$APPNAME.app/Contents/Resources/$res" "$APP/Contents/Resources/" || true
-done
-[ -d "/Applications/$APPNAME.app/Contents/Resources/Fonts" ] && cp -Rf "/Applications/$APPNAME.app/Contents/Resources/Fonts" "$APP/Contents/Resources/" || true
+# --- compile source-controlled assets (never inherit bytes from /Applications) ---
+ASSET_CATALOG="$SRC/Assets.xcassets"
+[ -d "$ASSET_CATALOG" ] || { echo "FAIL: missing source asset catalog: $ASSET_CATALOG" >&2; exit 1; }
+xcrun actool "$ASSET_CATALOG" \
+  --compile "$APP/Contents/Resources" \
+  --platform macosx \
+  --minimum-deployment-target 13.0 \
+  --app-icon AppIcon \
+  --output-partial-info-plist "$BUILD/asset-info.plist"
+[ -f "$APP/Contents/Resources/AppIcon.icns" ] || { echo "FAIL: actool did not emit AppIcon.icns" >&2; exit 1; }
+[ -f "$APP/Contents/Resources/Assets.car" ] || { echo "FAIL: actool did not emit Assets.car" >&2; exit 1; }
 
 # --- bundle the SELF-CONTAINED backend (code only, ships NO data) ---
 echo "==> Bundling self-contained backend (code only, no data)"
 mkdir -p "$APP/Contents/Resources/backend"
-cp -f "$ROOT/backend"/bltd_*.py "$APP/Contents/Resources/backend/"
+BACKEND_RUNTIME=(
+  bltd_alerts.py bltd_analytics.py bltd_api.py bltd_browser.py bltd_capture.py
+  bltd_feeds.py bltd_optimizer.py bltd_optimizer_cli.py bltd_parsers.py
+  bltd_paths.py bltd_store.py bltd_topstep_bridge.py
+)
+for module in "${BACKEND_RUNTIME[@]}"; do
+  [ -f "$ROOT/backend/$module" ] || { echo "FAIL: missing backend runtime module $module" >&2; exit 1; }
+  cp -f "$ROOT/backend/$module" "$APP/Contents/Resources/backend/"
+done
 cp -f "$ROOT/backend/launch-backend.sh" "$APP/Contents/Resources/backend/"
 chmod +x "$APP/Contents/Resources/backend/launch-backend.sh"
 # Reference OOS verdicts — Black Label's edge-gate result on OUR OWN historical ES bars (research,
@@ -154,32 +183,168 @@ chmod +x "$APP/Contents/Resources/backend/launch-backend.sh"
 echo "==> Bundling CPython runtime (fresh Mac: no Terminal/dev-tools prerequisite)"
 if [ ! -x "$PY_RUNTIME_SRC/bin/python3.11" ] && [ ! -x "$PY_RUNTIME_SRC/bin/python3" ]; then
   echo "FAIL: missing bundled Python runtime at $PY_RUNTIME_SRC" >&2
-  echo "      Set BLTD_PYTHON_RUNTIME=/path/to/python-runtime or populate vendor/python-runtime." >&2
+  echo "      Populate the source-controlled vendor/python-runtime release input." >&2
   exit 1
 fi
 rm -rf "$APP/Contents/Resources/backend/python-runtime"
 cp -Rf "$PY_RUNTIME_SRC" "$APP/Contents/Resources/backend/python-runtime"
+find "$APP/Contents/Resources/backend" -type d -name __pycache__ -prune -exec rm -rf {} +
+find "$APP/Contents/Resources/backend" -type f -name '*.pyc' -delete
+if find "$APP/Contents/Resources/backend" -type f \( -name 'bltd_exec.py' -o -name 'bltd_projectx.py' \) | grep -q .; then
+  echo "FAIL: broker-order code entered the signals-only bundle" >&2
+  exit 1
+fi
 cat > "$APP/Contents/Resources/backend/python3" <<'PYSH'
 #!/bin/bash
 set -euo pipefail
-export PYTHONDONTWRITEBYTECODE=1
-DIR="$(cd "$(dirname "$0")" && pwd)"
+umask 077
+
+DIR="$(cd "$(dirname "$0")" && pwd -P)"
+RUNTIME_HOME="${HOME:-/var/empty}"
+case "$RUNTIME_HOME" in
+  /*) ;;
+  *) RUNTIME_HOME="/var/empty" ;;
+esac
+CACHE_INPUT="${PYTHONPYCACHEPREFIX:-${BLTD_PYCACHE_ROOT:-$RUNTIME_HOME/Library/Caches/Black Label Trading/python}}"
+
+unset PYTHONHOME PYTHONPATH PYTHONSTARTUP PYTHONINSPECT PYTHONUSERBASE
+unset BASH_ENV ENV
+unset DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH DYLD_FRAMEWORK_PATH
+unset DYLD_FALLBACK_LIBRARY_PATH DYLD_FALLBACK_FRAMEWORK_PATH
+
+canonicalize_cache_path() {
+  local probe="${1%/}" suffix="" component
+  [ -n "$probe" ] || probe="/"
+  while [ ! -e "$probe" ]; do
+    [ "$probe" != "/" ] || return 1
+    component="${probe##*/}"
+    probe="${probe%/*}"
+    [ -n "$probe" ] || probe="/"
+    suffix="/$component$suffix"
+  done
+  [ -d "$probe" ] || return 1
+  probe="$(cd "$probe" && pwd -P)" || return 1
+  while [ -n "$suffix" ]; do
+    suffix="${suffix#/}"
+    component="${suffix%%/*}"
+    if [ "$suffix" = "$component" ]; then
+      suffix=""
+    else
+      suffix="${suffix#*/}"
+    fi
+    case "$component" in
+      ""|.) ;;
+      ..)
+        if [ "$probe" != "/" ]; then
+          probe="${probe%/*}"
+          [ -n "$probe" ] || probe="/"
+        fi
+        ;;
+      *)
+        if [ "$probe" = "/" ]; then
+          probe="/$component"
+        else
+          probe="$probe/$component"
+        fi
+        ;;
+    esac
+  done
+  printf '%s\n' "$probe"
+}
+
+case "$CACHE_INPUT" in
+  /*) ;;
+  *)
+    echo "Black Label Trading: PYTHONPYCACHEPREFIX must be an absolute path." >&2
+    exit 78
+    ;;
+esac
+PYTHON_CACHE="$(canonicalize_cache_path "$CACHE_INPUT")" || {
+  echo "Black Label Trading: invalid PYTHONPYCACHEPREFIX." >&2
+  exit 78
+}
+case "$PYTHON_CACHE" in
+  "$DIR"|"$DIR"/*)
+    echo "Black Label Trading: Python cache must be outside the bundled backend." >&2
+    exit 78
+    ;;
+esac
+/bin/mkdir -p "$PYTHON_CACHE"
+PYTHON_CACHE="$(cd "$PYTHON_CACHE" && pwd -P)"
+case "$PYTHON_CACHE" in
+  "$DIR"|"$DIR"/*)
+    echo "Black Label Trading: Python cache resolved inside the bundled backend." >&2
+    exit 78
+    ;;
+esac
+
 if [ -x "$DIR/python-runtime/bin/python3.11" ]; then
-  exec "$DIR/python-runtime/bin/python3.11" "$@"
+  PYTHON_BIN="$DIR/python-runtime/bin/python3.11"
+elif [ -x "$DIR/python-runtime/bin/python3" ]; then
+  PYTHON_BIN="$DIR/python-runtime/bin/python3"
+else
+  echo "Black Label Trading: bundled Python runtime is missing." >&2
+  exit 127
 fi
-exec "$DIR/python-runtime/bin/python3" "$@"
+
+RUNTIME_ENV=(
+  "HOME=$RUNTIME_HOME"
+  "PATH=/usr/bin:/bin:/usr/sbin:/sbin"
+  "LANG=C"
+  "LC_ALL=C"
+  "PYTHONPATH=$DIR"
+  "PYTHONUNBUFFERED=1"
+  "PYTHONDONTWRITEBYTECODE=1"
+  "PYTHONNOUSERSITE=1"
+  "PYTHONPYCACHEPREFIX=$PYTHON_CACHE"
+)
+BLTD_ALLOWLIST=(
+  BLTD_SUPPORT_DIR
+  BLTD_STORE
+  BLTD_CONFIG
+  BLTD_PORT
+  BLTD_SCOPE
+  BLTD_BUILD
+  BLTD_RUNTIME_CONTRACT
+  BLTD_TOKEN_FILE
+  BLTD_WEBHOOK_URL
+  BLTD_CAPTURE_BROWSER
+  BLTD_AUTO_BROWSER
+  BLTD_CAPTURE_ENGINES
+  BLTD_CDP_PORT
+  BLTD_BAR_SECONDS
+  BLTD_LOOKBACK
+  BLTD_EDGE_GATE
+  BLTD_STALL_SECONDS
+  BLTD_TOPSTEP_OPEN_DEBOUNCE_SECONDS
+)
+for name in "${BLTD_ALLOWLIST[@]}"; do
+  if [ "${!name+x}" = "x" ]; then
+    RUNTIME_ENV+=("$name=${!name}")
+  fi
+done
+
+exec /usr/bin/env -i "${RUNTIME_ENV[@]}" "$PYTHON_BIN" "$@"
 PYSH
 chmod +x "$APP/Contents/Resources/backend/python3"
-"$APP/Contents/Resources/backend/python3" - <<'PY'
+BLTD_PYCACHE_ROOT="$BUILD/python-cache-test" \
+  "$APP/Contents/Resources/backend/python3" - <<'PY'
 import secrets, sqlite3, ssl, sys
 raise SystemExit(0 if sys.version_info[:2] >= (3, 9) else 1)
 PY
 
 find "$APP" \( -name '._*' -o -name '.__*' \) -delete
+if find "$APP/Contents/Resources/backend" \( -type d -name __pycache__ -o -type f -name '*.pyc' \) | grep -q .; then
+  echo "FAIL: mutable Python cache found inside release bundle" >&2
+  exit 1
+fi
 
 # Zero-data guard: fail loudly if any database/data file slipped into the bundle.
 STRAY="$(find "$APP" -type f \( -name '*.sqlite3' -o -name '*.db' -o -name '*.sqlite' -o -name 'bars_log.csv' -o -name 'fires*.json' \) 2>/dev/null || true)"
 if [ -n "$STRAY" ]; then echo "FAIL: data files in bundle (must ship EMPTY):" >&2; echo "$STRAY" >&2; exit 1; fi
+
+echo "==> Signals-only release contract (assembled artifact)"
+bash "$ROOT/Tests/signals-only-release-contract.sh" "$APP"
 
 # --- sign with HARDENED RUNTIME + Developer ID entitlements (NO app-sandbox, NO applesignin) ----
 # --deep signs the nested launcher script's resources too. --options runtime = hardened runtime,
@@ -241,39 +406,192 @@ echo "$ENTDUMP" | grep -q 'allow-dyld-environment-variables' && { echo "FAIL: al
 echo "==> spctl -a -t exec assessment:"
 spctl -a -t exec -vv "$APP" 2>&1 | sed 's/^/    /' || true
 
-if [ "$INSTALL" = "1" ]; then
-  production_install_guard "$INSTALL" "$APP"
-  DEST="/Applications/$APPNAME.app"
-  echo "==> Installing to $DEST"
-  rm -rf "$DEST"; cp -Rf "$APP" "$DEST"
-  if [ "$SIGN_MODE" = "developerid" ]; then
-    codesign --force --deep --options runtime --timestamp --entitlements "$ENTS" --sign "$IDENTITY" "$DEST"
-  else
-    codesign --force --deep --options runtime --timestamp=none --entitlements "$ENTS" --sign - "$DEST"
+install_signed_bundle() {
+  if [ "$SUBMIT" != "1" ] || [ "$STAPLED_VERIFIED" != "1" ]; then
+    echo "FAIL: canonical install is forbidden until notarization and stapling verify" >&2
+    return 66
   fi
+  production_install_guard "$INSTALL" "$APP"
+  local DEST="/Applications/$APPNAME.app"
+  local STAGE="$DEST.staging.$$"
+  local OLD="$DEST.old.$$"
+  echo "==> Staging atomic install at $STAGE"
+  rm -rf "$STAGE" "$OLD"
+  cp -Rf "$APP" "$STAGE"
+  codesign --verify --deep --strict "$STAGE"
+  [ -f "$STAGE/Contents/Info.plist" ] || { echo "FAIL: staged bundle has no Info.plist" >&2; rm -rf "$STAGE"; exit 1; }
+  [ -d "$STAGE/Contents/Resources/backend/python-runtime" ] || { echo "FAIL: staged bundle has no Python runtime" >&2; rm -rf "$STAGE"; exit 1; }
+  local INSTALL_SUPPORT="$HOME/Library/Application Support/Black Label Trading"
+  local STAGED_BACKEND="$STAGE/Contents/Resources/backend"
+  local INSTALLED_GUI="$DEST/Contents/MacOS/$BIN_NAME"
+  if [ -x "$INSTALLED_GUI" ] &&
+     ps -axo command= | awk -v executable="$INSTALLED_GUI" '
+       $0 == executable || index($0, executable " ") == 1 { found=1 }
+       END { exit(found ? 0 : 1) }
+     '; then
+    rm -rf "$STAGE"
+    echo "FAIL: quit the running Black Label Trading app before canonical replacement" >&2
+    return 68
+  fi
+  echo "==> Stopping only verified installed Trading runtime processes"
+  if ! /usr/bin/env \
+      "BLTD_SUPPORT_DIR=$INSTALL_SUPPORT" \
+      "BLTD_PYTHON=$STAGED_BACKEND/python3" \
+      "BLTD_BUILD=$BUILD_NUMBER" \
+      "BLTD_PORT=8793" \
+      "BLTD_OWNED_BACKEND_DIR=$DEST/Contents/Resources/backend" \
+      /bin/bash "$STAGED_BACKEND/launch-backend.sh" --stop-owned; then
+    rm -rf "$STAGE"
+    echo "FAIL: verified installed Trading runtime could not be stopped; old app left untouched" >&2
+    return 67
+  fi
+  [ -d "$DEST" ] && mv "$DEST" "$OLD"
+  if ! mv "$STAGE" "$DEST"; then
+    [ -d "$OLD" ] && mv "$OLD" "$DEST"
+    echo "FAIL: atomic install rename failed; previous app restored" >&2
+    exit 1
+  fi
+  local FINAL_PLIST="$DEST/Contents/Info.plist"
+  local FINAL_TEAM
+  FINAL_TEAM="$(codesign -dv --verbose=4 "$DEST" 2>&1 |
+    awk -F= '$1 == "TeamIdentifier" { print $2; exit }' || true)"
+  if [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$FINAL_PLIST" 2>/dev/null || true)" != "$BUNDLE_ID" ] ||
+     [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' "$FINAL_PLIST" 2>/dev/null || true)" != "$APPNAME" ] ||
+     [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$FINAL_PLIST" 2>/dev/null || true)" != "$BIN_NAME" ] ||
+     [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$FINAL_PLIST" 2>/dev/null || true)" != "$BUILD_NUMBER" ] ||
+     [ "$FINAL_TEAM" != "$TEAM" ] ||
+     [ ! -x "$DEST/Contents/MacOS/$BIN_NAME" ] ||
+     ! codesign --verify --deep --strict --all-architectures "$DEST" ||
+     ! spctl -a -t exec -vv "$DEST" ||
+     ! xcrun stapler validate "$DEST"; then
+    rm -rf "$DEST"
+    [ -d "$OLD" ] && mv "$OLD" "$DEST"
+    echo "FAIL: installed bundle failed codesign/Gatekeeper/staple verification; previous app restored" >&2
+    exit 1
+  fi
+  rm -rf "$OLD"
   echo "==> Installed: $DEST"
-fi
+}
 
 if [ "$LAUNCH_TEST" = "1" ]; then
   echo "==> Launch test: starting the bundled backend exactly as the app does"
   LAUNCH="$APP/Contents/Resources/backend/launch-backend.sh"
-  PORT=8793   # spare port so we never collide with a running install on 8787
-  TMPSTORE="$(mktemp -d)/trading.sqlite3"
-  BLTD_PORT="$PORT" BLTD_STORE="$TMPSTORE" /bin/bash "$LAUNCH" --bg >/dev/null 2>&1 || true
+  TESTROOT="$(mktemp -d)"
+  SUPPORT="$TESTROOT/support"
+  TMPSTORE="$SUPPORT/trading.sqlite3"
+  BACKEND_DIR="$APP/Contents/Resources/backend"
+  mkdir -p "$SUPPORT"
+  PORT="$("$APP/Contents/Resources/backend/python3" - <<'PY'
+import socket
+with socket.socket() as s:
+    s.bind(("127.0.0.1", 0))
+    print(s.getsockname()[1])
+PY
+)"
+
+  launch_test_command() {
+    ps -ww -p "$1" -o command= 2>/dev/null || true
+  }
+  launch_test_pid_is_owned() {
+    local kind="$1" name="$2" script="$3" cmd="$4"
+    [[ "$cmd" == *"$BACKEND_DIR/"* ]] || return 1
+    # The fresh, isolated support directory can only contain pidfiles from this launch. The API
+    # additionally proves the exact random test port in argv; every worker proves the exact bundle
+    # script (and each supervisor proves its v3 build/name marker).
+    case "$kind" in
+      api)
+        [[ "$cmd" == *"$BACKEND_DIR/$script $PORT"* ]]
+        ;;
+      supervisor)
+        [[ "$cmd" == *"bltd-supervisor-v3:$BUILD_NUMBER:$name"* &&
+           "$cmd" == *"$BACKEND_DIR/$script"* ]]
+        ;;
+      child)
+        [[ "$cmd" == *"$BACKEND_DIR/$script"* &&
+           "$cmd" == *"bltd-worker-v3:$BUILD_NUMBER:$name"* &&
+           "$cmd" == *python* &&
+           "$cmd" != *"bltd-supervisor"* ]]
+        ;;
+      *) return 1 ;;
+    esac
+  }
+  stop_launch_test_pid() {
+    local pidfile="$1" kind="$2" name="$3" script="$4"
+    local pid cmd current
+    [ -f "$pidfile" ] || return 0
+    pid="$(cat "$pidfile" 2>/dev/null || true)"
+    case "$pid" in ''|0|*[!0-9]*) return 0 ;; esac
+    cmd="$(launch_test_command "$pid")"
+    launch_test_pid_is_owned "$kind" "$name" "$script" "$cmd" || return 0
+    kill "$pid" 2>/dev/null || return 0
+    for _ in $(seq 1 20); do
+      kill -0 "$pid" 2>/dev/null || return 0
+      sleep 0.1
+    done
+    # Re-read the live command before a force kill so PID reuse can never widen the target.
+    current="$(launch_test_command "$pid")"
+    if launch_test_pid_is_owned "$kind" "$name" "$script" "$current"; then
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+  }
+  LAUNCH_TEST_CLEANED=0
+  cleanup_launch_test() {
+    [ "$LAUNCH_TEST_CLEANED" = "0" ] || return 0
+    LAUNCH_TEST_CLEANED=1
+    # Stop supervisors before their children so they cannot restart a child during teardown.
+    stop_launch_test_pid "$SUPPORT/capture-supervisor.pid" \
+      supervisor capture bltd_capture.py
+    stop_launch_test_pid "$SUPPORT/topstep-bridge-supervisor.pid" \
+      supervisor topstep-bridge bltd_topstep_bridge.py
+    stop_launch_test_pid "$SUPPORT/capture.pid" child capture bltd_capture.py
+    stop_launch_test_pid "$SUPPORT/topstep-bridge.pid" \
+      child topstep-bridge bltd_topstep_bridge.py
+    stop_launch_test_pid "$SUPPORT/backend.pid" api backend bltd_api.py
+    rm -rf "$TESTROOT"
+  }
+  trap cleanup_launch_test EXIT
+
+  if ! BLTD_SUPPORT_DIR="$SUPPORT" \
+    BLTD_PYCACHE_ROOT="$TESTROOT/pycache" \
+    BLTD_PORT="$PORT" \
+    BLTD_BUILD="$BUILD_NUMBER" \
+    BLTD_STORE="$TMPSTORE" \
+    BLTD_CONFIG="$SUPPORT/config.json" \
+    /bin/bash "$LAUNCH" --bg >"$TESTROOT/launch.log" 2>&1; then
+    echo "FAIL: bundled launcher returned non-zero: $(tail -n 1 "$TESTROOT/launch.log")" >&2
+    exit 1
+  fi
   ok=""; body=""
   for i in $(seq 1 25); do
     body="$(curl -fsS "http://127.0.0.1:$PORT/health" 2>/dev/null || true)"
-    if [ -n "$body" ]; then ok="yes"; break; fi
+    if "$APP/Contents/Resources/backend/python3" -c '
+import json, os, sys
+try:
+    d = json.loads(sys.argv[1])
+    c = d.get("capabilities") or {}
+    good = (d.get("ok") is True
+            and d.get("service") == "black-label-trading"
+            and str(d.get("build")) == sys.argv[2]
+            and d.get("runtimeContract") == "bltd-signals-only-runtime-v1"
+            and os.path.realpath(str(d.get("backendScript") or "")) == os.path.realpath(sys.argv[3])
+            and c.get("signals") is True and c.get("execution") is False
+            and c.get("optimizerCompute") is False)
+except Exception:
+    good = False
+raise SystemExit(0 if good else 1)
+' "$body" "$BUILD_NUMBER" "$BACKEND_DIR/bltd_api.py"; then
+      ok="yes"; break
+    fi
     sleep 0.4
   done
-  # tear down the test backend
-  pkill -f "bltd_api.py $PORT" 2>/dev/null || true
   if [ -z "$ok" ]; then echo "FAIL: bundled backend did not come up on :$PORT" >&2; exit 1; fi
   echo "==> BACKEND UP: /health -> $body"
   # Self-contained guard: must serve its OWN store, never Utah's Postgres.
   echo "$body" | grep -q '"store": "own"' || echo "$body" | grep -q '"store":"own"' \
     || { echo "FAIL: backend is not using its OWN store ($body)" >&2; exit 1; }
   echo "==> SELF-CONTAINED OK: backend serves its own empty SQLite store (not Utah)"
+  cleanup_launch_test
+  trap - EXIT
 fi
 
 if [ "$SUBMIT" != "1" ]; then
@@ -342,6 +660,11 @@ ditto -x -k "$ZIP" "$_verify_extract"
 spctl -a -t exec -vv "$_verify_extract/$APPNAME.app"
 xcrun stapler validate "$_verify_extract/$APPNAME.app"
 rm -rf "$_verify_extract"
+STAPLED_VERIFIED=1
+
+if [ "$INSTALL" = "1" ]; then
+  install_signed_bundle
+fi
 
 echo ""
 echo "==> DONE — Developer-ID bundle: $APP"
