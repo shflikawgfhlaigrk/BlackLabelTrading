@@ -199,6 +199,10 @@ class WSConn:
         raw = socket.create_connection((self.host, self.port), timeout=timeout)
         if secure:
             ctx = ssl.create_default_context()
+            # SECURITY: raise the TLS floor to 1.2 — the default context still negotiates the
+            # deprecated TLSv1/TLSv1.1 on older runtimes. Every broker hub we speak wss:// to
+            # serves TLS 1.2+, so this is a floor, not a behaviour change.
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_2
             raw = ctx.wrap_socket(raw, server_hostname=self.host)
         self.sock = raw
         self._handshake(headers or {})
