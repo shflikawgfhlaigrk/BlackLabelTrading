@@ -1,0 +1,53 @@
+name: Tests
+
+# Scoped deliberately to the default branch (`mobile`).
+# The combined gate is known-green on `mobile` and known-red on the active
+# codex dev branch, so a `branches: ["**"]` trigger would go red on push.
+on:
+  push:
+    branches: [mobile]
+  pull_request:
+    branches: [mobile]
+  workflow_dispatch:
+
+# One run at a time — there is a single self-hosted macOS runner.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  combined-gate:
+    name: Combined test gate (Tests/run-all.sh)
+    # Requires Xcode/CLT + arm64: Tests/run-tests.sh shells out to
+    # `xcrun --sdk macosx swiftc -target arm64-apple-macosx13.0`.
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        # No setup-python / setup-node: this is a self-hosted host whose
+        # toolchain is managed outside CI. Installing one here would mutate it.
+
+      - name: Toolchain versions
+        run: |
+          set -euo pipefail
+          export PATH="/usr/bin:$PATH"
+          sw_vers
+          xcodebuild -version
+          xcrun --sdk macosx swiftc --version
+          echo "python3 -> $(command -v python3)"
+          python3 -VV
+          python3 -c 'import pytest; print("pytest", pytest.__version__)' \
+            || echo "pytest absent — backend/run-tests.sh will use its stdlib fallback"
+
+      - name: Combined test gate
+        run: |
+          set -euo pipefail
+          # run-all.sh and backend/run-tests.sh invoke bare `python3`.
+          # /usr/bin/python3 (3.9.6) has pytest; /opt/homebrew/bin/python3 does not,
+          # and under Homebrew python the backend suite silently degrades to the
+          # stdlib fallback (5 checks instead of the real 153). Pin /usr/bin first
+          # so the honest suite runs.
+          export PATH="/usr/bin:$PATH"
+          bash Tests/run-all.sh
