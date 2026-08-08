@@ -38,6 +38,9 @@ BUNDLE_ID="com.blacklabel.trading"
 TEAM="745ZPGFRA5"
 ENTS="$SRC/app-release.entitlements"
 
+echo "==> Signals-only release contract (source preflight)"
+bash "$ROOT/Tests/signals-only-release-contract.sh"
+
 # Locate the Xcode-managed provisioning profile for this bundle id (development first).
 PROFILE_DIR="$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"
 find_profile() {
@@ -117,7 +120,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleName</key><string>Black Label Trading</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>1.0</string>
-  <key>CFBundleVersion</key><string>25</string>
+  <key>CFBundleVersion</key><string>27</string>
   <key>ITSAppUsesNonExemptEncryption</key><false/>
   <key>LSApplicationCategoryType</key><string>public.app-category.finance</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
@@ -128,10 +131,16 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-# Reuse the installed icon/assets if present.
-for res in AppIcon.icns Assets.car; do
-  [ -f "/Applications/$APPNAME.app/Contents/Resources/$res" ] && cp -f "/Applications/$APPNAME.app/Contents/Resources/$res" "$APP/Contents/Resources/" || true
-done
+# Compile the source-controlled asset catalog. A release build never inherits bytes from an older
+# installed bundle.
+xcrun actool "$SRC/Assets.xcassets" \
+  --compile "$APP/Contents/Resources" \
+  --platform macosx \
+  --minimum-deployment-target 13.0 \
+  --app-icon AppIcon \
+  --output-partial-info-plist "$BUILD/asset-info.plist"
+[ -f "$APP/Contents/Resources/AppIcon.icns" ] || { echo "FAIL: actool did not emit AppIcon.icns" >&2; exit 1; }
+[ -f "$APP/Contents/Resources/Assets.car" ] || { echo "FAIL: actool did not emit Assets.car" >&2; exit 1; }
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
 echo "==> Embedding provisioning profile"

@@ -25,20 +25,32 @@ import re
 import sqlite3
 import threading
 import time
+from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
+
+import bltd_paths   # cross-platform app-support paths (macOS gold master + Windows W1 port)
 
 # ---------------------------------------------------------------------------
 # Default own-store location (the product owns this; NOT Michael's Utah Postgres).
 # Override with BLTD_STORE for tests / a custom path. The legacy Utah Postgres DSN is reachable
 # ONLY through the opt-in dev override in bltd_api.py — never the default, and never from here.
+# The per-OS base is resolved in bltd_paths (darwin path byte-identical to the historical one).
 # ---------------------------------------------------------------------------
 def default_store_path() -> str:
-    base = os.path.expanduser("~/Library/Application Support/Black Label Trading")
-    return os.environ.get("BLTD_STORE", os.path.join(base, "trading.sqlite3"))
+    return bltd_paths.store_path()
 
 
 def default_config_path() -> str:
-    base = os.path.expanduser("~/Library/Application Support/Black Label Trading")
-    return os.environ.get("BLTD_CONFIG", os.path.join(base, "config.json"))
+    return bltd_paths.config_path()
+
+
+# Seven distinct strategy implementations run live. Two retired ids remain registered for old
+# journals/reference evidence and permanently remain in the multiplicity family.
+ACTIVE_ENGINE_FAMILY = ("meanrev", "breakout", "momentum", "structure",
+                        "regime", "channel", "context_b")
+DUPLICATE_ENGINE_ALIASES = {"research": "breakout", "context_a": "momentum"}
+FDR_ENGINE_FAMILY = ("meanrev", "breakout", "research", "momentum", "structure", "regime",
+                     "channel", "context_a", "context_b")
+_KNOWN_ENGINES = FDR_ENGINE_FAMILY
 
 
 # ---------------------------------------------------------------------------
@@ -48,11 +60,9 @@ def default_config_path() -> str:
 # value is range-clamped so a bad write can never crash or de-honest the gate.
 # ---------------------------------------------------------------------------
 CONFIG_DEFAULTS = {
-    # The full engine roster (meanrev/breakout/research + the consensus-family engines). Every name
-    # here is registered in PROVERS + ENGINE_TRADES and has a live-fire signal; the edge gate
-    # decides per (engine,symbol) whether it may actually fire on the buyer's own bars.
-    "engines": ["meanrev", "breakout", "research", "momentum", "structure", "regime",
-                "channel", "context_a", "context_b"],   # which engines may fire
+    # Only distinct implementations run live. Retired duplicate aliases stay in PROVERS and the
+    # immutable FDR family so their historical tests continue to count against multiplicity.
+    "engines": list(ACTIVE_ENGINE_FAMILY),
     "lookback": 20,            # bars of context for the signal window
     "barSeconds": 15,          # bucket size of a closed bar
     "oosFrac": 0.4,            # held-out fraction for the OOS edge proof
@@ -63,26 +73,22 @@ CONFIG_DEFAULTS = {
     "mrStopMult": 8.0,         # mean-reversion stop in sd multiples
     "mrWinFloor": 0.87,        # mean-reversion OOS win-rate floor to count as edge
     "bkTargetR": 2.0,          # breakout reward:risk target
+    "bkMaxHold": 80,           # bounded bars in a breakout/research trade (entry bar included)
+    "researchTickSize": 0.25,  # legal ES/MES price increment for conservative research fills
     "fdrQ": 0.10,              # Benjamini–Hochberg false-discovery rate for the screen grid (across
                               # all engine×symbol cells) so the candidate count isn't inflated by grid size
     "symbols": [],             # capture filter: EMPTY = accept every in_scope symbol. A non-empty
                                # list must name the feed's own codes; ["ES"] dropped 100% of
                                # prop-feed bars (MESU6/CM.ESU6 never string-match "ES").
-    # risk / prop-firm rules. These are ENFORCED execution risk gates when execution is armed+live
-    # (see bltd_exec.RiskGateChain); informational otherwise.
+    # Manual planning / prop-firm reference values. They never route an order.
     "accountSize": 50000.0,
     "riskPerTradePct": 1.0,
     "maxDailyLossPct": 3.0,
     "maxTrades": 0,            # 0 = unlimited
     "propFirm": "",            # free-text label of the buyer's prop firm
-    # execution risk params (also enforced by the exec engine). NOTE: arm/mode/kill are NOT here —
-    # they live in a dedicated exec_kv table so a /api/config POST can never flip them on.
-    "execMaxContracts": 0,     # 0 = no execution cap set (engine treats 0 as "no cap configured")
-    "execMaxDrawdown": 0.0,    # $ trailing-drawdown guard vs the real-equity high-water mark
-    # NOTE: per-order confirm is NOT here on purpose. It lived in config and a plain /api/config POST
-    # could flip it off (2026-07-01 audit). It now lives in exec_kv ("confirmEachOrder", default "1")
-    # and can only be disabled through /api/exec/confirmeachorder WITH a fresh OS-auth — same class of
-    # gate as going live. The engine already never consults it for the live path (confirm is mandatory).
+    # Legacy planning/state keys retained for database compatibility; no shipping order route reads them.
+    "execMaxContracts": 0,
+    "execMaxDrawdown": 0.0,
     # alert/signal delivery channels (the daemon writes a fire; channels mirror it out)
     "alertSound": True,
     "alertWebhook": "",        # POST each fire as JSON to this URL (e.g. Discord/Slack)
@@ -100,13 +106,14 @@ _CONFIG_RANGES = {
     "lookback": (3, 200), "barSeconds": (1, 3600), "oosFrac": (0.1, 0.9),
     "minTrades": (1, 1000), "mrZ": (0.5, 6.0), "mrTgtFrac": (0.05, 1.0),
     "mrStopMult": (0.5, 50.0), "mrWinFloor": (0.0, 1.0), "bkTargetR": (0.25, 20.0),
-    "fdrQ": (0.001, 1.0),
+    "bkMaxHold": (1, 10000), "researchTickSize": (0.0001, 100.0),
+    # The production edge gate never permits a looser false-discovery budget than the documented
+    # q=0.10 family. Research tools may be stricter, but a config write cannot silently relax it.
+    "fdrQ": (0.001, 0.10),
     "accountSize": (0.0, 1e9), "riskPerTradePct": (0.0, 100.0),
     "maxDailyLossPct": (0.0, 100.0), "maxTrades": (0, 100000),
     "execMaxContracts": (0, 1000), "execMaxDrawdown": (0.0, 1e9),
 }
-_KNOWN_ENGINES = ("meanrev", "breakout", "research", "momentum", "structure", "regime",
-                  "channel", "context_a", "context_b")
 ES_ROOT = "ES"
 MES_ROOT = "MES"  # micro E-mini S&P — the most-traded TopStep instrument; first-class family member
 _ES_MONTH_CODES = "FGHJKMNQUVXZ"
@@ -288,7 +295,9 @@ def _clamp(key, val):
     lo, hi = _CONFIG_RANGES[key]
     try:
         v = float(val)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        return CONFIG_DEFAULTS[key]
+    if not math.isfinite(v):
         return CONFIG_DEFAULTS[key]
     v = max(lo, min(hi, v))
     return int(v) if isinstance(CONFIG_DEFAULTS[key], int) else v
@@ -314,9 +323,15 @@ def _sanitize(cfg: dict) -> dict:
     out.update({k: cfg.get(k, out[k]) for k in out})
     for k in _CONFIG_RANGES:
         out[k] = _clamp(k, out[k])
-    eng = [e for e in (out.get("engines") or []) if e in _KNOWN_ENGINES]
+    eng = []
+    for raw_engine in (out.get("engines") or []):
+        canonical = DUPLICATE_ENGINE_ALIASES.get(raw_engine, raw_engine)
+        if canonical in ACTIVE_ENGINE_FAMILY and canonical not in eng:
+            eng.append(canonical)
     out["engines"] = eng or list(CONFIG_DEFAULTS["engines"])
-    out["edgeGate"] = bool(out.get("edgeGate", True))
+    # Shipping signals are always edge-gated. Tests and offline embeddings can still pass an
+    # explicit Capture(..., edge_gate=False); persisted buyer config cannot disable the safety gate.
+    out["edgeGate"] = True
     out["alertSound"] = bool(out.get("alertSound", True))
     out["symbols"] = [ES_ROOT]
     out["propFirm"] = str(out.get("propFirm", ""))[:64]
@@ -567,46 +582,223 @@ MR_STOP_MULT = 8.0
 MR_WIN_FLOOR = 0.87
 MR_MAX_HOLD = 80
 BK_TARGET_R = 2.0
+BK_MAX_HOLD = 80
+RESEARCH_TICK_SIZE = 0.25
 
 
-def _mr_simulate_ohlc(ohlc, i, direction, entry, stop, target, max_hold):
-    """ohlc: list of (o,h,l,c). Mirrors Engines.swift mrSimulate."""
-    risk = abs(entry - stop)
-    if risk <= 0:
+def _valid_ohlc_bar(bar) -> bool:
+    """True only for a finite, internally consistent OHLC row.
+
+    Research must fail closed on a corrupt bar. In particular, accepting NaN makes every
+    comparison false and can silently turn a broken series into a flattering time-stop fill.
+    """
+    if not isinstance(bar, (list, tuple)) or len(bar) < 4:
+        return False
+    try:
+        o, h, l, c = (float(bar[k]) for k in range(4))
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return (all(math.isfinite(v) for v in (o, h, l, c))
+            and l <= min(o, c) <= max(o, c) <= h)
+
+
+def _valid_ohlc_series(ohlc) -> bool:
+    return isinstance(ohlc, (list, tuple)) and all(_valid_ohlc_bar(b) for b in ohlc)
+
+
+def _round_fill(price, direction, tick_size=RESEARCH_TICK_SIZE, is_entry=False):
+    """Round one ES-family research fill in the adverse direction.
+
+    LONG entries round up and SHORT entries down. Exits do the inverse: LONG exits round down
+    and SHORT exits up. Decimal avoids binary-float boundary errors at legal 0.25 ES/MES ticks.
+    Invalid price/direction/tick returns None so the caller can reject the trade.
+    """
+    if direction not in ("long", "short"):
         return None
-    target_r = abs(target - entry) / risk
-    end = len(ohlc) if max_hold <= 0 else min(len(ohlc), i + 1 + max_hold)
-    j = i + 1
-    while j < end:
-        hi, lo = ohlc[j][1], ohlc[j][2]
+    try:
+        px = Decimal(str(price))
+        tick = Decimal(str(tick_size))
+        if not px.is_finite() or not tick.is_finite() or tick <= 0:
+            return None
+        round_up = ((direction == "long") if is_entry else (direction == "short"))
+        mode = ROUND_CEILING if round_up else ROUND_FLOOR
+        units = (px / tick).to_integral_value(rounding=mode)
+        result = float(units * tick)
+    except (InvalidOperation, TypeError, ValueError, OverflowError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def _round_order_level(price, direction, kind, tick_size=RESEARCH_TICK_SIZE):
+    """Round a stop/target to a legal tick without improving the research geometry.
+
+    Order placement and realized fill rounding are different operations. A LONG stop must never
+    move farther away and a LONG target must never move closer, so both round UP. The SHORT inverse
+    rounds both levels DOWN. Once a legal trigger is touched, ``_round_fill`` still applies the
+    adverse realized-fill rule independently.
+    """
+    if direction not in ("long", "short") or kind not in ("stop", "target"):
+        return None
+    try:
+        px = Decimal(str(price))
+        tick = Decimal(str(tick_size))
+        if not px.is_finite() or not tick.is_finite() or tick <= 0:
+            return None
+        mode = ROUND_CEILING if direction == "long" else ROUND_FLOOR
+        units = (px / tick).to_integral_value(rounding=mode)
+        result = float(units * tick)
+    except (InvalidOperation, TypeError, ValueError, OverflowError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def _research_tick_size(cfg):
+    try:
+        value = float(cfg.get("researchTickSize", RESEARCH_TICK_SIZE))
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return None
+    lo, hi = _CONFIG_RANGES["researchTickSize"]
+    return value if math.isfinite(value) and lo <= value <= hi else None
+
+
+def _breakout_max_hold(cfg):
+    try:
+        value = int(cfg.get("bkMaxHold", BK_MAX_HOLD))
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return None
+    lo, hi = _CONFIG_RANGES["bkMaxHold"]
+    return value if lo <= value <= hi else None
+
+
+def _bracket_trade(ohlc, entry_index, direction, entry, stop, target, max_hold,
+                   tick_size=RESEARCH_TICK_SIZE, signal_index=None,
+                   close_incomplete=True):
+    """Walk an OHLC bracket causally from an already-known entry bar.
+
+    ``max_hold`` is entry-inclusive: 1 examines only the entry bar; 80 examines the entry bar
+    plus at most 79 later bars. Each bar checks its OPEN before its intrabar range, so a gap
+    beyond a bracket fills at the (adversely tick-rounded) open. If both stop and target occur
+    inside one bar, stop wins because OHLC cannot establish touch order.
+    """
+    if direction not in ("long", "short") or not _valid_ohlc_series(ohlc):
+        return None
+    try:
+        entry_index = int(entry_index)
+        max_hold = int(max_hold)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if entry_index < 0 or entry_index >= len(ohlc) or max_hold < 1:
+        return None
+
+    try:
+        raw_stop = float(stop)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    entry = _round_fill(entry, direction, tick_size, is_entry=True)
+    stop = _round_order_level(stop, direction, "stop", tick_size)
+    target = _round_order_level(target, direction, "target", tick_size)
+    if entry is None or stop is None or target is None:
+        return None
+    if direction == "long":
+        if not (stop <= entry < target):
+            return None
+    elif not (target < entry <= stop):
+        return None
+    risk = abs(entry - stop)
+    # A conservative legal stop can round exactly to the entry (for example LONG 100.00 with an
+    # intended 99.90 stop on a 0.25-tick instrument). That is an immediate scratch/loss, not a
+    # reason to discard the observation. Preserve the intended distance only as the R denominator.
+    if risk <= 0:
+        risk = abs(entry - raw_stop)
+    if risk <= 0:
+        try:
+            risk = float(tick_size)
+        except (TypeError, ValueError, OverflowError):
+            return None
+    if not math.isfinite(risk) or risk <= 0:
+        return None
+
+    try:
+        sig_i = entry_index - 1 if signal_index is None else int(signal_index)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    end = min(len(ohlc), entry_index + max_hold)
+
+    def result(exit_price, exit_index):
+        filled = _round_fill(exit_price, direction, tick_size, is_entry=False)
+        if filled is None:
+            return None
+        pnl = filled - entry if direction == "long" else entry - filled
+        r = pnl / risk
+        if not math.isfinite(r):
+            return None
+        return {
+            "dir": direction, "entry": entry, "exit": filled,
+            "stop": stop, "target": target,
+            "signalIndex": sig_i, "entryIndex": entry_index, "exitIndex": exit_index,
+            "held": exit_index - entry_index, "r": round(r, 4),
+        }
+
+    for j in range(entry_index, end):
+        op, hi, lo, _ = (float(ohlc[j][k]) for k in range(4))
         if direction == "long":
+            if op <= stop:
+                return result(op, j)       # gap through stop: no impossible stop-price fill
+            if op >= target:
+                return result(op, j)       # favorable target gap also fills at the open
             if lo <= stop:
-                return {"dir": direction, "entry": entry, "exit": stop, "held": j - i, "r": -1.0}
+                return result(stop, j)     # stop-first for ambiguous same-bar touches
             if hi >= target:
-                return {"dir": direction, "entry": entry, "exit": target, "held": j - i, "r": target_r}
+                return result(target, j)
         else:
+            if op >= stop:
+                return result(op, j)
+            if op <= target:
+                return result(op, j)
             if hi >= stop:
-                return {"dir": direction, "entry": entry, "exit": stop, "held": j - i, "r": -1.0}
+                return result(stop, j)
             if lo <= target:
-                return {"dir": direction, "entry": entry, "exit": target, "held": j - i, "r": target_r}
-        j += 1
-    k = end - 1
-    last = ohlc[k][3]
-    held = k - i
-    r = (last - entry) / risk if direction == "long" else (entry - last) / risk
-    return {"dir": direction, "entry": entry, "exit": last, "held": held, "r": round(r, 4)}
+                return result(target, j)
+
+    # The historical prover closes a truncated sample at its final observable close. A live fire
+    # is different: it remains pending until the full hold window is observable. This switch lets
+    # the journal use the exact same trigger/fill walker without inventing a premature time exit.
+    if not close_incomplete and len(ohlc) - entry_index < max_hold:
+        return None
+
+    # No bracket touch inside the bounded window: flatten at its final close, never at a later
+    # session's price. This is also the entry bar's close when max_hold == 1.
+    exit_index = end - 1
+    return result(float(ohlc[exit_index][3]), exit_index)
+
+
+def _mr_simulate_ohlc(ohlc, i, direction, entry, stop, target, max_hold,
+                      tick_size=RESEARCH_TICK_SIZE, signal_index=None):
+    """Compatibility wrapper for the shared causal OHLC bracket simulator."""
+    return _bracket_trade(ohlc, i, direction, entry, stop, target, max_hold,
+                          tick_size, signal_index)
 
 
 def _mr_trades(ohlc, lookback=LOOKBACK, cfg=None):
     cfg = cfg or CONFIG_DEFAULTS
-    z_enter = cfg.get("mrZ", MR_Z)
-    tgt_frac = cfg.get("mrTgtFrac", MR_TGT_FRAC)
-    stop_mult = cfg.get("mrStopMult", MR_STOP_MULT)
-    closes = [b[3] for b in ohlc]
+    if not _valid_ohlc_series(ohlc):
+        return []
+    tick_size = _research_tick_size(cfg)
+    try:
+        lookback = int(lookback)
+        z_enter = float(cfg.get("mrZ", MR_Z))
+        tgt_frac = float(cfg.get("mrTgtFrac", MR_TGT_FRAC))
+        stop_mult = float(cfg.get("mrStopMult", MR_STOP_MULT))
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return []
+    if (tick_size is None or lookback < 1
+            or not all(math.isfinite(v) and v > 0 for v in (z_enter, tgt_frac, stop_mult))):
+        return []
+    closes = [float(b[3]) for b in ohlc]
     out = []
     i = lookback
     n = len(ohlc)
-    while i < n:
+    while i < n - 1:
         prior = closes[i - lookback:i]
         mean = sum(prior) / lookback
         varc = sum((x - mean) ** 2 for x in prior) / lookback
@@ -614,67 +806,289 @@ def _mr_trades(ohlc, lookback=LOOKBACK, cfg=None):
             i += 1
             continue
         sd = math.sqrt(varc)
-        entry = closes[i]
-        z = (entry - mean) / sd
+        signal_close = closes[i]
+        z = (signal_close - mean) / sd
+        entry_index = i + 1
+        raw_entry = float(ohlc[entry_index][0])
+        entry = _round_fill(raw_entry, "long" if z <= -z_enter else "short",
+                            tick_size, is_entry=True)
+        if entry is None:
+            i += 1
+            continue
         if z <= -z_enter:
-            direction, target, stop = "long", entry + tgt_frac * (mean - entry), entry - stop_mult * sd
+            direction = "long"
+            target = entry + tgt_frac * (mean - entry)
+            stop = entry - stop_mult * sd
         elif z >= z_enter:
-            direction, target, stop = "short", entry - tgt_frac * (entry - mean), entry + stop_mult * sd
+            direction = "short"
+            target = entry - tgt_frac * (entry - mean)
+            stop = entry + stop_mult * sd
         else:
             i += 1
             continue
-        t = _mr_simulate_ohlc(ohlc, i, direction, entry, stop, target, MR_MAX_HOLD)
+        t = _mr_simulate_ohlc(ohlc, entry_index, direction, entry, stop, target,
+                              MR_MAX_HOLD, tick_size, signal_index=i)
         if not t:
             i += 1
             continue
         out.append(t)
-        i += max(1, t["held"])
+        i = max(i + 1, t["exitIndex"])
     return out
 
 
-# Significance bar for the OOS edge proof. expectancy>0 alone is NOT proof: under a 2:1 target a
-# driftless random walk clears expectancy>0 >50% of the time, so the directional engines would
-# "prove" an edge on pure noise. An edge is proven only if the OOS win-rate SIGNIFICANTLY beats the
-# R-geometry breakeven (one-sided binomial, p<0.05) on a sufficient sample. Verified: this collapses
-# the random-walk false-positive rate from ~55-63% to the ~5% floor; honest engines are unaffected.
+# Significance bar for the OOS edge proof. expectancy>0 alone is NOT proof: a driftless series
+# clears that threshold roughly half the time. More importantly, real research trades include gaps
+# and time exits, so they are not Bernoulli trials with one fixed win/loss payoff. The edge statistic
+# therefore tests the realized R-return mean directly, using capped positive outcomes, every actual
+# loss, and a Newey-West long-run variance that penalizes serially clustered results.
 SIG_MIN_N = 30          # minimum OOS trades before significance can be assessed
-SIG_ALPHA = 0.05        # one-sided binomial significance level
+SIG_ALPHA = 0.05        # one-sided mean-R significance level
 
 
 def _binom_sf(k, n, p):
-    """P(X >= k) for X ~ Binomial(n, p), exact via stdlib. n is the (small) OOS trade count."""
+    """P(X >= k) for X ~ Binomial(n, p), stable for small and large OOS samples.
+
+    The direct ``comb * p**i`` sum overflowed while optimizing high-turnover cells (n≈1,300),
+    crashing the farm instead of returning an honest p-value. Log-space summation chooses the
+    smaller tail and uses expm1 for the complement, avoiding integer→float overflow and severe
+    cancellation without adding a scipy dependency.
+    """
     if k <= 0:
         return 1.0
-    return sum(math.comb(n, i) * (p ** i) * ((1.0 - p) ** (n - i)) for i in range(k, n + 1))
+    if k > n:
+        return 0.0
+    if p <= 0.0:
+        return 0.0
+    if p >= 1.0:
+        return 1.0
+
+    log_p = math.log(p)
+    log_q = math.log1p(-p)
+
+    def log_pmf(i):
+        return (math.lgamma(n + 1) - math.lgamma(i + 1) - math.lgamma(n - i + 1)
+                + i * log_p + (n - i) * log_q)
+
+    def log_add(a, b):
+        if a == -math.inf:
+            return b
+        if b > a:
+            a, b = b, a
+        return a + math.log1p(math.exp(b - a))
+
+    if k <= n * p:
+        # Survival is the large tail; compute the smaller lower CDF and complement it stably.
+        log_cdf = -math.inf
+        for i in range(0, k):
+            log_cdf = log_add(log_cdf, log_pmf(i))
+        return max(0.0, min(1.0, -math.expm1(log_cdf)))
+
+    log_sf = -math.inf
+    for i in range(k, n + 1):
+        log_sf = log_add(log_sf, log_pmf(i))
+    return max(0.0, min(1.0, math.exp(log_sf)))
+
+
+def _beta_continued_fraction(a, b, x):
+    """Numerical-Recipes continued fraction for the regularized incomplete beta.
+
+    This tiny stdlib-only primitive lets the edge gate use a Student-t tail rather than treating a
+    small OOS sample as asymptotically normal. ``None`` means the fraction did not converge, which
+    callers treat as no evidence.
+    """
+    max_iterations = 200
+    epsilon = 3.0e-14
+    fp_min = 1.0e-300
+    qab = a + b
+    qap = a + 1.0
+    qam = a - 1.0
+    c = 1.0
+    d = 1.0 - qab * x / qap
+    if abs(d) < fp_min:
+        d = fp_min
+    d = 1.0 / d
+    h = d
+    for m in range(1, max_iterations + 1):
+        m2 = 2 * m
+        aa = m * (b - m) * x / ((qam + m2) * (a + m2))
+        d = 1.0 + aa * d
+        if abs(d) < fp_min:
+            d = fp_min
+        c = 1.0 + aa / c
+        if abs(c) < fp_min:
+            c = fp_min
+        d = 1.0 / d
+        h *= d * c
+        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
+        d = 1.0 + aa * d
+        if abs(d) < fp_min:
+            d = fp_min
+        c = 1.0 + aa / c
+        if abs(c) < fp_min:
+            c = fp_min
+        d = 1.0 / d
+        delta = d * c
+        h *= delta
+        if not math.isfinite(h):
+            return None
+        if abs(delta - 1.0) <= epsilon:
+            return h
+    return None
+
+
+def _regularized_beta(x, a, b):
+    """Regularized incomplete beta I_x(a,b), or ``None`` on invalid/nonconvergent input."""
+    if not all(math.isfinite(v) for v in (x, a, b)) or a <= 0.0 or b <= 0.0:
+        return None
+    if x <= 0.0:
+        return 0.0
+    if x >= 1.0:
+        return 1.0
+    try:
+        front = math.exp(
+            math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
+            + a * math.log(x) + b * math.log1p(-x))
+    except (OverflowError, ValueError):
+        return None
+    if not math.isfinite(front):
+        return None
+    if x < (a + 1.0) / (a + b + 2.0):
+        fraction = _beta_continued_fraction(a, b, x)
+        value = None if fraction is None else front * fraction / a
+    else:
+        fraction = _beta_continued_fraction(b, a, 1.0 - x)
+        value = None if fraction is None else 1.0 - front * fraction / b
+    if value is None or not math.isfinite(value):
+        return None
+    return max(0.0, min(1.0, value))
+
+
+def _student_t_sf(t_stat, degrees_freedom):
+    """One-sided Student-t survival probability, dependency-free and stable at large n."""
+    try:
+        t_stat = float(t_stat)
+        degrees_freedom = float(degrees_freedom)
+    except (TypeError, ValueError, OverflowError):
+        return 1.0
+    if not math.isfinite(degrees_freedom) or degrees_freedom < 1.0:
+        return 1.0
+    if math.isnan(t_stat):
+        return 1.0
+    if t_stat == math.inf:
+        return 0.0
+    if t_stat == -math.inf:
+        return 1.0
+    try:
+        x = degrees_freedom / (degrees_freedom + t_stat * t_stat)
+    except OverflowError:
+        x = 0.0
+    beta = _regularized_beta(x, degrees_freedom / 2.0, 0.5)
+    if beta is None:
+        return 1.0
+    return 0.5 * beta if t_stat >= 0.0 else 1.0 - 0.5 * beta
 
 
 def _edge_pvalue(trades, wins, n, expectancy, min_trades, target_r=None):
-    """One-sided binomial p-value that the OOS win-rate beats the R-geometry breakeven (1/(1+winR)).
-    Returns 1.0 (no evidence) when the sample is too small / no wins / non-positive expectancy, so
-    a thin or losing series can never look significant. This is the single edge statistic; both the
-    per-test gate and the grid-wide FDR correction derive from it.
+    """Conservative one-sided test of ``mean(realized R) > 0`` on the OOS trade sequence.
 
-    winR is the INTENDED target R, NOT the realized max win — using max() would data-snoop the
-    breakeven downward (one lucky runner lowers the bar and inflates significance). When the caller
-    knows its fixed target we cap at it; for a variable-R engine we use the robust median winning R.
-    For the current fixed-2:1 engines max==median==target so this changes nothing today; it is the
-    guard that keeps the gate honest if an uncapped-R (trailing/runner) engine ever ships."""
-    if n < max(min_trades, SIG_MIN_N) or wins <= 0 or expectancy <= 0:
+    Positive R is capped at the intended target when known. Variable-payoff engines use the lower
+    median realized positive R as a robust cap, so a rare runner cannot purchase significance.
+    Losses are never clipped. A Bartlett/Newey-West variance preserves short-range serial
+    dependence; it is floored at the IID variance so negative autocorrelation cannot make the test
+    more permissive. The bounded automatic lag is O(n * n**(2/9)), capped at 32 for optimizer scale.
+
+    Any thin, malformed, nonfinite, internally inconsistent, non-positive, or effectively
+    zero-variance sample returns 1.0. Both the per-cell edge gate and grid-wide BH-FDR consume this
+    same deterministic p-value.
+    """
+    try:
+        n_value = int(n)
+        wins_value = int(wins)
+        min_value = int(min_trades)
+        expectancy_value = float(expectancy)
+        rows = list(trades)
+    except (TypeError, ValueError, OverflowError):
         return 1.0
-    win_rs = [t["r"] for t in trades if t["r"] > 0]
-    if not win_rs:
+    if (n_value != n or wins_value != wins or min_value != min_trades
+            or n_value != len(rows) or n_value < max(min_value, SIG_MIN_N)
+            or wins_value <= 0 or not math.isfinite(expectancy_value)
+            or expectancy_value <= 0.0):
         return 1.0
-    if target_r is not None and target_r > 0:
-        win_r = min(max(win_rs), float(target_r))   # cap at the intended reward:risk
+
+    realized = []
+    try:
+        for trade in rows:
+            value = float(trade["r"])
+            if not math.isfinite(value):
+                return 1.0
+            realized.append(value)
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return 1.0
+    positives = sorted(value for value in realized if value > 0.0)
+    if len(positives) != wins_value:
+        return 1.0
+    if target_r is not None:
+        try:
+            positive_cap = float(target_r)
+        except (TypeError, ValueError, OverflowError):
+            return 1.0
+        if not math.isfinite(positive_cap) or positive_cap <= 0.0:
+            return 1.0
     else:
-        win_r = sorted(win_rs)[len(win_rs) // 2]    # robust median for variable-R geometry
-    breakeven = 1.0 / (1.0 + win_r)                  # win-rate needed just to break even at this R
-    return _binom_sf(wins, n, breakeven)
+        # Lower median is deliberate for even samples: uncertainty about the payoff distribution
+        # must reduce, never inflate, evidence.
+        positive_cap = positives[(len(positives) - 1) // 2]
+    if not math.isfinite(positive_cap) or positive_cap <= 0.0:
+        return 1.0
+
+    returns = [min(value, positive_cap) if value > 0.0 else value for value in realized]
+    try:
+        mean_r = math.fsum(returns) / n_value
+    except (OverflowError, ValueError):
+        return 1.0
+    if not math.isfinite(mean_r) or mean_r <= 0.0:
+        return 1.0
+    deviations = [value - mean_r for value in returns]
+    try:
+        iid_variance = math.fsum(value * value for value in deviations) / n_value
+    except (OverflowError, ValueError):
+        return 1.0
+    max_magnitude = max(abs(value) for value in returns)
+    variance_floor = (max(1.0, max_magnitude) * 1.0e-12) ** 2
+    if not math.isfinite(iid_variance) or iid_variance <= variance_floor:
+        return 1.0
+
+    # Andrews/Newey-West automatic bandwidth, hard-capped so large optimizer cells stay bounded.
+    lag_count = max(1, min(n_value - 1, 32,
+                           int(4.0 * (n_value / 100.0) ** (2.0 / 9.0))))
+    long_run_variance = iid_variance
+    for lag in range(1, lag_count + 1):
+        try:
+            covariance = math.fsum(
+                deviations[index] * deviations[index - lag]
+                for index in range(lag, n_value)) / n_value
+        except (OverflowError, ValueError):
+            return 1.0
+        weight = 1.0 - lag / (lag_count + 1.0)
+        long_run_variance += 2.0 * weight * covariance
+    # Never reward negative autocorrelation or a non-positive finite-sample HAC estimate.
+    long_run_variance = max(iid_variance, long_run_variance)
+    if not math.isfinite(long_run_variance) or long_run_variance <= variance_floor:
+        return 1.0
+    standard_error = math.sqrt(long_run_variance / n_value)
+    if not math.isfinite(standard_error) or standard_error <= 0.0:
+        return 1.0
+    t_stat = mean_r / standard_error
+    # Treat each (lag+1)-wide dependence block as one effective observation for the small-sample
+    # tail. This is deliberately more conservative than using n-1 degrees of freedom.
+    effective_df = max(1, n_value // (lag_count + 1) - 1)
+    p_value = _student_t_sf(t_stat, effective_df)
+    return p_value if math.isfinite(p_value) and 0.0 <= p_value <= 1.0 else 1.0
 
 
 def _edge_proven(trades, wins, n, expectancy, min_trades, target_r=None):
-    """Per-test gate: the edge p-value clears SIG_ALPHA. (The screen grid additionally applies a
-    Benjamini–Hochberg FDR correction across all (engine,symbol) cells — see bltd_analytics.screen.)"""
+    """Per-test gate: the return-based edge p-value clears SIG_ALPHA. (The screen grid additionally
+    applies BH-FDR across all (engine,symbol) cells — see bltd_analytics.screen.)"""
     return _edge_pvalue(trades, wins, n, expectancy, min_trades, target_r) < SIG_ALPHA
 
 
@@ -722,49 +1136,79 @@ def prove_meanrev(ohlc, cfg=None):
     split = int(len(ohlc) * (1.0 - oos_frac))
     oos = ohlc[split:]
     s = _summarize(_mr_trades(oos, lookback, cfg), min_trades)
-    edge = s["trades"] >= min_trades and s["winRate"] >= win_floor and s["netPts"] > 0
-    reason = (f"OOS candidate: win {s['winRate']*100:.1f}% / net {s['netPts']:+.2f} pts on {s['trades']} trades; live verification required"
+    effective_min = max(min_trades, SIG_MIN_N)
+    # Mean reversion used to return ok=True from a high configured win floor without requiring the
+    # same statistical edge test every other engine exposes. Keep the strategy-specific floor, but
+    # make significance a non-negotiable part of the single-engine verdict too.
+    edge = (s["trades"] >= effective_min and s["winRate"] >= win_floor
+            and s["netPts"] > 0 and s["edgeProven"])
+    reason = (f"OOS candidate: win {s['winRate']*100:.1f}% / net {s['netPts']:+.2f} pts on "
+              f"{s['trades']} trades (p={s['pEdge']:.3f}); live verification required"
               if edge else
               f"not proven: OOS win {s['winRate']*100:.1f}% / net {s['netPts']:+.2f} pts on {s['trades']} trades "
-              f"(need win>={win_floor*100:.0f}%, net>0, >={min_trades} trades)")
+              f"(need win>={win_floor*100:.0f}%, net>0, >={effective_min} trades, p<{SIG_ALPHA})")
     return {"ok": edge, "reason": reason, **s}
 
 
-def _bk_simulate(closes, i, direction, entry, stop, target_r):
-    risk = abs(entry - stop)
+def _bk_simulate(ohlc, i, direction, entry, stop, target_r,
+                 max_hold=BK_MAX_HOLD, tick_size=RESEARCH_TICK_SIZE, signal_index=None):
+    """Breakout bracket wrapper.
+
+    Numeric close-only input remains accepted for narrow compatibility tests, but real engine
+    callers pass OHLC so gaps and intrabar stop/target touches are modeled honestly.
+    """
+    if isinstance(ohlc, (list, tuple)) and ohlc and not isinstance(ohlc[0], (list, tuple)):
+        try:
+            ohlc = [(float(px),) * 4 for px in ohlc]
+        except (TypeError, ValueError, OverflowError):
+            return None
+    try:
+        raw_stop = float(stop)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    rounded_entry = _round_fill(entry, direction, tick_size, is_entry=True)
+    rounded_stop = _round_order_level(stop, direction, "stop", tick_size)
+    try:
+        target_r = float(target_r)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if (rounded_entry is None or rounded_stop is None
+            or not math.isfinite(target_r) or target_r <= 0):
+        return None
+    risk = abs(rounded_entry - rounded_stop)
+    if risk <= 0:
+        risk = abs(rounded_entry - raw_stop)
     if risk <= 0:
         return None
-    target = entry + target_r * risk if direction == "long" else entry - target_r * risk
-    j = i + 1
-    while j < len(closes):
-        px = closes[j]
-        if direction == "long":
-            if px <= stop:
-                return {"dir": direction, "entry": entry, "exit": stop, "held": j - i, "r": -1.0}
-            if px >= target:
-                return {"dir": direction, "entry": entry, "exit": target, "held": j - i, "r": target_r}
-        else:
-            if px >= stop:
-                return {"dir": direction, "entry": entry, "exit": stop, "held": j - i, "r": -1.0}
-            if px <= target:
-                return {"dir": direction, "entry": entry, "exit": target, "held": j - i, "r": target_r}
-        j += 1
-    last = closes[-1]
-    r = (last - entry) / risk if direction == "long" else (entry - last) / risk
-    return {"dir": direction, "entry": entry, "exit": last, "held": len(closes) - 1 - i, "r": round(r, 4)}
+    target = (rounded_entry + target_r * risk if direction == "long"
+              else rounded_entry - target_r * risk)
+    return _bracket_trade(ohlc, i, direction, rounded_entry, stop, target,
+                          max_hold, tick_size, signal_index)
 
 
 def _bk_trades(ohlc, lookback=LOOKBACK, cfg=None):
     """Breakout walk over a bar series: long on a close above the prior `lookback` high, short
-    below the prior low; stop at the opposite extreme; fixed reward:risk target. Pure — this is
-    the single canonical breakout generator the gate, screener and full-backtest all share."""
+    below the prior low; enter at the NEXT bar's open; stop at the opposite extreme; fixed
+    reward:risk target; and flatten within configured ``bkMaxHold`` bars. Pure — this is the
+    single canonical breakout/research generator the gate, screener and full-backtest share."""
     cfg = cfg or CONFIG_DEFAULTS
-    target_r = cfg.get("bkTargetR", BK_TARGET_R)
-    closes = [b[3] for b in ohlc]
+    if not _valid_ohlc_series(ohlc):
+        return []
+    tick_size = _research_tick_size(cfg)
+    max_hold = _breakout_max_hold(cfg)
+    try:
+        lookback = int(lookback)
+        target_r = float(cfg.get("bkTargetR", BK_TARGET_R))
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return []
+    if (tick_size is None or max_hold is None or lookback < 1
+            or not math.isfinite(target_r) or target_r <= 0):
+        return []
+    closes = [float(b[3]) for b in ohlc]
     trades = []
     i = lookback
     n = len(closes)
-    while i < n:
+    while i < n - 1:
         prior = closes[i - lookback:i]
         last = closes[i]
         if not prior:
@@ -777,12 +1221,15 @@ def _bk_trades(ohlc, lookback=LOOKBACK, cfg=None):
         else:
             i += 1
             continue
-        t = _bk_simulate(closes, i, direction, last, stop, target_r)
+        entry_index = i + 1
+        entry = float(ohlc[entry_index][0])
+        t = _bk_simulate(ohlc, entry_index, direction, entry, stop, target_r,
+                         max_hold, tick_size, signal_index=i)
         if not t:
             i += 1
             continue
         trades.append(t)
-        i += max(1, t["held"])
+        i = max(i + 1, t["exitIndex"])
     return trades
 
 
@@ -853,26 +1300,44 @@ def _atr_stop_target(ohlc, entry, direction, atr_mult, target_r):
 
 def _consensus_engine_trades(ohlc, lookback, cfg, dir_fn):
     """Shared OOS walk for the consensus-family engines. `dir_fn(closes, ohlc, lookback, cfg)`
-    yields 'long'/'short'/None on each bar; geometry is the shared ATR stop/2:1 target."""
+    yields 'long'/'short'/None on each CLOSED signal bar. Entry is the next bar's adverse-rounded
+    open; geometry is the shared ATR stop/2:1 target and the shared gap-aware OHLC fill walk."""
     cfg = cfg or CONFIG_DEFAULTS
-    closes = [b[3] for b in ohlc]
+    if not _valid_ohlc_series(ohlc):
+        return []
+    tick_size = _research_tick_size(cfg)
+    try:
+        lookback = int(lookback)
+    except (TypeError, ValueError, OverflowError):
+        return []
+    if tick_size is None or lookback < 1 or not callable(dir_fn):
+        return []
+    closes = [float(b[3]) for b in ohlc]
     trades = []
     i = lookback
     n = len(ohlc)
-    while i < n:
+    while i < n - 1:
         sub = ohlc[:i + 1]
-        d = dir_fn(closes[:i + 1], sub, lookback, cfg)
+        try:
+            d = dir_fn(closes[:i + 1], sub, lookback, cfg)
+        except (ArithmeticError, IndexError, TypeError, ValueError):
+            return []                      # broken strategy/config fails closed, never partial truth
         if not d:
             i += 1
             continue
-        entry = closes[i]
+        entry_index = i + 1
+        entry = _round_fill(ohlc[entry_index][0], d, tick_size, is_entry=True)
+        if entry is None:
+            i += 1
+            continue
         stop, target = _atr_stop_target(sub, entry, d, MO_ATR_MULT, MO_TARGET_R)
-        t = _mr_simulate_ohlc(ohlc, i, d, entry, stop, target, MR_MAX_HOLD)
+        t = _mr_simulate_ohlc(ohlc, entry_index, d, entry, stop, target,
+                              MR_MAX_HOLD, tick_size, signal_index=i)
         if not t:
             i += 1
             continue
         trades.append(t)
-        i += max(1, t["held"])
+        i = max(i + 1, t["exitIndex"])
     return trades
 
 
@@ -1178,18 +1643,20 @@ PROVERS = {"meanrev": prove_meanrev, "breakout": prove_breakout, "research": pro
            "channel": prove_channel, "context_a": prove_context_a, "context_b": prove_context_b}
 
 
-def prover_source_sha() -> str:
-    """sha256 (16-hex) of THIS prover module's source — the exact edge-gate math a verdict was
-    computed with. Reproducible by the buyer: `shasum -a 256 bltd_store.py`. So a re-run the buyer
-    triggers on their own bars carries the fingerprint of the code that produced it, and any change
-    to the gate math changes the fingerprint. Same computation gen_reference.py stamps onto the
-    reference artifact, exposed here so the live re-run endpoint can stamp it identically."""
+def prover_source_sha256() -> str:
+    """Full SHA-256 of this prover module for immutable optimizer provenance."""
     import hashlib
     try:
         with open(__file__, "rb") as f:
-            return hashlib.sha256(f.read()).hexdigest()[:16]
+            return hashlib.sha256(f.read()).hexdigest()
     except OSError:
         return "unknown"
+
+
+def prover_source_sha() -> str:
+    """Compact 16-hex display form used by the existing API/reference wire contract."""
+    digest = prover_source_sha256()
+    return digest[:16] if len(digest) == 64 else digest
 
 
 # ===========================================================================
@@ -1222,7 +1689,22 @@ CREATE TABLE IF NOT EXISTS fires (
     outcome TEXT,
     pnl REAL,
     synthetic INTEGER NOT NULL DEFAULT 0,
+    bar_ts INTEGER,              -- exact closed-bar epoch that created the signal (durable dedupe/grading)
+    max_hold INTEGER,            -- entry-inclusive causal hold window fixed when the signal fires
+    tick_size REAL,              -- fill/order increment fixed when the signal fires
     ts INTEGER NOT NULL
+);
+-- Durable signal-transition state. Capture processes restart; an in-memory last-direction map made
+-- the same historical signal fire again after every restart. Persist direction + gate state at the
+-- exact closed-bar endpoint so unchanged/rejected signals remain idempotent across processes.
+CREATE TABLE IF NOT EXISTS signal_state (
+    engine TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    direction TEXT,
+    edge_ok INTEGER NOT NULL DEFAULT 0,
+    bar_ts INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (engine, symbol)
 );
 -- EXECUTION control state (arm/mode/kill/firm/...). Deliberately a SEPARATE table, NOT in the
 -- config blob, so a /api/config POST can never flip arm/mode/kill (set_config only touches config).
@@ -1248,6 +1730,8 @@ CREATE INDEX IF NOT EXISTS exec_orders_ts ON exec_orders(ts);
 LIVE_BAR_WINDOW = 600     # feedLive: a bar recorded in the last 10 min
 LIVE_TICK_WINDOW = 30     # liveTicks: a tick in the last 30 s
 EDGE_TTL = 120            # cache edge verdicts for 2 min (matches Utah's TTL intent)
+LIVE_ENGINE_BARS = 5000   # bounded newest-bar window for the continuously-running live evaluator
+ANALYSIS_MAX_BARS = 250000  # bounded but materially complete local research/backtest history
 
 # One-time, idempotent rename migration. The engine roster moved from internal codenames to
 # generic customer-facing ids; any fire rows captured under the old id are relabelled in place so
@@ -1285,9 +1769,33 @@ class Store:
                     cx.execute("ALTER TABLE bars ADD COLUMN v REAL NOT NULL DEFAULT 0")
                 if "delta" not in cols:
                     cx.execute("ALTER TABLE bars ADD COLUMN delta REAL NOT NULL DEFAULT 0")
+                fire_cols = {r[1] for r in cx.execute("PRAGMA table_info(fires)").fetchall()}
+                if "bar_ts" not in fire_cols:
+                    cx.execute("ALTER TABLE fires ADD COLUMN bar_ts INTEGER")
+                if "max_hold" not in fire_cols:
+                    cx.execute("ALTER TABLE fires ADD COLUMN max_hold INTEGER")
+                if "tick_size" not in fire_cols:
+                    cx.execute("ALTER TABLE fires ADD COLUMN tick_size REAL")
+                # Existing rows migrate with bar_ts=NULL, which SQLite deliberately permits through
+                # the unique index. Every new real fire carries a bar timestamp and is idempotent.
+                cx.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS fires_signal_bar_unique "
+                    "ON fires(engine,symbol,direction,bar_ts) "
+                    "WHERE synthetic=0 AND bar_ts IS NOT NULL")
                 # Idempotent: relabel any fires captured under the old engine codenames.
                 for old, new in _RENAMED_ENGINES.items():
                     cx.execute("UPDATE fires SET engine=? WHERE engine=?", (new, old))
+                # b27 is signals-only. Neutralize any legacy armed state before the API/capture
+                # starts; the shipping runtime exposes no route or adapter that can re-enable it.
+                for key, value in (
+                    ("armed", "0"), ("mode", "paper"), ("kill", "1"),
+                    ("liveAuthExpiry", "0"), ("demoValidated", "0"),
+                    ("confirmEachOrder", "1"),
+                ):
+                    cx.execute(
+                        "INSERT INTO exec_kv(k,v) VALUES(?,?) "
+                        "ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                        (key, value))
                 cx.commit()
             self._ok = True
         except Exception:  # noqa: BLE001 — unwritable path: store stays "offline", never crashes
@@ -1473,16 +1981,200 @@ class Store:
 
     # ---- fires ---------------------------------------------------------
     def record_fire(self, engine, direction, entry, symbol=None, stop=None, target=None,
-                    rationale=None, synthetic=False) -> int:
+                    rationale=None, synthetic=False, bar_ts=None, max_hold=None,
+                    tick_size=None) -> int:
         # Storage gate only — WHETHER to fire is decided upstream by the edge-gate (proven OOS edge
-        # per engine,symbol). in_scope just keeps junk symbols out of the journal.
+        # per engine,symbol). in_scope just keeps junk symbols out of the journal. New real signals
+        # are keyed to the exact closed bar so a daemon restart/race cannot duplicate the journal.
         if symbol is not None and not in_scope(symbol):
             return 0
         return self._exec(
-            "INSERT INTO fires(engine,direction,entry,symbol,stop,target,rationale,synthetic,ts) "
-            "VALUES(?,?,?,?,?,?,?,?,?)",
+            "INSERT OR IGNORE INTO fires("
+            "engine,direction,entry,symbol,stop,target,rationale,synthetic,bar_ts,"
+            "max_hold,tick_size,ts) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
             (engine, direction, float(entry), symbol, stop, target, rationale,
-             1 if synthetic else 0, int(time.time())))
+             1 if synthetic else 0, (int(bar_ts) if bar_ts is not None else None),
+             (int(max_hold) if max_hold is not None else None),
+             (float(tick_size) if tick_size is not None else None), int(time.time())))
+
+    def observe_signal(self, engine: str, symbol: str, direction: str | None,
+                       edge_ok: bool, bar_ts: int) -> bool:
+        """Persist one evaluated signal state and return True exactly when it should fire.
+
+        A fire is eligible on signal appearance/flip, or when an unchanged direction transitions
+        from FDR-rejected to FDR-approved. State is committed atomically with the decision so a new
+        capture process over the same closed bar cannot replay it. A None direction clears the
+        appearance state, allowing a later genuine reappearance to fire.
+        """
+        if not self._ok or not in_scope(symbol):
+            return False
+        direction = direction if direction in ("long", "short") else None
+        bar_ts = int(bar_ts)
+        now = int(time.time())
+        try:
+            with self._lock, self._connect() as cx:
+                row = cx.execute(
+                    "SELECT direction,edge_ok,bar_ts FROM signal_state WHERE engine=? AND symbol=?",
+                    (engine, symbol)).fetchone()
+                previous_direction = row[0] if row else None
+                previous_edge = bool(row[1]) if row else False
+                should_fire = bool(
+                    direction and edge_ok
+                    and (row is None or direction != previous_direction or not previous_edge))
+                cx.execute(
+                    "INSERT INTO signal_state(engine,symbol,direction,edge_ok,bar_ts,updated_at) "
+                    "VALUES(?,?,?,?,?,?) "
+                    "ON CONFLICT(engine,symbol) DO UPDATE SET "
+                    "direction=excluded.direction,edge_ok=excluded.edge_ok,"
+                    "bar_ts=excluded.bar_ts,updated_at=excluded.updated_at",
+                    (engine, symbol, direction, 1 if edge_ok else 0, bar_ts, now))
+                cx.commit()
+                return should_fire
+        except Exception:  # noqa: BLE001 — broken state storage fails closed (never duplicate/fire)
+            return False
+
+    def record_signal_evaluation(self, engine: str, symbol: str, direction: str | None,
+                                 edge_ok: bool, bar_ts: int, entry=None, stop=None,
+                                 target=None, rationale=None, max_hold=None,
+                                 tick_size=None) -> int:
+        """Atomically persist one evaluation and, when flat, its journal fire.
+
+        The earlier two-transaction sequence committed ``signal_state`` before inserting ``fires``.
+        A crash or disk error between those writes permanently consumed the transition without a
+        journal row or alert. This single transaction either records both facts or neither.
+
+        Lifecycle parity is position-based, not direction-transition-based: the canonical prover
+        may re-enter an unchanged LONG/SHORT signal after the prior bracket closes. At most one
+        outcome-NULL fire per engine+symbol is allowed; while it is open, later signal bars only
+        advance durable state. Once grading closes it, a strictly later eligible signal bar may
+        fire even when direction is unchanged. The same bar remains restart-idempotent.
+        """
+        if not self._ok or not in_scope(symbol):
+            return 0
+        direction = direction if direction in ("long", "short") else None
+        try:
+            bar_ts = int(bar_ts)
+            entry_value = float(entry) if entry is not None else None
+            max_hold_value = int(max_hold) if max_hold is not None else None
+            tick_size_value = float(tick_size) if tick_size is not None else None
+        except (TypeError, ValueError, OverflowError):
+            return 0
+        now = int(time.time())
+        try:
+            with self._lock, self._connect() as cx:
+                # Serialize the read-open-position -> state/fire write sequence across processes,
+                # not only threads sharing this Store instance.
+                cx.execute("BEGIN IMMEDIATE")
+                row = cx.execute(
+                    "SELECT direction,edge_ok,bar_ts FROM signal_state WHERE engine=? AND symbol=?",
+                    (engine, symbol)).fetchone()
+                previous_direction = row[0] if row else None
+                previous_edge = bool(row[1]) if row else False
+                previous_bar_ts = int(row[2]) if row else None
+                if previous_bar_ts is not None and bar_ts < previous_bar_ts:
+                    cx.rollback()
+                    return 0
+                open_fire = cx.execute(
+                    "SELECT 1 FROM fires WHERE synthetic=0 AND engine=? AND symbol=? "
+                    "AND outcome IS NULL LIMIT 1",
+                    (engine, symbol)).fetchone()
+                newer_bar = previous_bar_ts is None or bar_ts > previous_bar_ts
+                # A transient family-gate failure may recover before the immutable signal bar
+                # changes. Preserve that prior contract without allowing a same-bar direction
+                # rewrite or a restart duplicate.
+                same_bar_gate_recovery = bool(
+                    previous_bar_ts == bar_ts and direction == previous_direction
+                    and edge_ok and not previous_edge)
+                should_fire = bool(
+                    direction and edge_ok and entry_value is not None
+                    and not open_fire and (newer_bar or same_bar_gate_recovery))
+                # Replaying an already-evaluated immutable bar changes nothing unless the sole
+                # allowed mutation is rejected->approved gate recovery above.
+                if (previous_bar_ts == bar_ts and not same_bar_gate_recovery):
+                    cx.commit()
+                    return 0
+                cx.execute(
+                    "INSERT INTO signal_state(engine,symbol,direction,edge_ok,bar_ts,updated_at) "
+                    "VALUES(?,?,?,?,?,?) "
+                    "ON CONFLICT(engine,symbol) DO UPDATE SET "
+                    "direction=excluded.direction,edge_ok=excluded.edge_ok,"
+                    "bar_ts=excluded.bar_ts,updated_at=excluded.updated_at",
+                    (engine, symbol, direction, 1 if edge_ok else 0, bar_ts, now))
+                inserted = 0
+                if should_fire:
+                    cur = cx.execute(
+                        "INSERT OR IGNORE INTO fires("
+                        "engine,direction,entry,symbol,stop,target,rationale,synthetic,bar_ts,"
+                        "max_hold,tick_size,ts) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (engine, direction, entry_value, symbol, stop, target, rationale,
+                         0, bar_ts, max_hold_value, tick_size_value, now))
+                    inserted = max(0, cur.rowcount)
+                cx.commit()
+                return inserted
+        except Exception:  # noqa: BLE001 — no partial state/fire and no fail-open signal
+            return 0
+
+    def grade_open_fires(self, symbol: str) -> dict:
+        """Grade new real signals from later CLOSED OHLC bars.
+
+        Only fires carrying a durable bar_ts are eligible; legacy rows remain honestly ungraded.
+        If a bar spans both stop and target, OHLC cannot reveal touch order, so the result is
+        conservatively resolved as a stop/loss. PnL is points, matching the journal's existing
+        points-only posture.
+        """
+        summary = {"graded": 0, "wins": 0, "losses": 0}
+        if not self._ok or not in_scope(symbol):
+            return summary
+        try:
+            with self._lock, self._connect() as cx:
+                cfg = self.config()
+                default_tick = _research_tick_size(cfg) or RESEARCH_TICK_SIZE
+                fires = list(cx.execute(
+                    "SELECT id,engine,direction,entry,stop,target,bar_ts,max_hold,tick_size "
+                    "FROM fires "
+                    "WHERE synthetic=0 AND outcome IS NULL AND symbol=? AND bar_ts IS NOT NULL "
+                    "AND stop IS NOT NULL AND target IS NOT NULL ORDER BY id",
+                    (symbol,)).fetchall())
+                for (fire_id, engine, direction, entry, stop, target, fired_bar_ts,
+                     stored_max_hold, stored_tick_size) in fires:
+                    if stored_max_hold is not None:
+                        try:
+                            max_hold = int(stored_max_hold)
+                        except (TypeError, ValueError, OverflowError):
+                            continue
+                    elif engine in ("breakout", "research"):
+                        max_hold = _breakout_max_hold(cfg) or BK_MAX_HOLD
+                    else:
+                        max_hold = MR_MAX_HOLD
+                    try:
+                        tick_size = (float(stored_tick_size) if stored_tick_size is not None
+                                     else default_tick)
+                    except (TypeError, ValueError, OverflowError):
+                        continue
+                    if max_hold < 1 or not math.isfinite(tick_size) or tick_size <= 0:
+                        continue
+                    bars = cx.execute(
+                        "SELECT o,h,l,c FROM bars WHERE symbol=? AND ts>? "
+                        "ORDER BY ts LIMIT ?",
+                        (symbol, int(fired_bar_ts), max_hold)).fetchall()
+                    ohlc = [((o if o is not None else c), (h if h is not None else c),
+                             (l if l is not None else c), c)
+                            for (o, h, l, c) in bars if c is not None]
+                    trade = _bracket_trade(
+                        ohlc, 0, direction, entry, stop, target, max_hold, tick_size,
+                        signal_index=-1, close_incomplete=False) if ohlc else None
+                    if trade:
+                        pnl = ((trade["exit"] - trade["entry"]) if direction == "long"
+                               else (trade["entry"] - trade["exit"]))
+                        outcome = "win" if pnl > 0 else "loss"
+                        cx.execute("UPDATE fires SET outcome=?,pnl=? WHERE id=? AND outcome IS NULL",
+                                   (outcome, round(float(pnl), 6), fire_id))
+                        summary["graded"] += 1
+                        summary["wins" if outcome == "win" else "losses"] += 1
+                cx.commit()
+            return summary
+        except Exception:  # noqa: BLE001 — grading failure leaves signals open, never fabricates
+            return summary
 
     def latest_fire(self) -> dict:
         rows = self._q(
@@ -1556,21 +2248,30 @@ class Store:
                 "byEngine": by_engine}
 
     # ---- in-process edge gate -----------------------------------------
-    def ohlc(self, symbol: str, limit: int = 5000):
-        """A symbol's bars as [(o,h,l,c), ...] oldest->newest — the engine/gate input. Public so
-        the capture daemon can evaluate the live signal off the same series the gate proves."""
+    def ohlc(self, symbol: str, limit: int = LIVE_ENGINE_BARS):
+        """Newest bounded live-engine window as [(o,h,l,c), ...] oldest->newest.
+
+        Selecting the oldest LIMIT rows freezes the live endpoint forever once a store grows past
+        the limit. The inner DESC query deliberately selects the newest rows; the outer ASC restores
+        chronological order for causal engine math.
+        """
         if not in_scope(symbol):
             return []
-        rows = self._q("SELECT o,h,l,c FROM bars WHERE symbol=? ORDER BY ts LIMIT ?",
-                       (symbol, limit))
+        rows = self._q(
+            "SELECT o,h,l,c FROM ("
+            "SELECT o,h,l,c,ts FROM bars WHERE symbol=? ORDER BY ts DESC LIMIT ?"
+            ") ORDER BY ts ASC",
+            (symbol, max(1, min(int(limit), ANALYSIS_MAX_BARS))))
         # tolerate null o/h/l (close-only history) by falling back to close
         return [((o if o is not None else c), (h if h is not None else c),
                  (l if l is not None else c), c) for (o, h, l, c) in rows]
 
-    def ohlc_between(self, symbol: str, start_ts=None, end_ts=None, limit: int = 20000):
+    def ohlc_between(self, symbol: str, start_ts=None, end_ts=None,
+                     limit: int = ANALYSIS_MAX_BARS):
         """A symbol's bars as [(o,h,l,c), ...] oldest->newest, optionally restricted to the closed
         epoch-second window [start_ts, end_ts] — the date-scoped input for the no-code backtest lab.
-        Same null-tolerant close fallback as ohlc(). Out-of-scope symbol -> [] (honest)."""
+        This research path has its own materially larger cap and therefore never silently inherits
+        the 5,000-bar live-evaluator window. Same null-tolerant close fallback as ohlc()."""
         if not in_scope(symbol):
             return []
         clauses = ["symbol=?"]
@@ -1579,11 +2280,45 @@ class Store:
             clauses.append("ts>=?"); params.append(int(start_ts))
         if end_ts is not None:
             clauses.append("ts<=?"); params.append(int(end_ts))
-        params.append(int(limit))
-        rows = self._q("SELECT o,h,l,c FROM bars WHERE " + " AND ".join(clauses)
-                       + " ORDER BY ts LIMIT ?", tuple(params))
+        params.append(max(1, min(int(limit), ANALYSIS_MAX_BARS)))
+        rows = self._q(
+            "SELECT o,h,l,c FROM (SELECT o,h,l,c,ts FROM bars WHERE "
+            + " AND ".join(clauses) + " ORDER BY ts DESC LIMIT ?) ORDER BY ts ASC",
+            tuple(params))
         return [((o if o is not None else c), (h if h is not None else c),
                  (l if l is not None else c), c) for (o, h, l, c) in rows]
+
+    def ohlc_between_timestamped(self, symbol: str, start_ts=None, end_ts=None,
+                                 limit: int = ANALYSIS_MAX_BARS):
+        """Immutable optimizer snapshot rows ``(o,h,l,c,ts)`` oldest->newest.
+
+        Research provenance hashes timestamps with prices; the ordinary engine reader intentionally
+        stays four-column for compatibility.
+        """
+        if not in_scope(symbol):
+            return []
+        clauses = ["symbol=?"]
+        params: list = [symbol]
+        if start_ts is not None:
+            clauses.append("ts>=?")
+            params.append(int(start_ts))
+        if end_ts is not None:
+            clauses.append("ts<=?")
+            params.append(int(end_ts))
+        params.append(max(1, min(int(limit), ANALYSIS_MAX_BARS)))
+        rows = self._q(
+            "SELECT o,h,l,c,ts FROM (SELECT o,h,l,c,ts FROM bars WHERE "
+            + " AND ".join(clauses) + " ORDER BY ts DESC LIMIT ?) ORDER BY ts ASC",
+            tuple(params))
+        return [((o if o is not None else c), (h if h is not None else c),
+                 (l if l is not None else c), c, int(ts))
+                for (o, h, l, c, ts) in rows]
+
+    def latest_bar_ts(self, symbol: str) -> int | None:
+        if not in_scope(symbol):
+            return None
+        rows = self._q("SELECT MAX(ts) FROM bars WHERE symbol=?", (symbol,))
+        return int(rows[0][0]) if rows and rows[0][0] is not None else None
 
     def bar_bounds(self, symbol: str) -> dict:
         """First/last captured epoch-second timestamp + bar count for a symbol — so the lab can show
@@ -1607,7 +2342,7 @@ class Store:
         self._edge_cache.clear()
         return written
 
-    # ---- execution control state (separate from config; /api/config can NEVER touch these) -----
+    # ---- inert legacy execution audit state (retained only to read/migrate old local databases) ----
     _EXEC_DEFAULTS = {"armed": "0", "mode": "paper", "kill": "0", "firm": "",
                       "firmAck": "0", "broker": "", "liveAuthExpiry": "0",
                       "confirmEachOrder": "1"}  # "1" = require per-order confirm (safe default)
@@ -1617,14 +2352,13 @@ class Store:
         return rows[0][0] if rows else self._EXEC_DEFAULTS.get(k, "")
 
     def set_exec_kv(self, k: str, v) -> None:
-        """Set ONE exec-state key. Only the dedicated /api/exec/* routes call this — never config."""
+        """Write one legacy audit-state key. No shipping API or capture path calls this."""
         self._exec("INSERT INTO exec_kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
                    [(k, str(v))], many=True)
 
     def exec_flags(self) -> dict:
-        """Current execution control flags (the engine reads this each fire). Kill also honors the
-        out-of-band sentinel file (checked in bltd_exec). confirmEachOrder is exec_kv-only (a
-        /api/config POST can never flip it; disabling needs /api/exec/confirmeachorder + OS-auth)."""
+        """Read inert legacy flags for migration/audit tooling. The b27 signals-only runtime forces
+        these fail-closed and has no API, UI, broker adapter, or capture path that can consume them."""
         cfg = self.config()
         return {"armed": self._exec_kv("armed") == "1",
                 "mode": self._exec_kv("mode") or "paper",
@@ -1718,11 +2452,13 @@ class Store:
                             "realizedPnl": r[8], "ts": r[9]} for r in rows]}
 
     def edge_ok(self, engine: str, symbol: str, cfg: dict | None = None, bypass_cache: bool = False) -> dict:
-        """The product's OWN edge gate: backtest THIS engine on THIS symbol's bars (OOS split)
-        and return {ok, reason, ...}. Runs entirely in-process. TTL-cached. Honest empty
-        verdict when there aren't enough bars. Uses the buyer's tuned config (lookback / OOS /
-        win-floor / geometry) — nothing hardcoded. bypass_cache=True forces a FRESH verdict (the
-        execution engine uses this so a stale 120s-cached 'ok' can never authorize a live order)."""
+        """The product's live edge gate, corrected across the whole engine×symbol family.
+
+        A prior implementation called one prover in isolation. That let a per-test p<alpha signal
+        surface even when the product's own screen correctly rejected it under BH-FDR. This method
+        now consumes the same family-wide screen verdict used by the research UI. bypass_cache=True
+        forces a fresh research grid for diagnostics; the capture path uses the normal bounded cache.
+        """
         cfg = cfg or self.config()
         if not in_scope(symbol):
             return {"ok": False, "reason": f"'{symbol}' is not a recognized instrument"}
@@ -1731,16 +2467,28 @@ class Store:
         now = time.time()
         if cached and cached[0] > now and not bypass_cache:
             return cached[1]
-        prover = PROVERS.get(engine)
-        lookback = cfg.get("lookback", LOOKBACK)
-        if not prover:
+        if engine not in PROVERS:
             v = {"ok": False, "reason": f"unknown engine '{engine}'"}
         else:
-            ohlc = self.ohlc(symbol)
-            if len(ohlc) < lookback + 2:
-                v = {"ok": False, "reason": f"insufficient bars ({len(ohlc)}) — gate arms when "
-                     f"the feed has persisted >= {lookback + 2}"}
-            else:
-                v = prover(ohlc, cfg)
+            try:
+                # Lazy import avoids a module-import cycle: bltd_analytics imports this module, while
+                # screen() itself only reads Store.ohlc and the prover registry.
+                import bltd_analytics
+                syms = list(self.symbols().get("backtestable", []))
+                if symbol not in syms:
+                    syms.append(symbol)
+                engines = [e for e in cfg.get("engines", []) if e in PROVERS]
+                if engine not in engines:
+                    engines.append(engine)
+                rows = bltd_analytics.screen(self, syms, engines, cfg)
+                row = next((r for r in rows
+                            if r.get("engine") == engine and r.get("symbol") == symbol), None)
+                if row is None:
+                    v = {"ok": False, "reason": "no family-wide edge verdict available"}
+                else:
+                    v = dict(row)
+                    v["ok"] = bool(row.get("edge"))
+            except Exception as exc:  # noqa: BLE001 — gate calculation failure must fail closed
+                v = {"ok": False, "reason": f"family-wide edge gate unavailable ({type(exc).__name__})"}
         self._edge_cache[key] = (now + EDGE_TTL, v)
         return v

@@ -1334,9 +1334,9 @@ sleep 2
 - [ ] **Step 2: Prove all 9 engines present on the live store** via `/api/screen` (will honestly show warming/edge per real bars):
 
 ```bash
-TOK=$(curl -s -XPOST http://127.0.0.1:8787/auth/signin -d '{"email":"x","password":"p"}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
-curl -s -H "Authorization: Bearer $TOK" "http://127.0.0.1:8787/api/screen" | python3 -m json.tool
-curl -s -H "Authorization: Bearer $TOK" "http://127.0.0.1:8787/api/fires?limit=20" | python3 -m json.tool
+TOK=$(curl -s -XPOST http://127.0.0.1:8793/auth/signin -d '{"email":"x","password":"p"}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+curl -s -H "Authorization: Bearer $TOK" "http://127.0.0.1:8793/api/screen" | python3 -m json.tool
+curl -s -H "Authorization: Bearer $TOK" "http://127.0.0.1:8793/api/fires?limit=20" | python3 -m json.tool
 ```
 
   Expected: rows for all 9 engines across captured symbols (CM.MNQM6 has 41 bars → not warming; thin symbols warming). Confirm each engine name appears.

@@ -4,6 +4,7 @@ DerivedData/
 build/
 build-archive/
 build-signed/
+dist/
 *.app/
 *.ipa
 *.dSYM/
@@ -17,4 +18,5 @@ build-signed/
 *.log
 # local signing scratch
 /tmp/bl-build/
-backend/__pycache__/
+**/__pycache__/
+*.py[cod]

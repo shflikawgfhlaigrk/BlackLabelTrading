@@ -1,0 +1,109 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Black Label Trading — MSIX package manifest (Microsoft Store distribution).
+
+  ============================================================================
+  THIS FILE IS THE *ONE* PLACE THE THREE PARTNER CENTER IDENTITY VALUES GO.
+  ============================================================================
+  All three are ASSIGNED BY MICROSOFT PARTNER CENTER after the app name is
+  reserved. None of them exist yet. They are NOT guessed, invented or derived
+  anywhere in this repo. Search this file for "PASTE-" / "PASTE " to find them:
+
+    1. <Identity Name="...">            -> Partner Center: Product Identity ->
+                                           "Package/Identity/Name"
+    2. <Identity Publisher="CN=...">    -> Partner Center: Product Identity ->
+                                           "Package/Identity/Publisher"
+                                           (a CN=<GUID-like string> Microsoft issues)
+    3. <PublisherDisplayName>           -> Partner Center: Product Identity ->
+                                           "Package/Properties/PublisherDisplayName"
+                                           This account is registered as an INDIVIDUAL,
+                                           so this is the owner's VERIFIED LEGAL NAME.
+                                           It is NOT a company name. Do not type a
+                                           trading name here — it must byte-match what
+                                           Partner Center shows or the upload is rejected.
+
+  build-msix.sh can also inject them at pack time without editing this file:
+      PARTNER_CENTER_IDENTITY_NAME=...  \
+      PARTNER_CENTER_PUBLISHER='CN=...' \
+      PARTNER_CENTER_PUBLISHER_DISPLAY_NAME='Legal Name' \
+      bash windows/build-msix.sh
+  While any placeholder survives, build-msix.sh renames the output with a
+  -PLACEHOLDER-IDENTITY suffix so an un-submittable package can never be
+  mistaken for a submittable one.
+
+  SIGNING: no Authenticode certificate has been purchased and none is applied.
+  The Microsoft Store re-signs the uploaded package under the Partner Center
+  account identity, so the STORE path needs no cert. The package produced by
+  this manifest is therefore UNSIGNED and CANNOT be sideload-installed as-is.
+
+  PRODUCT LAW: Black Label Trading is SIGNALS-ONLY. It never places, routes,
+  modifies or cancels an order. No capability here grants execution and none
+  ever should.
+-->
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  IgnorableNamespaces="uap uap10 rescap">
+
+  <!-- [1] and [2]: assigned by Partner Center. Placeholders use only characters
+       that are legal in these fields, so makeappx can still pack a proof build. -->
+  <Identity
+    Name="PASTE-PARTNER-CENTER-PACKAGE-IDENTITY-NAME-HERE"
+    Publisher="CN=PASTE-PARTNER-CENTER-PUBLISHER-CN-HERE"
+    Version="1.0.27.0"
+    ProcessorArchitecture="x64" />
+
+  <Properties>
+    <DisplayName>Black Label Trading</DisplayName>
+    <!-- [3]: the owner's VERIFIED LEGAL NAME (individual account, not a company). -->
+    <PublisherDisplayName>PASTE VERIFIED LEGAL NAME FROM PARTNER CENTER</PublisherDisplayName>
+    <Description>Signals-only futures analysis. Reads your platform, scores setups, and never places a trade.</Description>
+    <Logo>Assets\StoreLogo.png</Logo>
+    <uap10:PackageIntegrity>
+      <uap10:Content Enforcement="on" />
+    </uap10:PackageIntegrity>
+  </Properties>
+
+  <Dependencies>
+    <!-- Win10 1809 is the floor for the MSIX features used here (uap10 PackageIntegrity).
+         The bundled embeddable CPython 3.12 runtime supports Win10 1809+ as well. -->
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.22621.0" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+
+  <Applications>
+    <!-- BlackLabelTrading.exe is a thin launcher (windows/msix/launcher/Launcher.cs, compiled
+         on the Windows runner) that starts the bundled pythonw.exe on supervise.py and lives
+         for the life of that supervisor. MSIX requires a real PE entry point; a .cmd cannot be
+         an Application/@Executable, which is why launch-trading.cmd is not used here. -->
+    <Application Id="BlackLabelTrading" Executable="BlackLabelTrading.exe" EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements
+        DisplayName="Black Label Trading"
+        Description="Signals-only futures analysis. Reads your platform, scores setups, and never places a trade."
+        BackgroundColor="transparent"
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png">
+        <uap:DefaultTile
+          Wide310x150Logo="Assets\Wide310x150Logo.png"
+          Square71x71Logo="Assets\Square71x71Logo.png"
+          Square310x310Logo="Assets\Square310x310Logo.png" />
+      </uap:VisualElements>
+    </Application>
+  </Applications>
+
+  <Capabilities>
+    <!-- runFullTrust: this is a packaged Win32 app. The launcher spawns the bundled
+         CPython supervisor, which spawns the API server, the capture/edge-gate daemon
+         and the platform bridge as full-trust children. Required for that topology. -->
+    <rescap:Capability Name="runFullTrust" />
+    <!-- internetClient: the backend fetches market data feeds over outbound HTTPS.
+         Outbound only. No inbound server capability is requested — the local API binds
+         loopback. No broadFileSystemAccess, no user-data broker capabilities. -->
+    <Capability Name="internetClient" />
+  </Capabilities>
+</Package>

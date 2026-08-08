@@ -1,6 +1,6 @@
 # Black Label Trading
 
-A holographic macOS signal dashboard for the Black Label engine method — a 16-signal-module composite scoring engine, a 13-gate risk checklist, multi-timeframe consensus, a 6-tier trailing-stop management plan, and an OOS-candidate engine fleet that runs on **your own** trading feed, with **optional autonomous execution that is OFF by default and paper-first**. It places a real broker order only when you explicitly arm live mode, connect your own broker credentials, your prop firm's rules permit automation, and every risk/edge/kill gate passes — otherwise it is a signals + research tool that touches no money.
+A holographic macOS signals-and-research dashboard for the Black Label engine method — a 16-signal-module composite score, a 13-gate checklist, multi-timeframe consensus, manual trade-management planning, and an OOS research fleet that runs on **your own** trading feed. It never places broker orders or moves money.
 
 ---
 
@@ -10,22 +10,22 @@ Black Label Trading is a native macOS (SwiftUI/AppKit) application. Its bundled 
 
 The product is honest by design: when there is no data, it shows an honest empty state and never fabricates prices, win-rates, or a track record. Every number on screen is computed from your own captured bars or your own journal — none is invented. The app ships with **no data** and starts **empty** on your own accounts and your own machine.
 
-It is a decision-support and research tool — a scenario-scoring dashboard plus a coaching/analytics suite — with an **optional autonomous-execution engine that defaults OFF and paper-first**. It is **not** a track record. Live execution is a deliberate, separately-armed step requiring your own broker credentials and a firm that permits automation; until you do that, nothing here moves money.
+It is a signals-only decision-support and research tool — a scenario-scoring dashboard plus a coaching/analytics suite. It is **not** a broker or track record. Orders stay on the buyer's broker platform.
 
 ---
 
 ## Key Features
 
-The app is organized into a left sidebar with three groups — **Markets**, **Research**, and **Tools** — covering 16 screens.
+The app is organized into a left sidebar with three groups — **Markets**, **Research**, and **Tools** — covering 17 screens.
 
 ### Markets
-- **Signals** — the primary dashboard. Shows the OOS-candidate engine fleet, a multi-timeframe consensus panel (direction-lock requires at least 2 of the 8 timeframes to agree — 2-of-8), a **16-module** composite factor score (each module a real computation on your own bars, honestly absent when its data source isn't present), a **6-tier trailing-stop plan** (suggested management ladder — copy it to your own platform, or have the optional Execution engine place it), and an honestly-graded **session ledger** (you grade each committed signal Win or Loss; running W/L, win rate, and modeled P&L are computed on this Mac), with **exportable vault-backed daily logs** (grouped by day with per-day W/L + net modeled P&L, written to a CSV in your local vault). Includes a real equity curve plotted from that ledger and a reachable feed connection banner.
+- **Connect** — opens the app-owned browser and reports the real local feed/login state.
+- **Signals** — the primary dashboard. Shows the OOS-candidate engine fleet, a multi-timeframe consensus panel (direction-lock requires at least 2 of the 8 timeframes to agree — 2-of-8), a **16-module** composite factor score (each module is computed from your own bars and is absent when its source is missing), a **6-tier trailing-stop plan** for manual use on your platform, and an honestly graded **session ledger**. Running W/L, modeled P&L, local CSV logs, and the equity curve are derived only from the signals you grade on this Mac.
 - **Chart** — candlestick / Heikin-Ashi / Renko rendering on your live or imported bars, with indicators, drawing tools, and multi-timeframe view. Drawings persist on this Mac.
 - **Grid** — a configurable grid of charts to load ES contracts/timeframes side by side; empty tiles show an honest empty state.
 - **Watchlists** — track your symbols and the snapshot metrics you enter.
 - **Screener** — scan your watchlist symbols by the snapshot metrics you've entered, with one-tap preset scans and CSV export of results.
 - **Alerts** — price / % / volume / RSI conditions on your symbols; fires a real macOS notification when your snapshot meets the condition, with optional re-arm (repeat).
-- **Execution** — *optional* autonomous order execution, **OFF by default and paper-first**. Arm it to have gate-passing signals turn into bracket orders (entry + stop + target + 6-tier trail) sized from your own account/risk. **Paper mode** simulates fills with no broker contact (the default). **Live mode** is a deliberate, Touch-ID-gated second step that places real orders only when: you've armed live, supplied your own broker credentials, your prop firm's ToS permits automation, and every risk gate (daily-loss halt, contract cap, drawdown guard, max-trades) + a re-proven edge pass. A master **kill switch** halts and flattens everything instantly. Every decision (placed or blocked, with the reason) is logged. Validate on a broker demo/eval account before any funded account.
 
 ### Research
 - **Backtest** — test a rule set on your own historical bars with honest metrics; includes walk-forward folds and a Monte Carlo run projector.
@@ -42,7 +42,7 @@ The app is organized into a left sidebar with three groups — **Markets**, **Re
 - **Settings** — account, theme studio, live feed / browser bridge state, backend URL, sign-in providers, and app info.
 
 ### The engine fleet & research gate
-The bundled backend runs an ES-only roster of 9 engines — `meanrev`, `breakout`, `research`, `momentum`, `structure`, `regime`, `channel`, `context_a`, `context_b`. Each engine can produce an **out-of-sample candidate** on your own captured ES bars, but that is research evidence, not a verified-live profit claim. A signal appears only when your local ES data clears the configured OOS candidate gate; until then it honestly shows "warming." Recorded fires appear in a real, research-gated signal journal for manual review and grading.
+The bundled backend runs seven distinct strategies — `meanrev`, `breakout`, `momentum`, `structure`, `regime`, `channel`, and `context_b`. Two retired duplicate IDs (`research` = `breakout`, `context_a` = `momentum`) remain in the immutable nine-hypothesis correction family so removing them can never make significance easier. A strategy can produce an **out-of-sample research candidate** on your own captured bars only after it clears both its per-test floor and family-wide Benjamini–Hochberg correction. No candidate is a verified-live profit claim, and none places an order.
 
 ---
 
@@ -51,7 +51,7 @@ The bundled backend runs an ES-only roster of 9 engines — `meanrev`, `breakout
 - **macOS** (native SwiftUI/AppKit desktop app).
 - **Your own TopstepX or WealthCharts account.** The app opens a product-owned browser, you sign in there, and the bridge reads the market data already feeding your chart session into the local webhook/store. No platform credentials are bundled or stored by Black Label Trading.
 - **(Optional) Your own Google Desktop OAuth client ID** if you want the "Sign in with Google" button to perform a real login. Paste it in Settings → Sign-in providers; it is stored on this Mac and never bundled. Email/password and "Continue as guest" always work. Apple Sign-In works in the signed (provisioned) build.
-- **(Optional) Your own backend host/port.** The app starts a bundled, stdlib-only Python backend on `http://127.0.0.1:8787` automatically. If you run the backend elsewhere on your own machine or network, point the Backend URL field (Settings → Live data feed) at it.
+- **(Optional) Your own backend host/port.** The app starts a bundled, stdlib-only Python backend on `http://127.0.0.1:8793` automatically. If you run the backend elsewhere on your own machine or network, point the Backend URL field (Settings → Live data feed) at it.
 - **(Optional) A broker/platform CSV export** to populate the Journal and Analytics.
 
 There is no Black Label server in the loop. All data lives on your Mac.
@@ -62,7 +62,7 @@ There is no Black Label server in the loop. All data lives on your Mac.
 
 1. Launch the app and sign in (email/password, Apple in the signed build, Google with your own client ID, or continue as guest).
 2. On sign-in, the app starts its bundled local backend and reports an **honest feed state** (offline / logged-out / idle / live). Because you have no data yet, the store is **empty**:
-   - The engine fleet shows "Engine fleet idle / warming" — nothing arms until your own data produces an OOS candidate or fails the gate.
+   - The engine fleet shows "Engine fleet idle / warming" until your own data is sufficient to evaluate the research gate.
    - The Signals session ledger shows "No committed signals."
    - The Journal shows "No trades logged yet."
    - Charts and grid tiles show honest empty states — no prices are fabricated.
@@ -89,7 +89,7 @@ The app never shows a value it can't ground in your real data.
 - All capture, bars, signals, journal, drawings, and account credentials are stored **privately on your Mac**. Nothing is sent to Black Label or any third party.
 - The local backend serves only what your own browser bridge or webhook sender captured, over localhost. When the backend is down or your platform session is logged out / not producing data, the app reports an honest offline/idle state and shows no bars.
 - Deleting your account removes your credentials from this Mac; your local store remains under your control.
-- **Execution is OFF by default:** the app reads bars/ticks/fires and places **no** trade and moves **no** money unless you explicitly arm live execution (a separate Touch-ID-gated step) with your own broker credentials on a firm that permits automation. Paper mode (simulated fills, no broker contact) is the default; a master kill switch halts and flattens everything at any time.
+- **Signals only:** the app reads bars/ticks, emits edge-gated research signals, and offers clearly labeled manual paper tools. Broker credentials and order routes are not part of the shipping runtime.
 
 ---
 
@@ -97,4 +97,4 @@ The app never shows a value it can't ground in your real data.
 
 Black Label Trading is distributed as a **Developer ID–signed**, **Hardened Runtime**, **non-sandboxed** macOS application (not Mac App Store, not app-sandbox) — the same distribution path Sovereign and Homefront use. The build is signed with a "Developer ID Application" identity (Team `745ZPGFRA5`). Notarization is the explicitly gated final step: until the submit-and-staple to Apple's notary service completes, the on-disk Developer-ID build is signed but **not yet notarized** — Gatekeeper currently treats it as an unnotarized Developer-ID app (`spctl` rejects it) and no stapled ticket exists on the build. Once notarized and stapled, it will launch cleanly on end-user Macs via Gatekeeper.
 
-`./build.command` remains an ad-hoc local build under `build/`. Its canonical install lane is only `./build.command --devid --install`; `--install` alone fails before compilation. `./build-developer-id.sh --install` also verifies the finished bundle is genuinely Developer-ID signed, so its documented ad-hoc fallback can build but cannot install. `./build-signed.command` is a provisioned Apple Development/Distribution test lane and is build-only; `--install` is rejected because that signature class must never overwrite `/Applications/Black Label Trading.app`.
+`./build.command` is build-only: its default app is ad-hoc, while `--devid` produces an unnotarized validation/notary input under the ignored `dist/` directory. Every `build.command --install` invocation is rejected before compilation. The only canonical install lane is `./build-developer-id.sh --submit --install`, which pins the Developer ID identity to Team `745ZPGFRA5`, notarizes and staples, stops only verified existing Trading runtime processes, atomically swaps the app, and revalidates final bundle/build/team, Gatekeeper, and staple state before deleting the rollback copy. `./build-signed.command` remains a provisioned Apple Development/Distribution test lane and is build-only.

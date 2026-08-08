@@ -1,0 +1,147 @@
+name: Trading CI
+
+"on":
+  pull_request:
+  push:
+    branches:
+      - "**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: trading-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BUILD_NUMBER: "27"
+  DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+  PYTHONDONTWRITEBYTECODE: "1"
+  PYTEST_ADDOPTS: -p no:cacheprovider
+
+jobs:
+  test:
+    name: Canonical source tests
+    runs-on: macos-15
+    timeout-minutes: 35
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Require the pinned stable toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "arm64"
+          test -d "$DEVELOPER_DIR"
+          test "$(xcodebuild -version | sed -n '1p')" = "Xcode 26.3"
+          test "$(xcodebuild -version | sed -n '2p')" = "Build version 17C529"
+
+      - name: Run the canonical maintained suites
+        shell: bash
+        run: bash Tests/run-all.sh
+
+  build-ci-artifact:
+    name: Build b27 unsigned CI artifact
+    needs: test
+    runs-on: macos-15
+    timeout-minutes: 50
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Require the pinned stable toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "arm64"
+          test -d "$DEVELOPER_DIR"
+          test "$(xcodebuild -version | sed -n '1p')" = "Xcode 26.3"
+          test "$(xcodebuild -version | sed -n '2p')" = "Build version 17C529"
+
+      - name: Build and launch-test without Apple submission or installation
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "$GITHUB_WORKSPACE/build"
+          BUILD_NUMBER="$BUILD_NUMBER" ./build-developer-id.sh --no-submit --launch-test
+
+      - name: Run the canonical gate against the assembled app
+        shell: bash
+        run: bash Tests/run-all.sh
+
+      - name: Verify the b27 CI artifact is ad-hoc and non-distributable
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="$GITHUB_WORKSPACE/build/Black Label Trading.app"
+          test -d "$app"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app/Contents/Info.plist")" = "$BUILD_NUMBER"
+          test "$(lipo -archs "$app/Contents/MacOS/Black Label Trading")" = "x86_64 arm64" \
+            || test "$(lipo -archs "$app/Contents/MacOS/Black Label Trading")" = "arm64 x86_64"
+          runtime="$app/Contents/Resources/backend/python-runtime"
+          test -d "$runtime"
+          macho_count=0
+          while IFS= read -r -d '' binary; do
+            if file -b "$binary" | grep -q 'Mach-O'; then
+              macho_count=$((macho_count + 1))
+              architectures="$(
+                lipo -archs "$binary" \
+                  | tr ' ' '\n' \
+                  | sed '/^$/d' \
+                  | LC_ALL=C sort -u \
+                  | paste -sd ' ' -
+              )"
+              if [ "$architectures" != "arm64 x86_64" ]; then
+                echo "FAIL: bundled runtime Mach-O is not exact universal2: $binary ($architectures)" >&2
+                exit 1
+              fi
+            fi
+          done < <(find "$runtime" -type f -print0)
+          test "$macho_count" -gt 0
+          codesign --verify --deep --strict --all-architectures "$app"
+          signature="$(codesign -dv --verbose=4 "$app" 2>&1)"
+          grep -q '^Signature=adhoc$' <<<"$signature"
+          if grep -q '^Authority=Developer ID Application:' <<<"$signature"; then
+            echo "FAIL: CI artifacts must never carry a distribution identity" >&2
+            exit 1
+          fi
+          bash Tests/signals-only-release-contract.sh "$app"
+          bash Tests/built-bundle-reference-contract.sh "$app"
+
+      - name: Package the clearly marked CI-only artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/trading-ci-artifact"
+          mkdir -p "$out"
+          cp "$GITHUB_WORKSPACE/build/Black-Label-Trading-DeveloperID.zip" \
+            "$out/Black-Label-Trading-b27-CI-UNSIGNED-ADHOC-NOT-FOR-DISTRIBUTION.zip"
+          sha256="$(
+            shasum -a 256 "$out/Black-Label-Trading-b27-CI-UNSIGNED-ADHOC-NOT-FOR-DISTRIBUTION.zip" \
+              | awk '{print $1}'
+          )"
+          printf '%s  %s\n' "$sha256" \
+            "Black-Label-Trading-b27-CI-UNSIGNED-ADHOC-NOT-FOR-DISTRIBUTION.zip" \
+            > "$out/SHA256SUMS"
+          {
+            printf 'build=27\n'
+            printf 'commit=%s\n' "$GITHUB_SHA"
+            printf 'signature=ad-hoc\n'
+            printf 'distribution_allowed=false\n'
+            printf 'notarized=false\n'
+          } > "$out/CI-ONLY-NOTICE.txt"
+
+      - name: Upload the CI-only artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: Black-Label-Trading-b27-CI-UNSIGNED-${{ github.sha }}
+          path: ${{ runner.temp }}/trading-ci-artifact/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0

@@ -15,6 +15,7 @@ mkdir -p "$ROOT/build"
 # minimal types (TradeDirection, BLColor stand-ins) the engines reference so they compile alone.
 SOURCES=(
   "$ROOT/Tests/TestSupport.swift"
+  "$ROOT/Sources/FeedClient.swift"
   "$ROOT/Sources/HoloTheme.swift"
   "$ROOT/Sources/Updater.swift"
   "$ROOT/Sources/TradeMath.swift"
@@ -40,6 +41,7 @@ SOURCES=(
 echo "==> Compiling pure-logic test target"
 xcrun --sdk macosx swiftc \
   -O \
+  -D BLTD_ENVIRONMENT_HELPER_ONLY \
   -sdk "$SDK" \
   -target arm64-apple-macosx13.0 \
   -framework Foundation -framework CoreGraphics -framework ImageIO -framework CoreText -framework UniformTypeIdentifiers -framework CryptoKit -framework Security \
@@ -47,4 +49,15 @@ xcrun --sdk macosx swiftc \
   "${SOURCES[@]}"
 
 echo "==> Running"
-"$OUT"
+/usr/bin/env \
+  GITHUB_TOKEN="regression-github-secret" \
+  ANTHROPIC_API_KEY="regression-claude-secret" \
+  OPENAI_API_KEY="regression-openai-secret" \
+  PYTHONPATH="/tmp/bltd-regression-pythonpath" \
+  PYTHONHOME="/tmp/bltd-regression-pythonhome" \
+  BASH_ENV="/tmp/bltd-regression-bashenv" \
+  BLTD_PORT="1" \
+  BLTD_BUILD="caller-build" \
+  BLTD_STORE="/tmp/bltd-regression.sqlite3" \
+  BLTD_TOKEN="regression-backend-token" \
+  "$OUT"

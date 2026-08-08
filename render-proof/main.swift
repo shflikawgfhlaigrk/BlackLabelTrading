@@ -1,7 +1,7 @@
 // Black Label Trading — headless CHART RENDER PROOF harness (CLI, no SwiftUI, no computer-use).
 //
 // Pulls the buyer's OWN captured OHLC bars from the product's self-contained backend
-// (bltd_api.py at http://127.0.0.1:8787, the same endpoint the live app reads via FeedClient),
+// (bltd_api.py at http://127.0.0.1:8793, the same endpoint the live app reads via FeedClient),
 // then renders two professional-grade chart PNGs via ChartRender (CoreGraphics):
 //   /tmp/bltd_chart_candles.png     — clean candlesticks, nice-tick price axis, time axis, volume
 //   /tmp/bltd_chart_indicators.png  — same chart + EMA(9/21) + VWAP + RSI pane + crosshair + last-price
@@ -11,7 +11,7 @@
 //
 // Usage:
 //   render-proof [SYMBOL] [BASE_URL]
-//   (defaults: SYMBOL = backend's busiest captured symbol; BASE_URL = http://127.0.0.1:8787)
+//   (defaults: SYMBOL = backend's busiest captured symbol; BASE_URL = http://127.0.0.1:8793)
 import Foundation
 
 // ---- tiny synchronous HTTP GET/POST (so the CLI stays simple) ----
@@ -34,7 +34,7 @@ func httpJSON(_ method: String, _ urlStr: String, token: String? = nil, body: [S
 }
 
 let args = CommandLine.arguments
-let base = args.count > 2 ? args[2] : "http://127.0.0.1:8787"
+let base = args.count > 2 ? args[2] : "http://127.0.0.1:8793"
 var symbol = args.count > 1 ? args[1] : ""
 
 print("== Black Label Trading — chart render proof ==")

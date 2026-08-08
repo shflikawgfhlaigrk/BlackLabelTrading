@@ -1514,14 +1514,96 @@ func testEntitlementsHardeningContract() {
     let launcher = source("backend/launch-backend.sh")
     ok(launcher.contains("export PYTHONPATH="),
        "[entitlements] launcher imports bundled modules via PYTHONPATH")
-    ok(!launcher.contains("DYLD_"),
-       "[entitlements] launcher sets no DYLD_* variable, so no dyld-env entitlement is needed")
+    ok(launcher.contains("unset DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH DYLD_FRAMEWORK_PATH") &&
+       !launcher.contains("export DYLD_"),
+       "[entitlements] launcher strips and never exports DYLD_* variables")
 
     // The rationale must survive in the shipped file — a future reader who deletes it loses the
     // reason and re-grants the entitlement. Asserted on the raw text, not the parsed keys.
     let raw = source("Sources/app-developerid.entitlements")
     ok(raw.contains("intentionally NOT granted"),
        "[entitlements] Developer-ID file documents why the dyld-env entitlement is withheld")
+}
+
+// ===== Bundled backend process boundary — fixed environment, no caller inheritance =====
+func testBundledBackendEnvironment() {
+    let caller = ProcessInfo.processInfo.environment
+    let inheritedControls = [
+        "GITHUB_TOKEN": "regression-github-secret",
+        "ANTHROPIC_API_KEY": "regression-claude-secret",
+        "OPENAI_API_KEY": "regression-openai-secret",
+        "PYTHONPATH": "/tmp/bltd-regression-pythonpath",
+        "PYTHONHOME": "/tmp/bltd-regression-pythonhome",
+        "BASH_ENV": "/tmp/bltd-regression-bashenv",
+        "BLTD_PORT": "1",
+        "BLTD_BUILD": "caller-build",
+        "BLTD_STORE": "/tmp/bltd-regression.sqlite3",
+        "BLTD_TOKEN": "regression-backend-token",
+    ]
+    for (key, value) in inheritedControls {
+        ok(caller[key] == value, "[backend-env] caller poison control present: \(key)")
+    }
+
+    guard let environment = BundledBackendEnvironment.make(
+            port: 8793, build: "27", homeDirectory: "/Users/backend-regression") else {
+        ok(false, "[backend-env] valid production inputs create an environment")
+        return
+    }
+    ok(true, "[backend-env] valid production inputs create an environment")
+
+    let expectedKeys: Set<String> = [
+        "PATH", "HOME", "LC_ALL", "LANG", "BLTD_PORT", "BLTD_BUILD"
+    ]
+    ok(BundledBackendEnvironment.allowedKeys == expectedKeys,
+       "[backend-env] declared allowlist is exact")
+    ok(Set(environment.keys) == expectedKeys,
+       "[backend-env] output contains only allowlisted variables")
+    ok(environment["PATH"] == "/usr/bin:/bin:/usr/sbin:/sbin",
+       "[backend-env] PATH is fixed and absolute")
+    ok(environment["HOME"] == "/Users/backend-regression",
+       "[backend-env] HOME is the supplied trusted account home")
+    ok(environment["LC_ALL"] == "C" && environment["LANG"] == "C",
+       "[backend-env] locale is deterministic")
+    ok(environment["BLTD_PORT"] == "8793" && environment["BLTD_BUILD"] == "27",
+       "[backend-env] trusted port/build replace caller BLTD overrides exactly")
+
+    let forbidden = [
+        "GITHUB_TOKEN", "GH_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN",
+        "OPENAI_API_KEY", "AWS_SECRET_ACCESS_KEY",
+        "PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONINSPECT",
+        "BASH_ENV", "ENV", "SHELLOPTS",
+        "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH",
+        "BLTD_STORE", "BLTD_CONFIG", "BLTD_SCOPE", "BLTD_TOKEN", "BLTD_PYTHON",
+        "BLTD_WEBHOOK_URL", "BLTD_SUPPORT_DIR", "BLTD_OWNED_BACKEND_DIR",
+    ]
+    for key in forbidden {
+        ok(environment[key] == nil, "[backend-env] strips secret/injection variable: \(key)")
+    }
+
+    ok(BundledBackendEnvironment.validatedBuild(from: "28") == "28",
+       "[backend-env] canonical string build accepted exactly")
+    ok(BundledBackendEnvironment.validatedBuild(from: NSNumber(value: 28)) == "28",
+       "[backend-env] canonical numeric plist build accepted exactly")
+    for invalid in ["", "0", "-1", "027", "27.0", " 27", "27 ", "27\nBASH_ENV=/tmp/pwn", "27;touch /tmp/pwn"] {
+        ok(BundledBackendEnvironment.validatedBuild(from: invalid) == nil,
+           "[backend-env] rejects non-canonical build: \(invalid.debugDescription)")
+    }
+    ok(BundledBackendEnvironment.validatedBuild(from: true) == nil,
+       "[backend-env] rejects boolean plist build")
+    ok(BundledBackendEnvironment.make(port: 0, build: "27", homeDirectory: "/Users/test") == nil,
+       "[backend-env] rejects port zero")
+    ok(BundledBackendEnvironment.make(port: 65_536, build: "27", homeDirectory: "/Users/test") == nil,
+       "[backend-env] rejects out-of-range port")
+    ok(BundledBackendEnvironment.make(port: 8793, build: "27", homeDirectory: "relative/home") == nil,
+       "[backend-env] rejects a non-absolute HOME")
+
+    let feedClient = source("Sources/FeedClient.swift")
+    ok(!feedClient.contains("ProcessInfo.processInfo.environment"),
+       "[backend-env] production launcher never clones the caller environment")
+    ok(feedClient.contains("homeDirectory: FileManager.default.homeDirectoryForCurrentUser.path"),
+       "[backend-env] production HOME comes from FileManager account lookup")
+    ok(feedClient.contains("proc.environment = env"),
+       "[backend-env] fixed environment is applied to the bundled launcher process")
 }
 
 // ===== ChartRender — headless chart + engine-trade overlay (edge-gate transparency) =====
@@ -1628,6 +1710,21 @@ func testEngineRosterDecode() {
     ok(rows[1].engine == "regime" && !rows[1].edge && rows[1].warming, "roster row 1 fields")
     eqi(EngineRoster.decode(["rows": []]).count, 0, "empty roster honest")
     eqi(EngineRoster.decode([:]).count, 0, "missing rows key honest")
+
+    // Historical duplicate ids remain decodable, but collapse into their canonical active engine.
+    // A canonical row wins if both forms arrive, regardless of wire order.
+    let legacy: [String: Any] = ["rows": [
+        ["engine": "research", "symbol": "CM.ESU6", "edge": true, "reason": "legacy alias"],
+        ["engine": "breakout", "symbol": "CM.ESU6", "edge": false, "reason": "canonical row"],
+        ["engine": "context_a", "symbol": "CM.NQU6", "edge": false, "reason": "legacy momentum alias"],
+    ]]
+    let canonical = EngineRoster.decode(legacy)
+    eqi(canonical.count, 2, "duplicate historical aliases collapse to distinct active engines")
+    let breakout = canonical.first { $0.engine == "breakout" }
+    ok(breakout?.edge == false && breakout?.reason == "canonical row",
+       "canonical breakout row wins over research alias")
+    ok(canonical.contains { $0.engine == "momentum" && $0.symbol == "CM.NQU6" },
+       "context_a history decodes as momentum")
 }
 
 func testEngineLabels() {
@@ -1636,10 +1733,14 @@ func testEngineLabels() {
     ok(EngineRoster.label(for: "structure") == "Structure", "label structure")
     ok(EngineRoster.label(for: "regime") == "Regime", "label regime")
     ok(EngineRoster.label(for: "channel") == "Channel", "label channel")
-    ok(EngineRoster.label(for: "context_a") == "Context A", "label context_a")
+    ok(EngineRoster.label(for: "research") == "Breakout", "historical research alias labels as Breakout")
+    ok(EngineRoster.label(for: "context_a") == "Momentum", "historical context_a alias labels as Momentum")
     ok(EngineRoster.label(for: "context_b") == "Context B", "label context_b")
     ok(EngineRoster.label(for: "meanrev") == "Mean Reversion", "label meanrev")
     ok(EngineRoster.label(for: "my_engine") == "My Engine", "label humanizes unknown id")
+    ok(EngineRoster.order == ["meanrev", "breakout", "momentum", "structure", "regime", "channel", "context_b"],
+       "picker roster contains exactly seven distinct active engines")
+    eqi(Set(EngineRoster.order).count, 7, "active picker roster has no duplicate implementations")
     // No internal codename ever leaks through the order list.
     for e in EngineRoster.order {
         ok(!["perp", "bible", "apex", "barber", "ctx_alpha", "ctx_bravo"].contains(e),
@@ -1687,7 +1788,9 @@ func testGateVerdictNoEdgeAndReasons() {
     eqi(v.rejects.count, 2, "rejects exclude candidate engines")
     ok(v.rejects.first?.engine == "meanrev", "rejects preserve roster order (meanrev first)")
     ok(v.rejects.contains { $0.engine == "meanrev" && $0.reason.contains("no edge") }, "reject carries honest reason")
-    ok(v.headline.contains("OOS candidate"), "headline surfaces the candidate")
+    ok(v.headline.contains("research screen pass"), "headline labels the result as a research screen pass")
+    ok(v.subline.contains("nested confirmation required") && v.subline.contains("never live-adopted"),
+       "screen pass copy requires nested confirmation and disclaims live adoption")
 }
 
 func testGateVerdictAllNoEdgeHeadline() {
@@ -2258,33 +2361,355 @@ func testBacktestLabDecodeAndFolds() {
     ok(empty.reason.contains("insufficient bars"), "empty lab keeps honest reason")
 }
 
-// ===== In-app auto-updater (pure core: version compare, sha256, manifest decode, check window) =====
-// Mirrors the proven Black Label Real Estate testUpdater(). App-shell updater only — it never
-// touches the engines, the feed, the edge-gate, or any signal; these are the headless-verifiable
-// pure functions the Install/daily-check path depends on.
+// ===== Local parameter research screen: legacy farm wire decodes into selection-only semantics =====
+func testBacktestFarmSelectionOnlyDecodeAndCopy() {
+    let obj: [String: Any] = [
+        "available": true, "engine": "meanrev", "symbol": "CM.ESU6",
+        "prover_sha": "3e818b54f842ebcf", "sigMinN": 30, "fdrQ": 0.10,
+        "cellsTried": 2, "provenCells": 1, "cellsInsufficient": 0, "cellsSufficient": 2,
+        "status": "candidate",
+        "best": [
+            "params": ["lookback": 20, "mrZ": 2.0], "trades": 42, "wins": 30, "losses": 12,
+            "netPts": 8.0, "maxDrawdownR": 3.0, "pEdgeAdj": 0.04,
+            "proven": true, "insufficient": false,
+        ],
+        "cells": [
+            ["params": ["lookback": 20], "trades": 42, "wins": 30, "losses": 12,
+             "netPts": 8.0, "maxDrawdownR": 3.0, "pEdgeAdj": 0.04,
+             "proven": true, "insufficient": false],
+            ["params": ["lookback": 30], "trades": 44, "wins": 21, "losses": 23,
+             "netPts": -2.0, "maxDrawdownR": 7.0, "pEdgeAdj": 0.61,
+             "proven": false, "insufficient": false],
+        ],
+    ]
+    let r = BacktestFarmReport.decode(obj)
+    ok(r.available, "research-screen legacy wire decodes")
+    eqi(r.selectionCount, 1, "legacy provenCells is exposed only as a selection count")
+    ok(r.best?.selectedForConfirmation == true, "legacy proven flag is selection for confirmation")
+    ok(r.cells.first?.selectedForConfirmation == true, "selected cell retains its screening result")
+    ok(r.proverLine.contains("BH-FDR q≤0.10"), "research screen exposes its corrected family threshold")
+
+    let ui = source("Sources/Screens2.swift")
+    ok(ui.contains("Local parameter research screen"), "UI names the farm as a research screen")
+    ok(ui.contains("selection-only") && ui.contains("anchored nested confirmation"),
+       "UI states selection-only semantics and nested confirmation")
+    ok(ui.contains("never live-adopted by this screen"),
+       "UI states the research screen never live-adopts a strategy")
+    ok(!ui.contains("Stat(label: \"Candidates\"") && !ui.contains("\"OOS CANDIDATE\""),
+       "UI does not present screening output as candidates")
+}
+
+// ===== In-app auto-updater (fail-closed release-integrity core) =====
 func testUpdater() {
+    func rejects(_ name: String, _ body: () throws -> Void) {
+        do {
+            try body()
+            ok(false, name)
+        } catch {
+            ok(true, name)
+        }
+    }
+
     // Version compare — strictly newer only.
     ok(Updater.isNewer(latestBuild: 13, currentBuild: 12), "updater: 13>12 is newer")
     ok(!Updater.isNewer(latestBuild: 12, currentBuild: 12), "updater: equal is not newer")
     ok(!Updater.isNewer(latestBuild: 11, currentBuild: 12), "updater: older is not newer")
+    let recovery = UpdateRecoveryMarker(
+        version: 1,
+        helperPID: 4242,
+        watchdogPID: 4243,
+        statePath: "/Users/test/Library/Application Support/Black Label Trading/update-helper.state.4242",
+        backupPath: "/Applications/Black Label Trading.app.update-backup-test",
+        expectedBuild: 27,
+        backendMode: "bundled",
+        backendPort: 9000
+    )
+    ok(!UpdateRecoveryPolicy.mayDeleteBackup(
+        marker: recovery, currentBuild: 27,
+        helperIsAlive: true, watchdogIsAlive: false,
+        transactionCommitted: true, backendAcknowledged: true),
+       "updater recovery: an active helper always retains its rollback backup")
+    ok(!UpdateRecoveryPolicy.mayDeleteBackup(
+        marker: recovery, currentBuild: 27,
+        helperIsAlive: false, watchdogIsAlive: true,
+        transactionCommitted: true, backendAcknowledged: true),
+       "updater recovery: an active watchdog always retains its rollback backup")
+    ok(!UpdateRecoveryPolicy.mayDeleteBackup(
+        marker: recovery, currentBuild: 27,
+        helperIsAlive: false, watchdogIsAlive: false,
+        transactionCommitted: false, backendAcknowledged: true),
+       "updater recovery: an uncommitted transaction always retains its rollback backup")
+    ok(!UpdateRecoveryPolicy.mayDeleteBackup(
+        marker: recovery, currentBuild: 27,
+        helperIsAlive: false, watchdogIsAlive: false,
+        transactionCommitted: true, backendAcknowledged: false),
+       "updater recovery: bundled backend must acknowledge before backup deletion")
+    ok(UpdateRecoveryPolicy.mayDeleteBackup(
+        marker: recovery, currentBuild: 27,
+        helperIsAlive: false, watchdogIsAlive: false,
+        transactionCommitted: true, backendAcknowledged: true),
+       "updater recovery: dead helper + exact build/backend acknowledgement permits cleanup")
+    var externalRecovery = recovery
+    externalRecovery.backendMode = "external"
+    externalRecovery.backendPort = 0
+    ok(UpdateRecoveryPolicy.mayDeleteBackup(
+        marker: externalRecovery, currentBuild: 27,
+        helperIsAlive: false, watchdogIsAlive: false,
+        transactionCommitted: true, backendAcknowledged: true),
+       "updater recovery: custom remote backend uses the stable-GUI acknowledgement")
     // sha256 known vectors (integrity-check correctness).
     ok(Updater.sha256Hex(Data("abc".utf8)) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "updater: sha256(abc)")
     ok(Updater.sha256Hex(Data()) == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "updater: sha256(empty)")
-    // Manifest decode — snake_case keys, extra fields ignored.
-    let json = "{\"product\":\"trading\",\"latest_build\":13,\"latest_version\":\"1.0\",\"download_url\":\"https://x/13.zip\",\"sha256\":\"deadbeef\",\"notarized\":true,\"team_id\":\"745ZPGFRA5\",\"release_notes\":\"Fix\",\"mandatory\":false,\"unknown\":\"ignored\"}"
-    let m = try? Updater.decodeManifest(Data(json.utf8))
-    ok(m != nil, "updater: manifest decodes")
-    eqi(m?.latestBuild ?? -1, 13, "updater: manifest build = 13")
-    ok(m?.downloadURL == "https://x/13.zip", "updater: manifest download_url")
-    ok(m?.teamID == "745ZPGFRA5", "updater: manifest team_id")
-    ok(m?.sha256 == "deadbeef", "updater: manifest sha256")
-    ok(m?.product == "trading", "updater: manifest product = trading")
-    // Minimal manifest — only required fields present; optionals default nil.
-    let minimal = "{\"product\":\"trading\",\"latest_build\":5,\"download_url\":\"https://x/5.zip\"}"
-    let m2 = try? Updater.decodeManifest(Data(minimal.utf8))
-    ok(m2 != nil, "updater: minimal manifest decodes")
-    ok(m2?.sha256 == nil, "updater: minimal sha256 is nil")
-    eqi(m2?.latestBuild ?? -1, 5, "updater: minimal build = 5")
+    // A complete, exact manifest decodes and passes the semantic gate.
+    let validSHA = String(repeating: "a", count: 64)
+    let json = """
+    {"product":"trading","latest_build":27,"latest_version":"1.0",
+     "download_url":"https://downloads.blacklabelbots.com/trading/27.zip",
+     "sha256":"\(validSHA)","notarized":true,"team_id":"745ZPGFRA5",
+     "release_notes":"Fix","mandatory":false,"unknown":"ignored"}
+    """
+    guard let manifest = try? Updater.decodeManifest(Data(json.utf8)) else {
+        ok(false, "updater: complete manifest decodes")
+        return
+    }
+    ok(true, "updater: complete manifest decodes")
+    eqi(manifest.latestBuild, 27, "updater: manifest build = 27")
+    ok(manifest.downloadURL == "https://downloads.blacklabelbots.com/trading/27.zip",
+       "updater: manifest download_url")
+    ok(manifest.teamID == Updater.teamID, "updater: manifest exact team_id")
+    ok(manifest.sha256 == validSHA, "updater: manifest required sha256")
+    ok(manifest.product == Updater.productSlug, "updater: manifest product = trading")
+    do {
+        let url = try Updater.validateManifest(manifest)
+        ok(url.scheme == "https", "updater: exact manifest passes HTTPS security gate")
+    } catch {
+        ok(false, "updater: exact manifest passes HTTPS security gate")
+    }
+    do {
+        _ = try Updater.validateInstallCandidate(manifest, currentBuild: 26)
+        ok(true, "updater: exact newer build passes install-candidate gate")
+    } catch {
+        ok(false, "updater: exact newer build passes install-candidate gate")
+    }
+    rejects("updater: equal build is rejected at install boundary") {
+        try Updater.validateInstallCandidate(manifest, currentBuild: 27)
+    }
+    rejects("updater: newer installed build rejects a downgrade") {
+        try Updater.validateInstallCandidate(manifest, currentBuild: 28)
+    }
+    rejects("updater: unreadable installed build fails closed") {
+        try Updater.validateInstallCandidate(manifest, currentBuild: 0)
+    }
+
+    // Missing security metadata fails at decode; none of these fields has an optional bypass.
+    let missingSHA = """
+    {"product":"trading","latest_build":27,"download_url":"https://x/27.zip",
+     "notarized":true,"team_id":"745ZPGFRA5"}
+    """
+    rejects("updater: missing sha256 is rejected") {
+        _ = try Updater.decodeManifest(Data(missingSHA.utf8))
+    }
+    let missingProduct = """
+    {"latest_build":27,"download_url":"https://x/27.zip","sha256":"\(validSHA)",
+     "notarized":true,"team_id":"745ZPGFRA5"}
+    """
+    rejects("updater: missing product is rejected") {
+        _ = try Updater.decodeManifest(Data(missingProduct.utf8))
+    }
+    let missingBuild = """
+    {"product":"trading","download_url":"https://x/27.zip","sha256":"\(validSHA)",
+     "notarized":true,"team_id":"745ZPGFRA5"}
+    """
+    rejects("updater: missing latest_build is rejected") {
+        _ = try Updater.decodeManifest(Data(missingBuild.utf8))
+    }
+    let missingDownloadURL = """
+    {"product":"trading","latest_build":27,"sha256":"\(validSHA)",
+     "notarized":true,"team_id":"745ZPGFRA5",
+     "download":"sign in to fetch the update"}
+    """
+    rejects("updater: missing download_url is rejected") {
+        _ = try Updater.decodeManifest(Data(missingDownloadURL.utf8))
+    }
+    let missingNotarized = """
+    {"product":"trading","latest_build":27,"download_url":"https://x/27.zip",
+     "sha256":"\(validSHA)","team_id":"745ZPGFRA5"}
+    """
+    rejects("updater: missing notarized metadata is rejected") {
+        _ = try Updater.decodeManifest(Data(missingNotarized.utf8))
+    }
+    let missingTeam = """
+    {"product":"trading","latest_build":27,"download_url":"https://x/27.zip",
+     "sha256":"\(validSHA)","notarized":true}
+    """
+    rejects("updater: missing team_id is rejected") {
+        _ = try Updater.decodeManifest(Data(missingTeam.utf8))
+    }
+
+    // Semantic mismatches are rejected before any download.
+    var candidate = manifest
+    candidate.downloadURL = "http://downloads.blacklabelbots.com/trading/27.zip"
+    rejects("updater: HTTP download_url is rejected") { try Updater.validateManifest(candidate) }
+    candidate = manifest
+    candidate.downloadURL = "file:///tmp/trading.zip"
+    rejects("updater: file download_url is rejected") { try Updater.validateManifest(candidate) }
+    candidate = manifest
+    candidate.downloadURL = "https://user:secret@example.com/trading.zip"
+    rejects("updater: credential-bearing download_url is rejected") { try Updater.validateManifest(candidate) }
+    candidate = manifest
+    candidate.product = "marketing"
+    rejects("updater: wrong manifest product is rejected") { try Updater.validateManifest(candidate) }
+    candidate = manifest
+    candidate.teamID = "OTHERTEAM1"
+    rejects("updater: wrong manifest team is rejected") { try Updater.validateManifest(candidate) }
+    candidate = manifest
+    candidate.notarized = false
+    rejects("updater: notarized=false is rejected") { try Updater.validateManifest(candidate) }
+    candidate = manifest
+    candidate.sha256 = ""
+    rejects("updater: blank sha256 is rejected") { try Updater.validateManifest(candidate) }
+    candidate = manifest
+    candidate.sha256 = String(repeating: "a", count: 63)
+    rejects("updater: short sha256 is rejected") { try Updater.validateManifest(candidate) }
+    candidate = manifest
+    candidate.sha256 = String(repeating: "g", count: 64)
+    rejects("updater: non-hex sha256 is rejected") { try Updater.validateManifest(candidate) }
+    candidate = manifest
+    candidate.latestBuild = 0
+    rejects("updater: non-positive latest_build is rejected") { try Updater.validateManifest(candidate) }
+    ok(!Updater.isHTTPSURL(URL(string: "http://redirect.example/update.zip")!),
+       "updater: redirected HTTP response fails the shared HTTPS predicate")
+    ok(HTTPSOnlyRedirectDelegate.redirectTargetIsAllowed(
+        URL(string: "https://redirect.example/update.zip")
+    ), "updater: HTTPS redirect hop is allowed")
+    ok(!HTTPSOnlyRedirectDelegate.redirectTargetIsAllowed(
+        URL(string: "http://redirect.example/update.zip")
+    ), "updater: HTTP redirect hop is rejected before following it")
+    ok(!HTTPSOnlyRedirectDelegate.redirectTargetIsAllowed(nil),
+       "updater: redirect with no target URL is rejected")
+
+    // Quarantine is established before assessment and remains readable without shelling out.
+    let quarantineDir = tmpBase.appendingPathComponent("updater-quarantine", isDirectory: true)
+    let quarantineFile = quarantineDir.appendingPathComponent("update.zip")
+    do {
+        try FileManager.default.createDirectory(at: quarantineDir, withIntermediateDirectories: true)
+        try Data("archive".utf8).write(to: quarantineFile)
+        ok(!Updater.quarantineIsPresent(at: quarantineFile),
+           "updater: fresh local fixture begins without fabricated quarantine")
+        rejects("updater: missing quarantine fails closed") {
+            try Updater.requireQuarantine(at: quarantineFile)
+        }
+        try Updater.applyQuarantine(
+            to: quarantineFile,
+            originURL: URL(string: "https://downloads.blacklabelbots.com/trading/27.zip")!
+        )
+        ok(Updater.quarantineIsPresent(at: quarantineFile),
+           "updater: downloaded artifact carries quarantine before assessment")
+        do {
+            try Updater.requireQuarantine(at: quarantineFile)
+            ok(true, "updater: required quarantine assertion passes after attachment")
+        } catch {
+            ok(false, "updater: required quarantine assertion passes after attachment")
+        }
+    } catch {
+        ok(false, "updater: quarantine metadata can be attached and read")
+    }
+
+    let toolEnvironment = Updater.sanitizedToolEnvironment()
+    ok(toolEnvironment["PATH"] == "/usr/bin:/bin:/usr/sbin:/sbin",
+       "updater: release tools use a fixed system PATH")
+    ok(toolEnvironment["HOME"] == FileManager.default.homeDirectoryForCurrentUser
+        .standardizedFileURL.path,
+       "updater: helper/backend HOME is the trusted account home")
+    ok(toolEnvironment["DITTONORSRC"] == nil && toolEnvironment["COPYFILE_DISABLE"] == nil,
+       "updater: ditto quarantine-bypass variables are absent")
+    ok(toolEnvironment["DEVELOPER_DIR"] == nil && toolEnvironment["SDKROOT"] == nil,
+       "updater: developer-tool resolution variables are absent")
+
+    // The downloaded response bytes must match; a planted one-byte mutation is refused.
+    let genuineBytes = Data("genuine update archive".utf8)
+    var byteManifest = manifest
+    byteManifest.sha256 = Updater.sha256Hex(genuineBytes)
+    do {
+        try Updater.verifyChecksum(genuineBytes, against: byteManifest)
+        ok(true, "updater: downloaded bytes matching sha256 pass")
+    } catch {
+        ok(false, "updater: downloaded bytes matching sha256 pass")
+    }
+    rejects("updater: tampered downloaded bytes are rejected") {
+        try Updater.verifyChecksum(Data("genuine update archivf".utf8), against: byteManifest)
+    }
+
+    // A sibling same-team app cannot pass: exact signed product metadata and build are mandatory.
+    let exactBundle = UpdateBundleMetadata(
+        bundleIdentifier: Updater.bundleIdentifier,
+        displayName: Updater.productName,
+        bundleName: Updater.productName,
+        executableName: Updater.executableName,
+        buildVersion: String(manifest.latestBuild)
+    )
+    do {
+        try Updater.validateBundleMetadata(exactBundle, against: manifest)
+        ok(true, "updater: exact Trading bundle metadata passes")
+    } catch {
+        ok(false, "updater: exact Trading bundle metadata passes")
+    }
+    var wrongBundle = exactBundle
+    wrongBundle.bundleIdentifier = "com.blacklabel.marketing"
+    rejects("updater: wrong-product bundle identifier is rejected") {
+        try Updater.validateBundleMetadata(wrongBundle, against: manifest)
+    }
+    wrongBundle = exactBundle
+    wrongBundle.displayName = "Black Label Marketing"
+    rejects("updater: wrong-product display name is rejected") {
+        try Updater.validateBundleMetadata(wrongBundle, against: manifest)
+    }
+    wrongBundle = exactBundle
+    wrongBundle.bundleName = "Black Label Marketing"
+    rejects("updater: wrong-product bundle name is rejected") {
+        try Updater.validateBundleMetadata(wrongBundle, against: manifest)
+    }
+    wrongBundle = exactBundle
+    wrongBundle.executableName = "Black Label Marketing"
+    rejects("updater: wrong-product executable name is rejected") {
+        try Updater.validateBundleMetadata(wrongBundle, against: manifest)
+    }
+    wrongBundle = exactBundle
+    wrongBundle.buildVersion = "26"
+    rejects("updater: staged build below manifest build is rejected") {
+        try Updater.validateBundleMetadata(wrongBundle, against: manifest)
+    }
+    wrongBundle = exactBundle
+    wrongBundle.buildVersion = "027"
+    rejects("updater: non-exact CFBundleVersion spelling is rejected") {
+        try Updater.validateBundleMetadata(wrongBundle, against: manifest)
+    }
+
+    // Assessment parsers fail closed: exit zero alone is insufficient without Apple's notarized source
+    // and stapler's affirmative local-ticket validation.
+    ok(Updater.gatekeeperAssessmentIsAccepted(.init(
+        status: 0, output: "accepted\nsource=Notarized Developer ID\norigin=Developer ID Application"
+    )), "updater: Gatekeeper Notarized Developer ID verdict accepted")
+    ok(!Updater.gatekeeperAssessmentIsAccepted(.init(
+        status: 0, output: "accepted\nsource=Developer ID"
+    )), "updater: non-notarized Gatekeeper source rejected")
+    ok(!Updater.gatekeeperAssessmentIsAccepted(.init(
+        status: 3, output: "rejected\nsource=Unnotarized Developer ID"
+    )), "updater: Gatekeeper rejection rejected")
+    ok(!Updater.gatekeeperAssessmentIsAccepted(.init(
+        status: 0,
+        output: "/tmp/attacker.app/source=Notarized Developer ID\naccepted\nsource=Developer ID"
+    )), "updater: Gatekeeper source substring in a path cannot spoof an exact verdict line")
+    ok(Updater.stapleValidationIsAccepted(.init(
+        status: 0, output: "The validate action worked!"
+    )), "updater: affirmative staple validation accepted")
+    ok(!Updater.stapleValidationIsAccepted(.init(
+        status: 0, output: "no ticket"
+    )), "updater: empty/false staple result rejected even at exit zero")
+    ok(!Updater.stapleValidationIsAccepted(.init(
+        status: 0, output: "/tmp/The validate action worked!/payload.app"
+    )), "updater: staple success substring in a path cannot spoof an exact verdict line")
+
     // Malformed JSON throws cleanly (never crashes).
     var threw = false
     do { _ = try Updater.decodeManifest(Data("{not json".utf8)) } catch { threw = true }
@@ -2293,15 +2718,21 @@ func testUpdater() {
     let savedURL = UserDefaults.standard.string(forKey: Updater.manifestOverrideKey)
     UserDefaults.standard.removeObject(forKey: Updater.manifestOverrideKey)
     ok(Updater.manifestURL.absoluteString == "https://blacklabelbots.com/api/version/trading", "updater: default manifest URL = trading slug")
+    UserDefaults.standard.set("http://127.0.0.1:9999/manifest", forKey: Updater.manifestOverrideKey)
+    ok(Updater.manifestURL.absoluteString == "https://blacklabelbots.com/api/version/trading",
+       "updater: insecure manifest override is ignored")
     if let savedURL { UserDefaults.standard.set(savedURL, forKey: Updater.manifestOverrideKey) }
+    else { UserDefaults.standard.removeObject(forKey: Updater.manifestOverrideKey) }
     // Daily-check window.
+    let savedLastCheck = UserDefaults.standard.object(forKey: Updater.lastCheckKey)
     UserDefaults.standard.removeObject(forKey: Updater.lastCheckKey)
     ok(Updater.dueForBackgroundCheck(now: 1_000_000), "updater: due when never checked")
     UserDefaults.standard.set(1_000_000.0 - 3600, forKey: Updater.lastCheckKey)
     ok(!Updater.dueForBackgroundCheck(now: 1_000_000), "updater: not due 1h after a check")
     UserDefaults.standard.set(1_000_000.0 - 25*3600, forKey: Updater.lastCheckKey)
     ok(Updater.dueForBackgroundCheck(now: 1_000_000), "updater: due 25h after a check")
-    UserDefaults.standard.removeObject(forKey: Updater.lastCheckKey)
+    if let savedLastCheck { UserDefaults.standard.set(savedLastCheck, forKey: Updater.lastCheckKey) }
+    else { UserDefaults.standard.removeObject(forKey: Updater.lastCheckKey) }
 }
 
 // ===== LIVE backend integration test (opt-in via BLT_LIVE_BACKEND=1) =====
@@ -2328,7 +2759,7 @@ func livePOST(_ base: String, _ path: String, _ body: [String: Any]) -> [String:
     _ = sem.wait(timeout: .now() + 10); return out
 }
 func testLiveBackendIntegration() {
-    let base = ProcessInfo.processInfo.environment["BLT_BACKEND_URL"] ?? "http://127.0.0.1:8787"
+    let base = ProcessInfo.processInfo.environment["BLT_BACKEND_URL"] ?? "http://127.0.0.1:8793"
     // 1) sign in -> token
     guard let auth = livePOST(base, "/auth/signin", ["email": "local@blacklabel", "password": "local-session"]),
           let token = auth["token"] as? String, !token.isEmpty else {
@@ -2356,13 +2787,15 @@ func testLiveBackendIntegration() {
             ok((liveObj["gated"] as? Bool) == true || liveObj["symbol"] == nil, "[integration] /api/live honest gated/empty when no tick")
         }
     } else { ok(false, "[integration] /api/live reachable") }
-    // 5) /api/screen exposes the FULL edge-gated engine roster (every engine present, each row a
-    // real OOS verdict on the buyer's own bars — present-or-warming, never fabricated).
-    let roster = ["meanrev", "breakout", "research", "momentum", "structure", "regime", "channel", "context_a", "context_b"]
+    // 5) /api/screen exposes all seven distinct active engines. Historical aliases decode into
+    // their canonical ids and therefore never create duplicate product rows.
+    let roster = EngineRoster.order
     if let screenObj = liveGET(base, "/api/screen", token: token) {
         let rows = EngineRoster.decode(screenObj)
         let present = Set(rows.map { $0.engine })
         for e in roster { ok(present.contains(e), "[integration] /api/screen exposes engine \(e)") }
+        ok(Set(EngineRoster.historicalAliases.keys).isDisjoint(with: present),
+           "[integration] /api/screen exposes no duplicate historical alias rows")
         ok(rows.allSatisfy { $0.winRate >= 0 && $0.winRate <= 1 }, "[integration] screen winRates are real fractions [0,1]")
     } else { ok(false, "[integration] /api/screen reachable") }
     // 6) /api/fires decodes into the real (possibly empty) signal journal — never fabricated.
@@ -2387,29 +2820,31 @@ func testWindowLaunchOrderingContract() {
 }
 
 func testBuildNumberContract() {
-    let expectedBuild = "<key>CFBundleVersion</key><string>25</string>"
+    let expectedBuild = "<key>CFBundleVersion</key><string>27</string>"
     for file in ["build.command", "build-signed.command"] {
         guard let src = try? String(contentsOfFile: file, encoding: .utf8) else {
             ok(false, "[source] \(file) readable for build-number contract"); continue
         }
-        ok(src.contains(expectedBuild), "[source] \(file) stamps Trading build 25")
+        ok(src.contains(expectedBuild), "[source] \(file) stamps Trading build 27")
         ok(src.contains("universal2") && src.contains("build_trd_arch arm64") &&
            src.contains("build_trd_arch x86_64") && src.contains("lipo -create"),
            "[source] \(file) builds a universal2 Trading binary")
     }
     if let src = try? String(contentsOfFile: "build-developer-id.sh", encoding: .utf8) {
-        ok(src.contains("BUILD_NUMBER=\"${BUILD_NUMBER:-25}\""), "[source] Developer-ID build defaults to Trading build 25")
+        ok(src.contains("BUILD_NUMBER=\"${BUILD_NUMBER:-27}\""), "[source] Developer-ID build defaults to Trading build 27")
     } else {
         ok(false, "[source] build-developer-id.sh readable for build-number contract")
     }
     if let plist = try? String(contentsOfFile: "Sources/Info.plist", encoding: .utf8) {
-        ok(plist.contains("<key>CFBundleVersion</key>\n\t<string>25</string>"),
-           "[source] Sources/Info.plist CFBundleVersion is 25")
+        ok(plist.contains("<key>CFBundleVersion</key>\n\t<string>27</string>"),
+           "[source] Sources/Info.plist CFBundleVersion is 27")
     } else {
         ok(false, "[source] Sources/Info.plist readable for build-number contract")
     }
     if let project = try? String(contentsOfFile: "project.yml", encoding: .utf8) {
-        ok(project.contains("CFBundleVersion: \"25\""), "[source] project.yml CFBundleVersion is 25")
+        ok(project.contains("CURRENT_PROJECT_VERSION: \"27\""),
+           "[source] project.yml CURRENT_PROJECT_VERSION is 27")
+        ok(project.contains("CFBundleVersion: \"27\""), "[source] project.yml CFBundleVersion is 27")
     } else {
         ok(false, "[source] project.yml readable for build-number contract")
     }
@@ -2437,6 +2872,7 @@ testTradingSymbolScope()
 testProductSurfaceSymbolScopeContract()
 testNoAPIWebhookIngestionContract()
 testEntitlementsHardeningContract()
+testBundledBackendEnvironment()
 
 // Engine roster + fire feed decode (the /api/screen + /api/fires wire contract)
 testEngineRosterDecode()
@@ -2456,6 +2892,7 @@ testChartRenderParityIndicators()
 
 // No-code backtest lab (item 10): decode + per-fold honest stat formatting on the buyer's own bars.
 testBacktestLabDecodeAndFolds()
+testBacktestFarmSelectionOnlyDecodeAndCopy()
 
 // Prop-firm rule profiles (item 7): the profile-gating decision on the buyer's own caps.
 testRuleProfileGateWithinLimitsAndMax()
@@ -2473,7 +2910,7 @@ testDisciplineCockpitRiskOfRuin()
 testDisciplineCockpitEmptyHonest()
 testNonRepaintClosedBarsSwiftMirror()
 
-// In-app auto-updater pure core (version compare, sha256, manifest decode, daily-check window)
+// In-app updater fail-closed release-integrity core.
 testUpdater()
 
 // Installed-app launch contract: the window must be on-screen and frontmost.

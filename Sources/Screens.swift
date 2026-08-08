@@ -494,7 +494,7 @@ struct SignalsScreen: View {
     // max-drawdown / p-value per engine. NO cherry-picking, NO $ figures, NO win-rate marketing.
     private var rerunGatePanel: some View {
         Panel(title: "Re-run the edge gate on my bars", icon: "arrow.clockwise.circle.fill", accent: BLTheme.gold) {
-            Text("Runs the SAME shipped provers over YOUR captured bars — every engine, every instrument you stream, no cherry-picking. Shows the prover fingerprint (sha256 of the gate source), the OOS trade count, wins / losses, max drawdown in R, and the one-sided binomial p-value. Reproducible by you: shasum -a 256 bltd_store.py.")
+            Text("Runs the SAME shipped provers over YOUR captured bars — every engine, every instrument you stream, no cherry-picking. Shows the prover fingerprint (sha256 of the gate source), the OOS trade count, wins / losses, max drawdown in R, and the one-sided realized-mean-R p-value with serial-dependence penalty. Reproducible by you: shasum -a 256 bltd_store.py.")
                 .font(.system(size: 11, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
                 .fixedSize(horizontal: false, vertical: true)
             HStack(spacing: 10) {
@@ -717,7 +717,7 @@ struct SignalsScreen: View {
                 Text(connected ? "Platform account saved" : "Save your platform account")
                     .font(.system(size: 14, weight: .bold, design: .rounded)).foregroundColor(BLTheme.text)
                 Text(connected
-                     ? "\(wc.account.username) · saved on this Mac. Live data comes from your selected platform session in the app-owned browser. Autonomous execution is OFF by default (see Execution)."
+                     ? "\(wc.account.username) · saved on this Mac. Live data comes from your selected platform session in the app-owned browser. Trading remains manual on your platform."
                      : "Save your platform account label on this Mac. Live data comes from your selected platform session in the app-owned browser.")
                     .font(.system(size: 11.5, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
                     .fixedSize(horizontal: false, vertical: true)
@@ -1872,7 +1872,7 @@ struct SettingsScreen: View {
                 }
             }
             Panel(title: "Products & roadmap", icon: "shippingbox.fill") {
-                productRow("Trading", "see blacklabelbots.com", "9 edge-gated signal engines, 13 risk gates, multi-TF consensus, direction lock, and OPTIONAL autonomous execution (default OFF, paper-first) on your own broker where your firm permits automation.", BLTheme.gold, "Available")
+                productRow("Trading", "see blacklabelbots.com", "7 distinct edge-gated research strategies, multi-TF analysis, alerts, replay, and manual paper tools. Signals only — orders stay on your broker platform.", BLTheme.gold, "Available")
                 productRow("Marketing", "see blacklabelbots.com", "Six-platform content pipeline. Channels post from credentials you own.", BLTheme.sub, "Coming soon")
                 productRow("Outbound", "see blacklabelbots.com", "Lead gen and outreach — scoped intro before a monthly lane opens.", BLTheme.sub, "Intro")
                 Text("Current pricing lives on blacklabelbots.com (kept there so it's never stale in the app). This app is a scenario-scoring dashboard for the engine method — it scores factors you set, runs the 13 gates, and keeps an honestly-graded session ledger on this Mac. It is not a broker execution record or track record.")
@@ -2117,7 +2117,7 @@ struct ConnectWealthChartsSheet: View {
                         .frame(width: 30, height: 30).background(BLTheme.goldGrad).clipShape(RoundedRectangle(cornerRadius: 9))
                 Text("Save platform account").font(.system(size: 18, weight: .heavy, design: .rounded)).foregroundColor(BLTheme.text)
                 }
-                Text("Saved on this Mac only. This panel just stores your account label — it does not log in, trade, or move money. The password is stored in the macOS Keychain. Autonomous execution is OFF by default (Execution screen).")
+                Text("Saved on this Mac only. This panel stores your account label; it does not place trades or move money. The password is stored in the macOS Keychain. Orders remain manual on your platform.")
                     .font(.system(size: 12, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
                     .fixedSize(horizontal: false, vertical: true)
 

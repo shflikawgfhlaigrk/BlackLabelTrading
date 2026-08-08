@@ -25,10 +25,19 @@ TOPSTEP_URLS = ("https://www.topstepx.com/",)
 
 def webhook_url() -> str:
     return os.environ.get("BLTD_WEBHOOK_URL") or \
-        f"http://127.0.0.1:{os.environ.get('BLTD_PORT', '8787')}/webhook/feed"
+        f"http://127.0.0.1:{os.environ.get('BLTD_PORT', '8793')}/webhook/feed"
 
 
 def webhook_token() -> str:
+    token_file = os.environ.get("BLTD_TOKEN_FILE")
+    if token_file:
+        try:
+            with open(token_file, encoding="utf-8") as handle:
+                token = handle.read(4097).strip()
+            if token and len(token) <= 4096:
+                return token
+        except OSError:
+            pass
     return os.environ.get("BLTD_TOKEN", "")
 
 
@@ -100,7 +109,7 @@ def run_once(page, sink=None, idle_stall=45.0):
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     if not webhook_token():
-        log.error("topstep bridge: BLTD_TOKEN missing; cannot authenticate to local webhook")
+        log.error("topstep bridge: local webhook token missing; cannot authenticate")
         return 2
     log.info("browser bridge: webhook -> %s", webhook_url())
     readers = {}

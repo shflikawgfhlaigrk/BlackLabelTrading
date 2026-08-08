@@ -267,8 +267,9 @@ enum LiveFold {
 // MARK: - Engine roster from GET /api/screen.
 // Wire: {"rows":[{engine,symbol,edge,warming,winRate,netPts,expectancyR,trades,bars,reason}]}.
 // Every field is the backend's REAL per-(engine,symbol) OOS verdict on the buyer's own captured
-// bars. `edge` is true ONLY when that engine proved held-out edge on real bars; `warming` is true
-// when there aren't enough bars yet. Nothing here is fabricated — an empty/cold store yields [].
+// bars. `edge` means the row cleared this screening gate; it is research evidence, not adoption.
+// `warming` is true when there aren't enough bars yet. Nothing here is fabricated — an empty/cold
+// store yields [].
 // The UI must NEVER hardcode a win%/net; it shows exactly these decoded values or an empty state.
 struct EngineRow: Equatable, Identifiable {
     var engine: String
@@ -285,33 +286,44 @@ struct EngineRow: Equatable, Identifiable {
 }
 
 enum EngineRoster {
-    // Display order for the engine fleet (generic, customer-facing ids — never internal codenames).
-    static let order = ["meanrev", "breakout", "research", "momentum", "structure", "regime",
-                        "channel", "context_a", "context_b"]
+    // Seven distinct implementations are selectable. The two retired ids remain decodable so old
+    // journals/reference artifacts still render, but they never create duplicate picker entries.
+    static let order = ["meanrev", "breakout", "momentum", "structure", "regime", "channel",
+                        "context_b"]
+    static let historicalAliases = ["research": "breakout", "context_a": "momentum"]
 
     // Clean human label for an engine id. Pure formatting — maps a known id to its display name
     // and title-cases any unknown id (e.g. a buyer-added engine). NEVER invents data, only labels.
     static let labels: [String: String] = [
-        "meanrev": "Mean Reversion", "breakout": "Breakout", "research": "Research",
-        "momentum": "Momentum", "structure": "Structure", "regime": "Regime",
-        "channel": "Channel", "context_a": "Context A", "context_b": "Context B",
+        "meanrev": "Mean Reversion", "breakout": "Breakout", "momentum": "Momentum",
+        "structure": "Structure", "regime": "Regime", "channel": "Channel",
+        "context_b": "Context B",
     ]
 
+    static func canonicalID(for engine: String) -> String {
+        historicalAliases[engine] ?? engine
+    }
+
     static func label(for engine: String) -> String {
-        if let l = labels[engine] { return l }
+        let canonical = canonicalID(for: engine)
+        if let l = labels[canonical] { return l }
         // Unknown id: humanize ("foo_bar" -> "Foo Bar") rather than show a raw token.
-        return engine.split(whereSeparator: { $0 == "_" || $0 == "-" })
+        return canonical.split(whereSeparator: { $0 == "_" || $0 == "-" })
             .map { $0.prefix(1).uppercased() + $0.dropFirst() }
             .joined(separator: " ")
     }
 
     static func decode(_ obj: [String: Any]) -> [EngineRow] {
         guard let rows = obj["rows"] as? [[String: Any]] else { return [] }
-        return rows.compactMap { r in
-            guard let e = r["engine"] as? String, let s = r["symbol"] as? String else { return nil }
-            guard TradingSymbolScope.inScope(s) else { return nil }
-            return EngineRow(
-                engine: e, symbol: s,
+        var decoded: [EngineRow] = []
+        var indexByID: [String: Int] = [:]
+        var sourceWasCanonical: [Bool] = []
+        for r in rows {
+            guard let rawEngine = r["engine"] as? String, let s = r["symbol"] as? String,
+                  TradingSymbolScope.inScope(s) else { continue }
+            let engine = canonicalID(for: rawEngine)
+            let row = EngineRow(
+                engine: engine, symbol: s,
                 edge: (r["edge"] as? Bool) ?? false,
                 warming: (r["warming"] as? Bool) ?? false,
                 winRate: FeedBars.num(r["winRate"] as Any) ?? 0,
@@ -320,14 +332,28 @@ enum EngineRoster {
                 trades: Int(FeedBars.num(r["trades"] as Any) ?? 0),
                 bars: Int(FeedBars.num(r["bars"] as Any) ?? 0),
                 reason: (r["reason"] as? String) ?? "")
+            let isCanonical = rawEngine == engine
+            if let index = indexByID[row.id] {
+                // If both an old alias and its canonical id arrive, keep one honest row and prefer
+                // the canonical source regardless of wire order.
+                if isCanonical && !sourceWasCanonical[index] {
+                    decoded[index] = row
+                    sourceWasCanonical[index] = true
+                }
+            } else {
+                indexByID[row.id] = decoded.count
+                decoded.append(row)
+                sourceWasCanonical.append(isCanonical)
+            }
         }
+        return decoded
     }
 }
 
 // MARK: - Live gate verdict for the buyer's OWN bars (the "NO EDGE TODAY" hero).
 // A pure roll-up of the engine fleet (decoded EngineRows from GET /api/screen) into the single
 // honest headline a buyer needs first: how many of their engines have NO edge on their captured
-// bars today, how many are still warming, and how many (if any) cleared an OOS candidate. It
+// bars today, how many are still warming, and how many (if any) cleared this research screen. It
 // NEVER fabricates — an empty fleet (no captured bars) is `hasData == false`, and the counts are
 // grouped straight from the real per-engine rows. No aggregate win-rate, no P&L, no promise.
 struct GateReject: Equatable, Identifiable {
@@ -339,16 +365,16 @@ struct GateReject: Equatable, Identifiable {
 struct GateVerdict: Equatable {
     var hasData: Bool        // false when no bars captured yet (fleet empty)
     var evaluated: Int       // engines actually evaluated on the buyer's bars
-    var candidates: Int      // engines with >=1 OOS candidate (edge cleared significance)
+    var candidates: Int      // legacy count: engines with >=1 row that cleared this screen
     var warming: Int         // engines still warming (insufficient bars)
     var noEdge: Int          // engines evaluated with a sufficient sample but no edge
-    var rejects: [GateReject]   // per no-edge/warming engine, the honest reason (candidates excluded)
+    var rejects: [GateReject]   // per no-edge/warming engine, the honest reason (passes excluded)
 
-    // Headline: the blunt truth first. Zero proven edges is the norm and the tool says so plainly.
+    // A screen pass is deliberately not described as proof, promotion, or live adoption.
     var headline: String {
         if !hasData { return "No bars captured yet" }
         if candidates > 0 {
-            return "\(candidates) of \(evaluated) engine\(evaluated == 1 ? "" : "s"): OOS candidate on your bars today"
+            return "\(candidates) of \(evaluated) engine\(evaluated == 1 ? "" : "s"): research screen pass on your bars"
         }
         return "\(noEdge + warming) of \(evaluated) engine\(evaluated == 1 ? "" : "s"): no edge on your bars today"
     }
@@ -358,7 +384,9 @@ struct GateVerdict: Equatable {
             return "Connect your feed and let bars accumulate — the gate verdict is computed only from your own captured bars."
         }
         var parts: [String] = []
-        if candidates > 0 { parts.append("\(candidates) OOS candidate\(candidates == 1 ? "" : "s") (research only, not proven live)") }
+        if candidates > 0 {
+            parts.append("\(candidates) screen pass\(candidates == 1 ? "" : "es") — nested confirmation required; never live-adopted by this screen")
+        }
         if noEdge > 0 { parts.append("\(noEdge) no edge") }
         if warming > 0 { parts.append("\(warming) still warming") }
         return parts.joined(separator: " · ")
@@ -391,7 +419,7 @@ struct GateVerdict: Equatable {
             let allWarming = !rows.isEmpty && rows.allSatisfy { $0.warming }
             if hasEdge {
                 candidates += 1
-                continue                       // candidates are surfaced elsewhere, not as "rejects"
+                continue                       // screen passes are surfaced elsewhere, not as rejects
             } else if allWarming {
                 warming += 1
             } else {
@@ -497,7 +525,8 @@ struct ReferenceReport: Equatable {
 
 // MARK: - Buyer-triggered gate re-run from GET /api/gate/rerun.
 // The one-click "re-run the edge gate on MY bars" result: the SAME shipped provers (SIG_MIN_N=30,
-// one-sided binomial p<0.05, grid-wide FDR) run live over the buyer's OWN captured bars, stamped
+// one-sided realized-mean-R p<0.05 with serial-dependence penalty, grid-wide FDR) run live over
+// the buyer's OWN captured bars, stamped
 // with the prover-source sha256 so it is reproducible (`shasum -a 256 bltd_store.py`). Every field
 // is decoded straight from the artifact — no aggregate win-rate, no equity, no $ claim, no promise.
 // A thin sample decodes as `insufficient` (n < minTrades); an empty store as `available == false`.
@@ -570,7 +599,7 @@ struct GateRerunReport: Equatable {
 
     // Provenance line — the whole run is reproducible from this.
     var proverLine: String {
-        "prover \(proverSHA.isEmpty ? "—" : proverSHA) · one-sided binomial p<\(String(format: "%.2f", alpha)) · min n \(minTrades)"
+        "prover \(proverSHA.isEmpty ? "—" : proverSHA) · mean-R p<\(String(format: "%.2f", alpha)) · serial-aware · min n \(minTrades)"
     }
 
     static func decode(_ obj: [String: Any]) -> GateRerunReport {
@@ -769,7 +798,7 @@ struct BacktestLabReport: Equatable {
         totalBars: 0, status: "insufficient", whole: nil, folds: [], reason: "")
 
     var proverLine: String {
-        "prover \(proverSHA.isEmpty ? "—" : proverSHA) · one-sided binomial p<\(String(format: "%.2f", alpha)) · min n \(minTrades)"
+        "prover \(proverSHA.isEmpty ? "—" : proverSHA) · mean-R p<\(String(format: "%.2f", alpha)) · serial-aware · min n \(minTrades)"
     }
 
     private static func decodeFold(_ f: [String: Any]) -> BacktestLabFold {
@@ -810,13 +839,12 @@ struct BacktestLabReport: Equatable {
     }
 }
 
-// MARK: - TR-19 own-silicon parameter-sweep backtest FARM from GET /api/backtest/farm.
-// The buyer picks ONE engine + ONE instrument; the backend fans the SHIPPED prover's hyperparameter
-// grid across this Mac's cores over their OWN captured bars — no cloud, no data fee, no egress. Every
-// cell reports n / W / L / max-drawdown-R and a Benjamini–Hochberg FDR-corrected p across the WHOLE
-// grid (`pEdgeAdj`). A raw best-cell p is NEVER surfaced (that would be a multiple-comparisons lie);
-// there is NO aggregate win-rate / equity / $ figure. A cell with < minTrades OOS trades decodes as
-// `insufficient`. "On your captured bars only — NOT a promise."
+// MARK: - TR-19 local parameter research screen from GET /api/backtest/farm.
+// The buyer picks ONE engine + ONE instrument; the backend fans the fixed research grid across this
+// Mac's cores over their OWN captured bars — no cloud, no data fee, no egress. Every cell reports
+// n / W / L / max-drawdown-R and a Benjamini–Hochberg FDR-corrected p across the WHOLE grid
+// (`pEdgeAdj`). A raw best-cell p is NEVER surfaced. A passing cell is only selected for a separate
+// nested confirmation protocol; this report never enables or live-adopts a strategy.
 struct BacktestFarmCell: Equatable, Identifiable {
     var index: Int
     var params: String       // human-readable parameter set, e.g. "lookback=20 · mrZ=2.0"
@@ -826,7 +854,8 @@ struct BacktestFarmCell: Equatable, Identifiable {
     var netPts: Double
     var maxDrawdownR: Double
     var pEdgeAdj: Double      // BH-FDR-corrected — the ONLY p shown as significance
-    var proven: Bool
+    // Decoded from the legacy wire key `proven`; semantically this is only a screen selection.
+    var selectedForConfirmation: Bool
     var insufficient: Bool
     var reason: String
     var id: Int { index }
@@ -855,22 +884,23 @@ struct BacktestFarmReport: Equatable {
     var generatedUTC: String
     var totalBars: Int
     var cellsTried: Int
-    var provenCells: Int
+    // Decoded from the legacy wire key `provenCells`; no selected cell is enabled or adopted.
+    var selectionCount: Int
     var cellsInsufficient: Int
     var cellsSufficient: Int
     var gridSize: Int
     var gridTruncated: Bool
-    var status: String        // "candidate" | "no_edge" | "insufficient"
+    var status: String        // legacy wire: "candidate" means selection-only, never adoption
     var best: BacktestFarmCell?
     var cells: [BacktestFarmCell]
     var reason: String
 
     static let empty = BacktestFarmReport(
         available: false, engine: "", symbol: "",
-        label: "Parameter sweep of the SHIPPED edge-gate prover on YOUR captured bars only — reproducible, NOT a promise, no performance guaranteed.",
-        overfitNote: "Best-of-N parameter search inflates significance. Every p is Benjamini–Hochberg FDR-corrected across all cells tried; a raw best-cell p is never shown.",
+        label: "Parameter research screen on YOUR captured bars only — reproducible research, never live-adopted by this screen.",
+        overfitNote: "Best-of-N parameter screening inflates significance. Every p is Benjamini–Hochberg FDR-corrected across all cells tried; a raw best-cell p is never shown. A selection still requires separate nested confirmation.",
         proverSHA: "", minTrades: 30, alpha: 0.05, fdrQ: 0.10, compute: "", cores: 0,
-        generatedUTC: "", totalBars: 0, cellsTried: 0, provenCells: 0, cellsInsufficient: 0,
+        generatedUTC: "", totalBars: 0, cellsTried: 0, selectionCount: 0, cellsInsufficient: 0,
         cellsSufficient: 0, gridSize: 0, gridTruncated: false, status: "insufficient",
         best: nil, cells: [], reason: "")
 
@@ -899,7 +929,7 @@ struct BacktestFarmReport: Equatable {
             netPts: FeedBars.num(c["netPts"] as Any) ?? 0,
             maxDrawdownR: FeedBars.num(c["maxDrawdownR"] as Any) ?? 0,
             pEdgeAdj: FeedBars.num(c["pEdgeAdj"] as Any) ?? 1.0,
-            proven: (c["proven"] as? Bool) ?? false,
+            selectedForConfirmation: (c["proven"] as? Bool) ?? false,
             insufficient: (c["insufficient"] as? Bool) ?? false,
             reason: (c["reason"] as? String) ?? "")
     }
@@ -920,7 +950,7 @@ struct BacktestFarmReport: Equatable {
         out.generatedUTC = (obj["generatedUTC"] as? String) ?? ""
         out.totalBars = Int(FeedBars.num(obj["totalBars"] as Any) ?? 0)
         out.cellsTried = Int(FeedBars.num(obj["cellsTried"] as Any) ?? 0)
-        out.provenCells = Int(FeedBars.num(obj["provenCells"] as Any) ?? 0)
+        out.selectionCount = Int(FeedBars.num(obj["provenCells"] as Any) ?? 0)
         out.cellsInsufficient = Int(FeedBars.num(obj["cellsInsufficient"] as Any) ?? 0)
         out.cellsSufficient = Int(FeedBars.num(obj["cellsSufficient"] as Any) ?? 0)
         out.gridSize = Int(FeedBars.num(obj["gridSize"] as Any) ?? 0)

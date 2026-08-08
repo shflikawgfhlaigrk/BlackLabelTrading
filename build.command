@@ -3,33 +3,37 @@
 # Compiles Sources/*.swift with swiftc into a signed .app bundle.
 #
 #   ./build.command            -> builds into ./build/Black Label Trading.app
-#   ./build.command --devid --install  -> Developer-ID build + guarded production install
+#   ./build.command --devid       -> unnotarized Developer-ID artifact for validation/notary input
 #
 # Signals-only product. Ships NO data. Entitlements applied at sign time.
 set -euo pipefail
 
 cd "$(dirname "$0")"
 ROOT="$(pwd)"
-# shellcheck source=scripts/production-install-guard.sh
-source "$ROOT/scripts/production-install-guard.sh"
 SRC="$ROOT/Sources"
 BUILD="$ROOT/build"
 APPNAME="Black Label Trading"
 APP="$BUILD/$APPNAME.app"
 BIN_NAME="Black Label Trading"
 BUNDLE_ID="com.blacklabel.trading"
+TEAM="745ZPGFRA5"
 
 # --- mode flags --------------------------------------------------------------
 # --devid   : sign Developer-ID + hardened runtime + NON-sandbox entitlements (app-developerid.entitlements
 #             — network.client + disable-library-validation) — notarization-ready, and the ONLY build the in-app updater can
 #             self-replace (the sandbox forbids self-replace). The adhoc default path is unchanged.
-# --install : after building, install the fresh bundle into /Applications (atomic swap).
+# --install : intentionally rejected here; canonical installs require notarization + stapling through
+#             build-developer-id.sh --submit --install.
 DEVID=0; INSTALL=0
 for a in "$@"; do case "$a" in --devid) DEVID=1;; --install) INSTALL=1;; esac; done
-if [[ "$INSTALL" == "1" && "$DEVID" != "1" ]]; then
-  echo "ABORT: --install requires --devid; ad-hoc builds remain in ./build." >&2
+if [ "$INSTALL" = "1" ]; then
+  echo "ABORT: build.command produces an unnotarized artifact and cannot install to /Applications." >&2
+  echo "       Use ./build-developer-id.sh --submit --install after Apple notarization." >&2
   exit 64
 fi
+
+echo "==> Signals-only release contract (source preflight)"
+bash "$ROOT/Tests/signals-only-release-contract.sh"
 
 # DEVID and ADHOC both sign with the HARDENED, non-sandbox Developer-ID entitlements
 # (network.client + disable-library-validation). The bundled Python backend loads unsigned
@@ -43,9 +47,13 @@ DEVID_IDENTITY=""
 if [ "$DEVID" = "1" ]; then
   # Resolve the first VALID Developer ID Application identity by HASH (avoids the "ambiguous —
   # matches N identities" error when more than one valid cert is in the keychain).
-  DEVID_IDENTITY="$(security find-identity -v -p codesigning | awk '/Developer ID Application/{print $2; exit}')"
+  DEVID_IDENTITY="$(
+    security find-identity -v -p codesigning 2>/dev/null |
+      awk -v team="$TEAM" '/Developer ID Application/ && index($0, "(" team ")") { print $2; exit }' ||
+      true
+  )"
   if [ -z "$DEVID_IDENTITY" ]; then
-    echo "ABORT: --devid requested but no 'Developer ID Application' identity is in the keychain."; exit 1
+    echo "ABORT: --devid requested but no team $TEAM Developer ID Application identity is in the keychain."; exit 1
   fi
   [ -f "$DEVID_ENTITLEMENTS" ] || { echo "ABORT: missing $DEVID_ENTITLEMENTS"; exit 1; }
 fi
@@ -75,7 +83,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 echo "==> Compiling Sources/*.swift (universal2: arm64 + x86_64)"
 SWIFT_FILES=( "$SRC"/*.swift )
 TRD_FRAMEWORKS=( -framework SwiftUI -framework AppKit -framework Charts
-  -framework AuthenticationServices -framework CryptoKit -framework LocalAuthentication -framework Security )
+  -framework AuthenticationServices -framework CryptoKit -framework Security )
 build_trd_arch () {
   local arch="$1"
   echo "==> Compiling ${arch} (deployment target macOS 13.0)"
@@ -121,7 +129,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleName</key><string>Black Label Trading</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>1.0</string>
-  <key>CFBundleVersion</key><string>25</string>
+  <key>CFBundleVersion</key><string>27</string>
   <key>GoogleClientID</key><string></string>
   <key>ITSAppUsesNonExemptEncryption</key><false/>
   <key>LSApplicationCategoryType</key><string>public.app-category.finance</string>
@@ -135,18 +143,18 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-# --- copy resources if present (icon/assets/fonts) ---
-[ -f "$SRC/Assets.xcassets/AppIcon.appiconset"/*.icns ] 2>/dev/null && true
-# Prefer resources already built into the installed app if our source lacks compiled assets.
-if [ -f "/Applications/$APPNAME.app/Contents/Resources/AppIcon.icns" ]; then
-  cp -f "/Applications/$APPNAME.app/Contents/Resources/AppIcon.icns" "$APP/Contents/Resources/" || true
-fi
-if [ -d "/Applications/$APPNAME.app/Contents/Resources/Fonts" ]; then
-  cp -Rf "/Applications/$APPNAME.app/Contents/Resources/Fonts" "$APP/Contents/Resources/" || true
-fi
-if [ -f "/Applications/$APPNAME.app/Contents/Resources/Assets.car" ]; then
-  cp -f "/Applications/$APPNAME.app/Contents/Resources/Assets.car" "$APP/Contents/Resources/" || true
-fi
+# --- compile source-controlled assets (never inherit bytes from /Applications) ---
+ASSET_CATALOG="$SRC/Assets.xcassets"
+[ -d "$ASSET_CATALOG" ] || { echo "ABORT: missing source asset catalog: $ASSET_CATALOG" >&2; exit 1; }
+xcrun actool "$ASSET_CATALOG" \
+  --compile "$APP/Contents/Resources" \
+  --platform macosx \
+  --minimum-deployment-target 13.0 \
+  --app-icon AppIcon \
+  --output-partial-info-plist "$BUILD/asset-info.plist"
+[ -f "$APP/Contents/Resources/AppIcon.icns" ] || { echo "ABORT: actool did not emit AppIcon.icns" >&2; exit 1; }
+[ -f "$APP/Contents/Resources/Assets.car" ] || { echo "ABORT: actool did not emit Assets.car" >&2; exit 1; }
+printf 'APPL????' > "$APP/Contents/PkgInfo"
 
 # --- privacy manifest (REQUIRED, accurate: no tracking, no collection, UserDefaults reason) ---
 [ -f "$SRC/PrivacyInfo.xcprivacy" ] && cp -f "$SRC/PrivacyInfo.xcprivacy" "$APP/Contents/Resources/PrivacyInfo.xcprivacy"
@@ -157,7 +165,15 @@ fi
 if [ -d "$ROOT/backend" ]; then
   echo "==> Bundling self-contained backend (code only, no data)"
   mkdir -p "$APP/Contents/Resources/backend"
-  cp -f "$ROOT/backend"/bltd_*.py "$APP/Contents/Resources/backend/"
+  BACKEND_RUNTIME=(
+    bltd_alerts.py bltd_analytics.py bltd_api.py bltd_browser.py bltd_capture.py
+    bltd_feeds.py bltd_optimizer.py bltd_optimizer_cli.py bltd_parsers.py
+    bltd_paths.py bltd_store.py bltd_topstep_bridge.py
+  )
+  for module in "${BACKEND_RUNTIME[@]}"; do
+    [ -f "$ROOT/backend/$module" ] || { echo "ABORT: missing backend runtime module $module" >&2; exit 1; }
+    cp -f "$ROOT/backend/$module" "$APP/Contents/Resources/backend/"
+  done
   cp -f "$ROOT/backend/launch-backend.sh" "$APP/Contents/Resources/backend/"
   chmod +x "$APP/Contents/Resources/backend/launch-backend.sh"
   # Reference OOS verdicts: Black Label's edge-gate result on OUR OWN historical ES bars (research,
@@ -165,31 +181,169 @@ if [ -d "$ROOT/backend" ]; then
   # account, NOT a promise. gen_reference.py (the build-time generator) is deliberately NOT shipped.
   [ -f "$ROOT/backend/reference_oos.json" ] && cp -f "$ROOT/backend/reference_oos.json" "$APP/Contents/Resources/backend/"
 
-  RUNTIME_SRC=""
-  if [ -d "$ROOT/vendor/python-runtime" ]; then
-    RUNTIME_SRC="$ROOT/vendor/python-runtime"
-  elif [ -d "/Applications/$APPNAME.app/Contents/Resources/backend/python-runtime" ]; then
-    RUNTIME_SRC="/Applications/$APPNAME.app/Contents/Resources/backend/python-runtime"
-  fi
-  if [ -z "$RUNTIME_SRC" ]; then
-    echo "ABORT: missing bundled backend runtime (expected vendor/python-runtime)."; exit 1
+  RUNTIME_SRC="$ROOT/vendor/python-runtime"
+  if [ ! -x "$RUNTIME_SRC/bin/python3.11" ] && [ ! -x "$RUNTIME_SRC/bin/python3" ]; then
+    echo "ABORT: missing source-controlled backend runtime at $RUNTIME_SRC" >&2
+    exit 1
   fi
 
-  echo "==> Bundling backend runtime"
+  echo "==> Bundling source-controlled backend runtime"
   rm -rf "$APP/Contents/Resources/backend/python-runtime"
   cp -Rf "$RUNTIME_SRC" "$APP/Contents/Resources/backend/python-runtime"
+  # Precompiled caches are mutable interpreter state, not release inputs. The wrapper below writes
+  # any future cache outside the signed app.
+  find "$APP/Contents/Resources/backend" -type d -name __pycache__ -prune -exec rm -rf {} +
+  find "$APP/Contents/Resources/backend" -type f -name '*.pyc' -delete
+  if find "$APP/Contents/Resources/backend" -type f \( -name 'bltd_exec.py' -o -name 'bltd_projectx.py' \) | grep -q .; then
+    echo "ABORT: broker-order code entered the signals-only bundle" >&2
+    exit 1
+  fi
   cat > "$APP/Contents/Resources/backend/python3" <<'PYSH'
 #!/bin/bash
 set -euo pipefail
-export PYTHONDONTWRITEBYTECODE=1
-DIR="$(cd "$(dirname "$0")" && pwd)"
+umask 077
+
+DIR="$(cd "$(dirname "$0")" && pwd -P)"
+RUNTIME_HOME="${HOME:-/var/empty}"
+case "$RUNTIME_HOME" in
+  /*) ;;
+  *) RUNTIME_HOME="/var/empty" ;;
+esac
+CACHE_INPUT="${PYTHONPYCACHEPREFIX:-${BLTD_PYCACHE_ROOT:-$RUNTIME_HOME/Library/Caches/Black Label Trading/python}}"
+
+unset PYTHONHOME PYTHONPATH PYTHONSTARTUP PYTHONINSPECT PYTHONUSERBASE
+unset BASH_ENV ENV
+unset DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH DYLD_FRAMEWORK_PATH
+unset DYLD_FALLBACK_LIBRARY_PATH DYLD_FALLBACK_FRAMEWORK_PATH
+
+canonicalize_cache_path() {
+  local probe="${1%/}" suffix="" component
+  [ -n "$probe" ] || probe="/"
+  while [ ! -e "$probe" ]; do
+    [ "$probe" != "/" ] || return 1
+    component="${probe##*/}"
+    probe="${probe%/*}"
+    [ -n "$probe" ] || probe="/"
+    suffix="/$component$suffix"
+  done
+  [ -d "$probe" ] || return 1
+  probe="$(cd "$probe" && pwd -P)" || return 1
+  while [ -n "$suffix" ]; do
+    suffix="${suffix#/}"
+    component="${suffix%%/*}"
+    if [ "$suffix" = "$component" ]; then
+      suffix=""
+    else
+      suffix="${suffix#*/}"
+    fi
+    case "$component" in
+      ""|.) ;;
+      ..)
+        if [ "$probe" != "/" ]; then
+          probe="${probe%/*}"
+          [ -n "$probe" ] || probe="/"
+        fi
+        ;;
+      *)
+        if [ "$probe" = "/" ]; then
+          probe="/$component"
+        else
+          probe="$probe/$component"
+        fi
+        ;;
+    esac
+  done
+  printf '%s\n' "$probe"
+}
+
+case "$CACHE_INPUT" in
+  /*) ;;
+  *)
+    echo "Black Label Trading: PYTHONPYCACHEPREFIX must be an absolute path." >&2
+    exit 78
+    ;;
+esac
+PYTHON_CACHE="$(canonicalize_cache_path "$CACHE_INPUT")" || {
+  echo "Black Label Trading: invalid PYTHONPYCACHEPREFIX." >&2
+  exit 78
+}
+case "$PYTHON_CACHE" in
+  "$DIR"|"$DIR"/*)
+    echo "Black Label Trading: Python cache must be outside the bundled backend." >&2
+    exit 78
+    ;;
+esac
+/bin/mkdir -p "$PYTHON_CACHE"
+PYTHON_CACHE="$(cd "$PYTHON_CACHE" && pwd -P)"
+case "$PYTHON_CACHE" in
+  "$DIR"|"$DIR"/*)
+    echo "Black Label Trading: Python cache resolved inside the bundled backend." >&2
+    exit 78
+    ;;
+esac
+
 if [ -x "$DIR/python-runtime/bin/python3.11" ]; then
-  exec "$DIR/python-runtime/bin/python3.11" "$@"
+  PYTHON_BIN="$DIR/python-runtime/bin/python3.11"
+elif [ -x "$DIR/python-runtime/bin/python3" ]; then
+  PYTHON_BIN="$DIR/python-runtime/bin/python3"
+else
+  echo "Black Label Trading: bundled Python runtime is missing." >&2
+  exit 127
 fi
-exec "$DIR/python-runtime/bin/python3" "$@"
+
+RUNTIME_ENV=(
+  "HOME=$RUNTIME_HOME"
+  "PATH=/usr/bin:/bin:/usr/sbin:/sbin"
+  "LANG=C"
+  "LC_ALL=C"
+  "PYTHONPATH=$DIR"
+  "PYTHONUNBUFFERED=1"
+  "PYTHONDONTWRITEBYTECODE=1"
+  "PYTHONNOUSERSITE=1"
+  "PYTHONPYCACHEPREFIX=$PYTHON_CACHE"
+)
+BLTD_ALLOWLIST=(
+  BLTD_SUPPORT_DIR
+  BLTD_STORE
+  BLTD_CONFIG
+  BLTD_PORT
+  BLTD_SCOPE
+  BLTD_BUILD
+  BLTD_RUNTIME_CONTRACT
+  BLTD_TOKEN_FILE
+  BLTD_WEBHOOK_URL
+  BLTD_CAPTURE_BROWSER
+  BLTD_AUTO_BROWSER
+  BLTD_CAPTURE_ENGINES
+  BLTD_CDP_PORT
+  BLTD_BAR_SECONDS
+  BLTD_LOOKBACK
+  BLTD_EDGE_GATE
+  BLTD_STALL_SECONDS
+  BLTD_TOPSTEP_OPEN_DEBOUNCE_SECONDS
+)
+for name in "${BLTD_ALLOWLIST[@]}"; do
+  if [ "${!name+x}" = "x" ]; then
+    RUNTIME_ENV+=("$name=${!name}")
+  fi
+done
+
+exec /usr/bin/env -i "${RUNTIME_ENV[@]}" "$PYTHON_BIN" "$@"
 PYSH
   chmod +x "$APP/Contents/Resources/backend/python3"
+  BLTD_PYCACHE_ROOT="$BUILD/python-cache-test" \
+    "$APP/Contents/Resources/backend/python3" - <<'PY'
+import secrets, sqlite3, ssl, sys
+raise SystemExit(0 if sys.version_info[:2] >= (3, 9) else 1)
+PY
+  if find "$APP/Contents/Resources/backend" \( -type d -name __pycache__ -o -type f -name '*.pyc' \) | grep -q .; then
+    echo "ABORT: mutable Python cache found inside release bundle" >&2
+    exit 1
+  fi
 fi
+
+echo "==> Signals-only release contract (assembled artifact)"
+bash "$ROOT/Tests/signals-only-release-contract.sh" "$APP"
 
 # --- adhoc sign with the DEVELOPER-ID entitlements (NO app-sandbox, NO applesignin) ---
 # Trading spawns its bundled Python backend, which the App Store sandbox would forbid — so even
@@ -217,38 +371,6 @@ if [ "$DEVID" = "1" ]; then
   codesign -dv --verbose=2 "$APP" 2>&1 | grep -E "Identifier|TeamIdentifier|flags|Authority=Developer ID" | sed 's/^/    /' || true
   echo "    NEXT: notarize (xcrun notarytool submit --wait / notarize.command), staple"
   echo "          (xcrun stapler staple), then take the STAPLED zip's sha256 for the manifest."
-fi
-
-if [ "$INSTALL" = "1" ]; then
-  production_install_guard "$DEVID" "$APP"
-  echo "==> Installing into /Applications/$APPNAME.app (atomic stage → verify → swap)"
-  DEST="/Applications/$APPNAME.app"
-  # §5.9 ATOMIC install (was: cp -Rf "$APP" "$DEST" straight into the live path on
-  # first install / in-place file copies + in-place re-sign). A kill mid-copy (3600s
-  # dispatch timeout / crash / disk-full) left a half-written DOA bundle in
-  # /Applications a buyer can't launch. Fix: stage the freshly built, complete bundle
-  # (icon/fonts/Assets.car/backend already assembled above) to a sibling, re-sign +
-  # verify the STAGE, then atomically rename it into place. Matches the proven
-  # Homefront/Sovereign/Marketing pattern (support-escalation P0 nonatomic-install).
-  STAGE="$DEST.staging.$$"
-  OLD="$DEST.old.$$"
-  rm -rf "$STAGE" "$OLD"
-  # Keep the privacy manifest in sync inside the fresh bundle before staging.
-  [ -f "$SRC/PrivacyInfo.xcprivacy" ] && cp -f "$SRC/PrivacyInfo.xcprivacy" "$APP/Contents/Resources/PrivacyInfo.xcprivacy"
-  echo "==> Staging build into $STAGE"
-  cp -Rf "$APP" "$STAGE"
-  echo "==> Re-signing staged bundle ($([ "$DEVID" = "1" ] && echo "Developer-ID + hardened runtime + non-sandbox" || echo "adhoc, with Developer-ID entitlements"))"
-  codesign --remove-signature "$STAGE" 2>/dev/null || true
-  sign_bundle "$STAGE"
-  # Verify the staged bundle is whole + signed BEFORE disturbing the live bundle.
-  [ -f "$STAGE/Contents/Info.plist" ] || { echo "ABORT: staged bundle incomplete (no Info.plist)"; rm -rf "$STAGE"; exit 1; }
-  codesign --verify --deep --strict "$STAGE" || { echo "ABORT: staged bundle fails codesign"; rm -rf "$STAGE"; exit 1; }
-  # Atomic swap — keep a rollback copy until the rename lands.
-  [ -d "$DEST" ] && mv "$DEST" "$OLD"
-  mv "$STAGE" "$DEST"
-  rm -rf "$OLD"
-  codesign -dv "$DEST" 2>&1 | sed 's/^/    /'
-  echo "==> Installed (atomic): $DEST"
 fi
 
 echo "==> DONE"

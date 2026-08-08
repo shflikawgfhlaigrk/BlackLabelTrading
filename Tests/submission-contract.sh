@@ -167,7 +167,10 @@ check(
 )
 check(
     "backend launcher uses versioned pid-file supervisors",
-    "bltd-supervisor-v2" in launch and "pgrep -f \"bltd_capture.py\"" not in launch,
+    "bltd-supervisor-v3:$BLTD_BUILD:$NAME" in launch
+    and "bltd-worker-v3:$BLTD_BUILD:$NAME" in launch
+    and "pgrep" not in launch
+    and "pkill" not in launch,
 )
 check(
     "backend launcher does not force ES-only scope",

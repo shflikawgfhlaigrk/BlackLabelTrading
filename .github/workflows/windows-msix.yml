@@ -1,0 +1,201 @@
+name: Trading Windows MSIX
+
+# Builds the Microsoft Store MSIX for Black Label Trading on a real GitHub-hosted Windows
+# runner and uploads it as an artifact. Modelled on the proven Circuit windows-spike lane.
+#
+# STORE-FIRST, UNSIGNED. No Authenticode certificate has been purchased and none is applied.
+# The Microsoft Store re-signs an uploaded package under the Partner Center account identity,
+# so the Store path needs no cert. The artifact produced here is for Partner Center upload
+# ONLY — it is NOT sideload-installable (MSIX sideload requires a signature) and the artifact
+# name says so.
+#
+# PORTABILITY: every path is repo-relative. This job checks out exactly one repository and
+# depends on no sibling checkout, no self-hosted runner, and no developer machine.
+#
+# PRODUCT LAW: Black Label Trading is SIGNALS-ONLY. Nothing here can place, route, modify or
+# cancel an order; build-msix.sh fails the pack if a broker/execution adapter reaches the layout.
+
+"on":
+  pull_request:
+    paths:
+      - 'windows/**'
+      - '.github/workflows/windows-msix.yml'
+  push:
+    paths:
+      - 'windows/**'
+      - '.github/workflows/windows-msix.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: trading-windows-msix-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------------------
+  # Host-agnostic gate. Catches a broken manifest or a bad Store tile in ~20s, on Linux,
+  # before a Windows minute is spent. It packs nothing.
+  # ---------------------------------------------------------------------------------------
+  validate:
+    name: Validate MSIX layout (host-agnostic)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Node LTS
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: lts/*
+
+      - name: Assemble layout + run manifest / tile / product-law gates
+        shell: bash
+        run: bash windows/build-msix.sh --validate
+
+  # ---------------------------------------------------------------------------------------
+  # The real thing: stage the app on Windows, compile the MSIX entry-point launcher, pack
+  # with makeappx. FAIL-CLOSED — no continue-on-error. A job that swallows its own failure
+  # turns "packed nothing" into a green check, and a green check reads as "the package exists".
+  # ---------------------------------------------------------------------------------------
+  msix:
+    name: Pack UNSIGNED Store MSIX on windows-latest
+    needs: validate
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Node LTS
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: lts/*
+
+      - name: Record Windows runner evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "RUNNER_OS=$RUNNER_OS"
+            echo "IMAGE_OS=${ImageOS:-unknown}"
+            echo "node=$(node --version)"
+          } | tee runner-evidence.txt
+          # systeminfo is a Windows-only binary; its output proves a genuine Windows image.
+          powershell -Command "(Get-CimInstance Win32_OperatingSystem | Select-Object Caption,Version,OSArchitecture | Format-List | Out-String)" \
+            >> runner-evidence.txt
+          cat runner-evidence.txt
+
+      - name: Stage the app payload (embeddable CPython + pure-stdlib backend)
+        shell: pwsh
+        run: |
+          # build-windows.ps1 downloads the embeddable CPython runtime and FAILS CLOSED unless
+          # its sha256 matches the pin in windows/python-embed.sha256. It also enforces the
+          # ships-empty and pure-stdlib laws. It stages only; it never signs or publishes.
+          ./windows/build-windows.ps1
+          Get-ChildItem windows/dist/blacklabel-trading-win | Format-Table Name, Length
+
+      - name: Compile the MSIX entry-point launcher
+        shell: pwsh
+        run: |
+          # MSIX requires Application/@Executable to be a real PE; launch-trading.cmd cannot be
+          # it. csc.exe ships in-box with the .NET Framework on every Windows image, so this
+          # needs no toolchain install and no network.
+          $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+          if (-not (Test-Path $csc)) { Write-Error "csc.exe not found at $csc"; exit 1 }
+          New-Item -ItemType Directory -Force -Path windows/dist | Out-Null
+          & $csc /nologo /target:winexe /platform:x64 `
+            /out:windows/dist/BlackLabelTrading.exe `
+            windows/msix/launcher/Launcher.cs
+          if ($LASTEXITCODE -ne 0) { Write-Error "launcher compile failed"; exit 1 }
+          # Prove it is a real PE, not a text file with an .exe name.
+          $bytes = [System.IO.File]::ReadAllBytes('windows/dist/BlackLabelTrading.exe')
+          if ($bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) { Write-Error "launcher is not a PE (no MZ header)"; exit 1 }
+          Write-Host "launcher OK: $($bytes.Length) bytes, MZ header present"
+
+      - name: Put the Windows SDK makeappx.exe on PATH
+        shell: pwsh
+        run: |
+          $kit = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\makeappx.exe" `
+            -ErrorAction SilentlyContinue | Sort-Object FullName | Select-Object -Last 1
+          if (-not $kit) { Write-Error "makeappx.exe not found in the Windows SDK on this runner"; exit 1 }
+          Write-Host "makeappx: $($kit.FullName)"
+          Add-Content -Path $env:GITHUB_PATH -Value (Split-Path $kit.FullName)
+
+      - name: Pack the UNSIGNED Store MSIX
+        id: pack
+        shell: bash
+        env:
+          # Empty until Partner Center assigns them. build-msix.sh leaves the placeholders
+          # standing when these are empty and renames the output -PLACEHOLDER-IDENTITY-
+          # NOT-SUBMITTABLE, so a lane-proof build can never be mistaken for a submission.
+          # Once the account verifies, set these three as repository variables (not secrets —
+          # they are public identity values printed on the Store listing).
+          PARTNER_CENTER_IDENTITY_NAME: ${{ vars.PARTNER_CENTER_IDENTITY_NAME }}
+          PARTNER_CENTER_PUBLISHER: ${{ vars.PARTNER_CENTER_PUBLISHER }}
+          PARTNER_CENTER_PUBLISHER_DISPLAY_NAME: ${{ vars.PARTNER_CENTER_PUBLISHER_DISPLAY_NAME }}
+        run: |
+          set -euo pipefail
+          bash windows/build-msix.sh
+          ls -la windows/dist/*.msix
+
+      - name: Prove the artifact is a real MSIX container
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          MSIX="$(ls windows/dist/*.msix 2>/dev/null | head -1 || true)"
+          if [ -z "$MSIX" ]; then
+            echo "no .msix produced" | tee msix-sha256.txt
+            exit 0
+          fi
+          # An MSIX is an OPC zip container and must hold the manifest makeappx wrote.
+          # File presence alone proves nothing, so read the bytes.
+          node -e '
+            const fs = require("fs");
+            const b = fs.readFileSync(process.argv[1]);
+            if (b[0] !== 0x50 || b[1] !== 0x4b) { console.error("not a zip container (no PK magic)"); process.exit(1); }
+            if (!b.includes(Buffer.from("AppxManifest.xml"))) { console.error("no AppxManifest.xml entry inside the package"); process.exit(1); }
+            console.log(`msix ok: ${b.length} bytes, PK magic, AppxManifest.xml present`);
+          ' "$MSIX"
+          sha256sum "$MSIX" | tee msix-sha256.txt
+          echo "bytes=$(wc -c < "$MSIX")" | tee -a msix-sha256.txt
+
+      # Terminal gate. Runs even when the pack step died, so "no artifact" can never be silent.
+      - name: VERDICT
+        if: always()
+        shell: bash
+        run: |
+          MSIX="$(ls windows/dist/*.msix 2>/dev/null | head -1 || true)"
+          if [ -n "$MSIX" ] && [ -s "$MSIX" ]; then
+            case "$MSIX" in
+              *PLACEHOLDER-IDENTITY*) echo "PACKED-PLACEHOLDER-IDENTITY" | tee msix-VERDICT.txt ;;
+              *)                      echo "PACKED-SUBMITTABLE-IDENTITY" | tee msix-VERDICT.txt ;;
+            esac
+          else
+            echo NOT-PACKED | tee msix-VERDICT.txt
+            echo "::error::this run produced NO .msix — nothing was packed"
+            exit 1
+          fi
+
+      # The artifact NAME carries the outcome. Someone who downloads it and never opens the zip
+      # still cannot read it as a signed, sideload-ready, submittable package.
+      - name: Upload the UNSIGNED Store MSIX
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: trading-store-msix-UNSIGNED-${{ steps.pack.outcome == 'success' && 'PACKED' || 'NOT-PACKED' }}
+          if-no-files-found: warn
+          retention-days: 30
+          path: |
+            windows/dist/*.msix
+            windows/msix-layout/AppxManifest.xml
+            runner-evidence.txt
+            msix-sha256.txt
+            msix-VERDICT.txt

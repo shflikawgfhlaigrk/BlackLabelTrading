@@ -1,0 +1,4 @@
+# Windows packaging build output (regeneratable — never committed).
+# NOTE: windows/dist/ is already covered by the repo-root `dist/` rule; msix-layout is not.
+msix-layout/
+dist/

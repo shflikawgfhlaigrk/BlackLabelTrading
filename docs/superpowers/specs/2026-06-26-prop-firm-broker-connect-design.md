@@ -70,7 +70,7 @@ On every rail, a native macOS app + local Python backend connects **directly, no
 ```
 SwiftUI app ──HTTP/WS──> local Python backend (trader's own Mac) ──> rail
   FeedClient.swift          bltd_api.py + adapters                    ProjectX/TopstepX (HTTPS+SignalR)
-  (127.0.0.1:8787)          normalize → bars/wc_live/positions        Rithmic (protobuf/WSS)
+  (127.0.0.1:8793)          normalize → bars/wc_live/positions        Rithmic (protobuf/WSS)
                                                                        WealthCharts (CDP, existing)
 ```
 

@@ -15,7 +15,10 @@ pass the buyer's tuned config.
 """
 from __future__ import annotations
 
+import concurrent.futures
 import math
+import multiprocessing
+import os
 
 import bltd_store as S
 
@@ -129,6 +132,13 @@ def full_backtest(engine: str, ohlc, cfg=None) -> dict:
     if engine not in S.PROVERS:
         return {"ok": False, "engine": engine, "reason": f"unknown engine '{engine}'",
                 "stats": _stats([]), "curve": [], "enoughBars": False}
+    if engine in S.DUPLICATE_ENGINE_ALIASES:
+        return {
+            "ok": False, "engine": engine,
+            "reason": (f"retired duplicate hypothesis; use canonical engine "
+                       f"'{S.DUPLICATE_ENGINE_ALIASES[engine]}'"),
+            "stats": _stats([]), "curve": [], "enoughBars": False,
+        }
     if len(ohlc) < lookback + 2:
         return {"ok": False, "engine": engine,
                 "reason": f"insufficient bars ({len(ohlc)}) — arms at >= {lookback + 2}",
@@ -174,30 +184,80 @@ def screen(store, symbols, engines, cfg=None) -> list[dict]:
     cfg = cfg or store.config()
     lookback = cfg.get("lookback", S.LOOKBACK)
     q = cfg.get("fdrQ", 0.10)
+    requested_symbols = S.scoped_symbols(symbols)
+    requested_engines = [
+        e for e in engines
+        if e in S.PROVERS and e not in S.DUPLICATE_ENGINE_ALIASES
+    ]
+    try:
+        discovered_symbols = S.scoped_symbols(store.symbols().get("backtestable", []))
+    except Exception:  # noqa: BLE001 — small test/fallback stores may expose only ohlc()
+        discovered_symbols = []
+    family_symbols = S.scoped_symbols([*discovered_symbols, *requested_symbols])
+    family_engines = [e for e in S.FDR_ENGINE_FAMILY if e in S.PROVERS]
+    series = {sym: store.ohlc(sym) for sym in family_symbols}
+    canonical_engines = []
+    for engine in family_engines:
+        canonical = S.DUPLICATE_ENGINE_ALIASES.get(engine, engine)
+        if canonical not in canonical_engines:
+            canonical_engines.append(canonical)
+    cells_to_run = [
+        (engine, symbol)
+        for symbol in family_symbols
+        for engine in canonical_engines
+        if len(series.get(symbol, [])) >= lookback + 2
+    ]
+    verdict_cache = {}
+    if len(cells_to_run) > 1 and sum(len(series[symbol]) for _, symbol in cells_to_run) >= 10_000:
+        try:
+            workers = min(len(cells_to_run), os.cpu_count() or 1)
+            with concurrent.futures.ProcessPoolExecutor(
+                    max_workers=workers,
+                    mp_context=multiprocessing.get_context("spawn"),
+                    initializer=_gate_pool_init,
+                    initargs=(series, cfg)) as pool:
+                for engine, symbol, verdict in pool.map(_gate_pool_worker, cells_to_run):
+                    verdict_cache[(engine, symbol)] = verdict
+        except Exception:  # noqa: BLE001 — process spawning is an optimization; truth falls back serially
+            verdict_cache = {}
+    for engine, symbol in cells_to_run:
+        if (engine, symbol) not in verdict_cache:
+            verdict_cache[(engine, symbol)] = S.PROVERS[engine](series[symbol], cfg)
+
     rows = []
     testable = []                                         # (row_index, pEdge) for the BH family
-    for sym in S.scoped_symbols(symbols):
-        ohlc = store.ohlc(sym)
+    for sym in family_symbols:
+        ohlc = series[sym]
         bars = len(ohlc)
-        for eng in engines:
-            if eng not in S.PROVERS:
-                continue
+        for eng in family_engines:
             if bars < lookback + 2:
+                if eng in S.DUPLICATE_ENGINE_ALIASES:
+                    continue
                 rows.append({"engine": eng, "symbol": sym, "edge": False, "warming": True,
                              "bars": bars, "winRate": 0.0, "netPts": 0.0, "expectancyR": 0.0,
                              "trades": 0, "pEdge": 1.0, "reason": f"warming ({bars} bars, arms at {lookback + 2})"})
                 continue
-            v = S.PROVERS[eng](ohlc, cfg)
+            # A retired alias is historical multiplicity debt, not current evidence. Cloning the
+            # canonical p-value here is anti-conservative: two copies of p=.02 advance to BH rank 2
+            # and can pass a nine-test q=.10 family even though the lone canonical p=.02 fails at
+            # rank 1. Charge the alias as a fixed null p=1.0 instead, with no live/output row.
+            if eng in S.DUPLICATE_ENGINE_ALIASES:
+                testable.append((None, 1.0))
+                continue
+            canonical = S.DUPLICATE_ENGINE_ALIASES.get(eng, eng)
+            cache_key = (canonical, sym)
+            v = verdict_cache[cache_key]
             row = {"engine": eng, "symbol": sym, "edge": bool(v.get("ok")), "warming": False,
                    "bars": bars, "winRate": v.get("winRate", 0.0), "netPts": v.get("netPts", 0.0),
                    "expectancyR": v.get("expectancyR", 0.0), "trades": v.get("trades", 0),
                    "pEdge": v.get("pEdge", 1.0), "reason": v.get("reason", "")}
             rows.append(row)
-            if v.get("trades", 0) > 0:
-                testable.append((len(rows) - 1, v.get("pEdge", 1.0)))
+            # A completed zero-trade cell is still a tested hypothesis. Count its p=1 placeholder so
+            # changing engine activity or a parameter cannot shrink the historical family.
+            testable.append((len(rows) - 1, v.get("pEdge", 1.0)))
     # Grid-wide FDR control: among per-test-significant cells, keep only those that also survive BH.
     survivors = _benjamini_hochberg([p for (_, p) in testable], q)
-    kept = {testable[i][0] for i in survivors}
+    kept = {testable[i][0] for i in survivors if testable[i][0] is not None}
     m = len(testable)
     for ri, row in enumerate(rows):
         if row["edge"] and ri not in kept:               # per-test sig but rejected family-wide
@@ -205,7 +265,14 @@ def screen(store, symbols, engines, cfg=None) -> list[dict]:
             row["reason"] = (f"per-test significant (p={row.get('pEdge', 1.0):.3f}) but rejected by "
                              f"grid-wide FDR control across {m} tests (q={q:.2f})")
     rows.sort(key=lambda r: (not r["edge"], r["warming"], -r["netPts"]))
-    return rows
+    requested_symbol_set = set(requested_symbols or family_symbols)
+    requested_engine_set = (
+        set(requested_engines)
+        if engines else
+        {e for e in family_engines if e not in S.DUPLICATE_ENGINE_ALIASES}
+    )
+    return [r for r in rows
+            if r["symbol"] in requested_symbol_set and r["engine"] in requested_engine_set]
 
 
 def instruments(store, cfg=None) -> dict:
@@ -269,18 +336,33 @@ def instruments(store, cfg=None) -> dict:
     }
 
 
+_GATE_SERIES = None
+_GATE_CFG = None
+
+
+def _gate_pool_init(series, cfg):
+    global _GATE_SERIES, _GATE_CFG
+    _GATE_SERIES, _GATE_CFG = series, cfg
+
+
+def _gate_pool_worker(cell):
+    engine, symbol = cell
+    return engine, symbol, S.PROVERS[engine](_GATE_SERIES[symbol], _GATE_CFG)
+
+
 def gate_rerun(store, symbols, engines, cfg=None) -> dict:
-    """Re-run the SHIPPED edge-gate provers (bltd_store.PROVERS, SIG_MIN_N=30, one-sided binomial
-    p<0.05) over the buyer's OWN captured bars, on demand, and return a fully reproducible verdict:
+    """Re-run the SHIPPED edge-gate provers (bltd_store.PROVERS, SIG_MIN_N=30, one-sided
+    realized-mean-R p<0.05) over the buyer's OWN captured bars, on demand, and return a fully
+    reproducible verdict:
     per (engine, contract) the OOS trade count n, wins/losses, net points, max-drawdown-R, and the
-    binomial p-value, stamped with the prover-source sha256 so the buyer can reproduce it with
+    return-based p-value, stamped with the prover-source sha256 so the buyer can reproduce it with
     `shasum -a 256 bltd_store.py`. NO cherry-picking (every scoped symbol × every engine is run and
     reported), NO aggregate win-rate / equity / $ claim, NO performance promise. When a series has
     < SIG_MIN_N OOS trades it is reported honestly as 'insufficient' — significance is NOT assessed
     and the engine is never 'proven'. Same math the reference artifact and the live fleet use; this
     just runs it live on the buyer's data and surfaces the underlying statistics.
 
-    An engine's status is honest: 'candidate' only if it clears the prover floor, per-test binomial
+    An engine's status is honest: 'candidate' only if it clears the prover floor, per-test return
     significance AND a grid-wide Benjamini–Hochberg FDR correction across every (engine,contract)
     cell (the SAME family-wide guard the live fleet applies, so a re-run can never surface more
     spurious 'candidates' than the fleet does); else 'no_edge' if any contract had a sufficient
@@ -288,15 +370,58 @@ def gate_rerun(store, symbols, engines, cfg=None) -> dict:
     cfg = cfg or store.config()
     lookback = cfg.get("lookback", S.LOOKBACK)
     q = cfg.get("fdrQ", 0.10)
-    syms = S.scoped_symbols(symbols)
+    requested_syms = S.scoped_symbols(symbols)
+    try:
+        discovered_syms = S.scoped_symbols(store.symbols().get("backtestable", []))
+    except Exception:  # noqa: BLE001 — test stores may expose only an analysis reader
+        discovered_syms = []
+    syms = S.scoped_symbols([*discovered_syms, *requested_syms])
+    # This endpoint advertises a no-cherry-picking rerun. Ignore a narrowed engine request and run
+    # the immutable historical family; requested subsets are a display concern, not a correction.
+    engines = [e for e in S.FDR_ENGINE_FAMILY if e in S.PROVERS]
+    # Load each immutable analysis snapshot once. Evaluating nine pure-Python walkers serially over
+    # ~30k bars made the button block for ~90 seconds; large runs fan the independent cells across a
+    # spawn-safe process pool and fall back explicitly to serial if the host cannot spawn.
+    analysis_reader = getattr(store, "ohlc_between", store.ohlc)
+    series = {sym: analysis_reader(sym) for sym in syms}
+    compute_engines = [
+        eng for eng in engines
+        if eng in S.PROVERS and eng not in S.DUPLICATE_ENGINE_ALIASES
+    ]
+    cells_to_run = [(eng, sym) for eng in compute_engines for sym in syms
+                    if len(series.get(sym, [])) >= lookback + 2]
+    verdicts = {}
+    compute = "serial"
+    if len(cells_to_run) > 1 and sum(len(series[s]) for _, s in cells_to_run) >= 10_000:
+        try:
+            workers = min(len(cells_to_run), os.cpu_count() or 1)
+            with concurrent.futures.ProcessPoolExecutor(
+                    max_workers=workers,
+                    mp_context=multiprocessing.get_context("spawn"),
+                    initializer=_gate_pool_init,
+                    initargs=(series, cfg)) as pool:
+                for eng, sym, verdict in pool.map(_gate_pool_worker, cells_to_run):
+                    verdicts[(eng, sym)] = verdict
+            compute = f"process-pool ({workers} workers)"
+        except Exception as exc:  # noqa: BLE001 — honest, deterministic serial fallback
+            verdicts = {}
+            compute = f"serial (pool unavailable: {type(exc).__name__})"
+    if not verdicts:
+        for eng, sym in cells_to_run:
+            verdicts[(eng, sym)] = S.PROVERS[eng](series[sym], cfg)
     engine_reports = []
-    testable = []                       # (contract_dict, pEdge) across the whole grid, for BH-FDR
+    # (contract_dict-or-None, pEdge) across the whole grid, for BH-FDR. None entries are retired
+    # historical hypotheses: they consume multiplicity at conservative p=1.0 but can never appear
+    # as a current contract, candidate, or live engine row.
+    testable = []
     for eng in engines:
-        if eng not in S.PROVERS:
+        if eng not in S.PROVERS or eng in S.DUPLICATE_ENGINE_ALIASES:
             continue
         contracts = []
         for sym in syms:
-            ohlc = store.ohlc(sym)
+            # On-demand research reruns use the complete bounded analysis history. The continuously
+            # running live screen intentionally uses Store.ohlc()'s newest 5k window.
+            ohlc = series.get(sym, [])
             bars = len(ohlc)
             if bars < lookback + 2:
                 contracts.append({
@@ -305,10 +430,10 @@ def gate_rerun(store, symbols, engines, cfg=None) -> dict:
                     "pEdge": 1.0, "proven": False, "insufficient": True,
                     "reason": f"warming — only {bars} bars captured (arms at {lookback + 2})"})
                 continue
-            v = S.PROVERS[eng](ohlc, cfg)
+            v = verdicts[(eng, sym)]
             trades = int(v.get("trades", 0))
             insufficient = trades < S.SIG_MIN_N
-            # Per-test candidacy: clears the binomial significance gate (p<alpha, n>=SIG_MIN_N) AND
+            # Per-test candidacy: clears the return significance gate (p<alpha, n>=SIG_MIN_N) AND
             # the prover's own edge floor. Family-wide FDR (below) can only DEMOTE this, never add.
             per_test = bool(v.get("edgeProven")) and bool(v.get("ok"))
             c = {
@@ -321,17 +446,25 @@ def gate_rerun(store, symbols, engines, cfg=None) -> dict:
                 "pEdge": v.get("pEdge", 1.0), "proven": per_test, "insufficient": insufficient,
                 "reason": ""}
             contracts.append(c)
-            if trades > 0:
-                testable.append((c, v.get("pEdge", 1.0)))
+            testable.append((c, v.get("pEdge", 1.0)))
         if contracts:
             engine_reports.append({"engine": eng, "status": None, "contracts": contracts})
+
+    retired_debt_n = 0
+    for alias in S.DUPLICATE_ENGINE_ALIASES:
+        if alias not in engines:
+            continue
+        for sym in syms:
+            if len(series.get(sym, [])) >= lookback + 2:
+                testable.append((None, 1.0))
+                retired_debt_n += 1
 
     # Grid-wide FDR control across every testable cell — a per-test candidate that does not survive
     # the family-wide correction is demoted to no-edge, honestly labeled.
     survivors = _benjamini_hochberg([p for (_, p) in testable], q)
-    kept = {id(testable[i][0]) for i in survivors}
+    kept = {id(testable[i][0]) for i in survivors if testable[i][0] is not None}
     m = len(testable)
-    for c in (c for (c, _) in testable):
+    for c in (c for (c, _) in testable if c is not None):
         if c["proven"] and id(c) not in kept:
             c["proven"] = False
             c["fdrRejected"] = True
@@ -369,12 +502,15 @@ def gate_rerun(store, symbols, engines, cfg=None) -> dict:
         "label": ("Re-run of the edge-gate on YOUR captured bars — reproducible, not a promise, no "
                   "performance guaranteed."),
         "source": "your own captured bars (this Mac's store)",
+        "compute": compute,
         "prover_sha": S.prover_source_sha(),
         "sigMinN": S.SIG_MIN_N,
         "alpha": S.SIG_ALPHA,
-        "test": "one-sided binomial vs R-geometry breakeven",
+        "test": "one-sided realized-mean-R Student-t with Newey-West serial-dependence variance",
         "symbols": syms,
         "engineCount": len(engine_reports),
+        "fdrHypothesisCount": m,
+        "fdrRetiredDebtCount": retired_debt_n,
         "candidateCount": candidate_n,
         "noEdgeCount": no_edge_n,
         "insufficientCount": insufficient_n,
@@ -386,7 +522,7 @@ def gate_rerun(store, symbols, engines, cfg=None) -> dict:
 
 def _lab_fold(engine, ohlc, cfg, lookback, index, start_ts=None, end_ts=None) -> dict:
     """Run the SHIPPED prover on ONE contiguous fold of bars and surface only honest OOS statistics:
-    the trade count n, wins/losses, net points, max-drawdown-R and the one-sided binomial p-value.
+    the trade count n, wins/losses, net points, max-drawdown-R and the one-sided return p-value.
     A fold with < SIG_MIN_N OOS trades is 'insufficient' — significance is NOT assessed and it is
     never 'proven'. NO aggregate win-rate/$ headline is derived here."""
     bars = len(ohlc)
@@ -427,7 +563,7 @@ def backtest_lab(store, engine: str, symbol: str, start_ts=None, end_ts=None,
     """No-code backtest lab (item 10): run the SAME SHIPPED prover (bltd_store.PROVERS[engine]) on
     ONE (engine, symbol) over the buyer's OWN captured bars, optionally restricted to the epoch-second
     window [start_ts, end_ts] and split into `folds` contiguous, non-overlapping folds. Returns per
-    fold the OOS trade count n / wins / losses / net points / max-drawdown-R / one-sided binomial
+    fold the OOS trade count n / wins / losses / net points / max-drawdown-R / one-sided mean-R
     p-value, plus one whole-range row, stamped with the prover-source sha256 so the buyer can
     reproduce it (`shasum -a 256 bltd_store.py`). A fold with < SIG_MIN_N OOS trades is reported
     honestly as 'insufficient' (significance not assessed, never 'proven'). NO aggregate win-rate /
@@ -439,10 +575,14 @@ def backtest_lab(store, engine: str, symbol: str, start_ts=None, end_ts=None,
     head = {"kind": "backtest_lab", "available": False, "engine": engine, "symbol": symbol,
             "label": label, "source": "your own captured bars (this Mac's store)",
             "prover_sha": S.prover_source_sha(), "sigMinN": S.SIG_MIN_N, "alpha": S.SIG_ALPHA,
-            "test": "one-sided binomial vs R-geometry breakeven",
+            "test": "one-sided realized-mean-R Student-t with Newey-West serial-dependence variance",
             "startTs": start_ts, "endTs": end_ts, "folds": [], "whole": None, "reason": ""}
     if engine not in S.PROVERS:
         head["reason"] = f"unknown engine '{engine}'"
+        return head
+    if engine in S.DUPLICATE_ENGINE_ALIASES:
+        head["reason"] = (f"'{engine}' is a retired duplicate hypothesis; use canonical engine "
+                          f"'{S.DUPLICATE_ENGINE_ALIASES[engine]}'")
         return head
     if not S.in_scope(symbol):
         head["reason"] = f"'{symbol}' is not a recognized instrument"
@@ -498,18 +638,17 @@ import concurrent.futures as _futures  # noqa: E402
 import itertools as _itertools          # noqa: E402
 import os as _os                         # noqa: E402
 
-# Per-engine sweep grids. Every key here is a hyperparameter the SHIPPED prover already reads from
-# cfg (see bltd_store CONFIG_DEFAULTS) — the farm only varies existing knobs, it invents no math.
+# Per-engine exploratory grids. These are intentionally the same predeclared cells used by the
+# bounded nested optimizer. The farm is a SELECTION screen on one captured slice; it is not
+# confirmation evidence and cannot adopt or enable a strategy.
 _FARM_GRIDS = {
-    "meanrev":  {"lookback": [10, 20, 30], "mrZ": [1.5, 2.0, 2.5],
-                 "mrTgtFrac": [0.4, 0.6, 0.8], "mrStopMult": [6.0, 10.0]},
+    "meanrev":  {"lookback": [10, 20], "mrZ": [1.5, 2.0, 2.5],
+                 "mrTgtFrac": [0.4, 0.6, 0.8], "mrStopMult": [6.0, 8.0, 10.0]},
     "breakout": {"lookback": [10, 20, 30, 40], "bkTargetR": [1.0, 1.5, 2.0, 2.5, 3.0]},
-    "research": {"lookback": [10, 20, 30, 40], "bkTargetR": [1.0, 1.5, 2.0, 2.5, 3.0]},
 }
-# The consensus family (momentum/structure/regime/channel/context_*) shares the same two universal
-# knobs the prover honours; its geometry (ATR stop / fixed 2:1 target) is deliberately NOT swept so a
-# runner can't snoop the reward:risk cap.
-_FARM_GRID_CONSENSUS = {"lookback": [8, 12, 20, 30], "oosFrac": [0.3, 0.4, 0.5]}
+# The consensus family shares one effective knob. `oosFrac` is deliberately absent: the farm already
+# receives an isolated series, and sweeping it produced duplicate cells with identical trades.
+_FARM_GRID_CONSENSUS = {"lookback": [8, 12, 20, 30]}
 _FARM_MAX_CELLS = 256  # hard ceiling on grid size so a farm run is always bounded
 
 
@@ -593,7 +732,9 @@ def backtest_farm(store, engine: str, symbol: str, start_ts=None, end_ts=None,
     TRIED, the honest OOS statistics (n / wins / losses / net points / max-drawdown-R) and a
     Benjamini–Hochberg FDR-corrected p (`pEdgeAdj`) computed across the WHOLE grid. It NEVER surfaces
     a raw best-cell p — that would be a multiple-comparisons lie. A cell with < SIG_MIN_N OOS trades
-    is 'insufficient' (significance not assessed, never 'proven'). NO aggregate win-rate / equity / $
+    is 'insufficient' (significance not assessed). A surviving cell is only a screening hit; it must
+    pass the separately reserved nested-confirmation protocol before it is even a research candidate.
+    NO aggregate win-rate / equity / $
     figure. Stamped with prover_sha so the buyer can reproduce it. Nothing is downloaded or invented;
     an empty / too-thin store yields an honest empty verdict.
 
@@ -603,20 +744,26 @@ def backtest_farm(store, engine: str, symbol: str, start_ts=None, end_ts=None,
     base_cfg = dict(cfg)
     lookback = cfg.get("lookback", S.LOOKBACK)
     q = cfg.get("fdrQ", 0.10)
-    label = ("Parameter sweep of the SHIPPED edge-gate prover on YOUR captured bars only — "
-             "reproducible, NOT a promise, no performance guaranteed.")
+    label = ("Selection-only parameter sweep of the SHIPPED edge-gate prover on YOUR captured bars — "
+             "reproducible, NOT a promise, never live-adopted.")
     overfit_note = ("Best-of-N parameter search inflates significance. Every p below is "
                     "Benjamini–Hochberg FDR-corrected across all cells tried; a raw best-cell "
-                    "p is never shown.")
+                    "p is never shown. A screening hit still requires independent nested confirmation.")
     head = {"kind": "backtest_farm", "available": False, "engine": engine, "symbol": symbol,
             "label": label, "overfitNote": overfit_note,
             "source": "your own captured bars (this Mac's store)",
             "prover_sha": S.prover_source_sha(), "sigMinN": S.SIG_MIN_N, "alpha": S.SIG_ALPHA,
-            "fdrQ": q, "test": "one-sided binomial vs R-geometry breakeven, BH-FDR corrected across the grid",
+            "fdrQ": q,
+            "test": ("one-sided realized-mean-R Student-t with Newey-West serial-dependence "
+                     "variance, BH-FDR corrected across the grid"),
             "cores": _os.cpu_count() or 1, "startTs": start_ts, "endTs": end_ts,
             "cells": [], "best": None, "cellsTried": 0, "reason": ""}
     if engine not in S.PROVERS:
         head["reason"] = f"unknown engine '{engine}'"
+        return head
+    if engine in S.DUPLICATE_ENGINE_ALIASES:
+        head["reason"] = (f"'{engine}' is a retired duplicate hypothesis; use canonical engine "
+                          f"'{S.DUPLICATE_ENGINE_ALIASES[engine]}'")
         return head
     if not S.in_scope(symbol):
         head["reason"] = f"'{symbol}' is not a recognized instrument"
@@ -655,43 +802,46 @@ def backtest_farm(store, engine: str, symbol: str, start_ts=None, end_ts=None,
     # ── family-wide BH-FDR correction across every cell's raw p ────────────────
     adj = _bh_adjusted_pvalues([r["_pRaw"] for r in results])
     cells = []
-    proven_n = insuff_n = suff_n = 0
+    selection_n = insuff_n = suff_n = 0
     for r, a in zip(results, adj):
         insufficient = r["insufficient"]
-        proven = (not insufficient) and r["_edgeFloor"] and (a <= q)
+        selection_hit = (not insufficient) and r["_edgeFloor"] and (a <= q)
         if insufficient:
             insuff_n += 1
             reason = (f"insufficient sample — {r['trades']} OOS trades, need ≥{S.SIG_MIN_N} "
                       f"before significance can be assessed")
         else:
             suff_n += 1
-            if proven:
-                proven_n += 1
-                reason = (f"candidate — win {r['winRate'] * 100:.1f}% / net {r['netPts']:+.2f} pts on "
-                          f"{r['trades']} trades (FDR-adj p={a:.3f}); research only, live verification required")
+            if selection_hit:
+                selection_n += 1
+                reason = (f"selection-screen hit — {r['trades']} OOS trades "
+                          f"(FDR-adj p={a:.3f}); independent nested confirmation required, "
+                          "not adopted for live use")
             else:
-                reason = (f"no edge — win {r['winRate'] * 100:.1f}% / net {r['netPts']:+.2f} pts on "
-                          f"{r['trades']} OOS trades (FDR-adj p={a:.3f} > q={q:.2f})")
+                reason = (f"no screening hit — {r['trades']} OOS trades "
+                          f"(FDR-adj p={a:.3f} > q={q:.2f})")
         cells.append({
             "params": r["params"], "trades": r["trades"], "wins": r["wins"], "losses": r["losses"],
             "winRate": r["winRate"], "netPts": r["netPts"], "expectancyR": r["expectancyR"],
             "maxDrawdownR": r["maxDrawdownR"], "pEdgeAdj": round(a, 6),
-            "proven": proven, "insufficient": insufficient, "reason": reason,
+            "selectionHit": selection_hit, "insufficient": insufficient, "reason": reason,
         })
-    # deterministic order: proven first, then sufficient, then by adjusted p ascending
-    cells.sort(key=lambda c: (not c["proven"], c["insufficient"], c["pEdgeAdj"]))
+    # deterministic order: selection-screen hits first, then sufficient, then adjusted p ascending.
+    cells.sort(key=lambda c: (not c["selectionHit"], c["insufficient"], c["pEdgeAdj"]))
     head["cells"] = cells
     head["cellsTried"] = len(cells)
-    head["provenCells"] = proven_n
+    head["selectionHits"] = selection_n
     head["cellsInsufficient"] = insuff_n
     head["cellsSufficient"] = suff_n
     head["available"] = True
 
     # ── the best cell: honest either way, always by ADJUSTED p ─────────────────
     sufficient_cells = [c for c in cells if not c["insufficient"]]
-    if proven_n > 0:
+    if selection_n > 0:
         head["best"] = cells[0]
-        head["status"] = "candidate"
+        head["status"] = "screening_hit"
+        head["reason"] = ("selection screen found one or more cells; independent nested confirmation "
+                          "is required and no strategy was adopted")
     elif sufficient_cells:
         best = min(sufficient_cells, key=lambda c: c["pEdgeAdj"])
         head["best"] = best
@@ -720,9 +870,10 @@ def render_farm_payload(report: dict) -> str:
              report["overfitNote"]]
     best = report.get("best")
     status = report.get("status")
-    if status == "candidate" and best:
-        lines.append(f"Best cell: candidate on {best['trades']} OOS trades "
-                     f"(FDR-adj p={best['pEdgeAdj']:.3f}) — research only, live verification required.")
+    if status == "screening_hit" and best:
+        lines.append(f"Best cell: selection-screen hit on {best['trades']} OOS trades "
+                     f"(FDR-adj p={best['pEdgeAdj']:.3f}) — independent nested confirmation "
+                     "required; not adopted.")
     elif status == "no_edge" and best:
         lines.append(f"Verdict: NO EDGE — no parameter set beat the correction "
                      f"(best FDR-adj p={best['pEdgeAdj']:.3f} on {best['trades']} trades).")
@@ -732,20 +883,20 @@ def render_farm_payload(report: dict) -> str:
 
 
 def farm_sample_payloads() -> list[str]:
-    """Representative rendered farm payloads for the claim linter — a candidate case, a no-edge case,
+    """Representative rendered farm payloads for the claim linter — a screening-hit case, a no-edge case,
     and an insufficient case. Mirrors bltd_alerts.linter_sample_payloads: the linter renders these so
     a fabricated figure reaching the farm's text surface fails the build."""
-    candidate = {"available": True, "engine": "meanrev", "symbol": "ES", "cellsTried": 54,
+    screening = {"available": True, "engine": "meanrev", "symbol": "ES", "cellsTried": 54,
                  "overfitNote": ("Best-of-N parameter search inflates significance. Every p is "
                                  "Benjamini–Hochberg FDR-corrected; a raw best-cell p is never shown."),
-                 "status": "candidate",
+                 "status": "screening_hit",
                  "best": {"trades": 42, "pEdgeAdj": 0.031}}
     no_edge = {"available": True, "engine": "breakout", "symbol": "NQ", "cellsTried": 20,
-               "overfitNote": candidate["overfitNote"], "status": "no_edge",
+               "overfitNote": screening["overfitNote"], "status": "no_edge",
                "best": {"trades": 61, "pEdgeAdj": 0.184}}
     insufficient = {"available": True, "engine": "regime", "symbol": "CL", "cellsTried": 12,
-                    "overfitNote": candidate["overfitNote"], "status": "insufficient", "best": None}
-    return [render_farm_payload(candidate), render_farm_payload(no_edge), render_farm_payload(insufficient)]
+                    "overfitNote": screening["overfitNote"], "status": "insufficient", "best": None}
+    return [render_farm_payload(screening), render_farm_payload(no_edge), render_farm_payload(insufficient)]
 
 
 # ===========================================================================

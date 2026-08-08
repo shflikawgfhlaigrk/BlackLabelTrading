@@ -491,7 +491,7 @@ enum OrderTicket {
         }
         func n(_ x: Double) -> String { String(format: "%.2f", x) }
         let szStr = size(r, account: account, riskPct: riskPct).map(String.init) ?? "—  (enter your own; $/pt unknown for this instrument)"
-        var out = "ORDER TICKET — manual copy. Place this on YOUR OWN platform (or arm the Execution engine).\n"
+        var out = "ORDER TICKET — manual copy. Review and place it on YOUR OWN platform.\n"
         out += "SYMBOL \(r.symbol)   SIDE \(r.direction.rawValue)   SIZE \(szStr)\n"
         out += "ENTRY \(n(r.entry))   STOP \(n(r.stop))   TARGET \(n(r.target))   R:R \(String(format: "%.2f", r.rr))\n"
         let trail = r.trailTiers.map { "T\($0.id)@\(n($0.trigger))→\(n($0.stop))" }.joined(separator: "  ")

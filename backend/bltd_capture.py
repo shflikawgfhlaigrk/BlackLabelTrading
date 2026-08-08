@@ -9,8 +9,7 @@ bars/ticks into the product's OWN SQLite store (bltd_store). It then runs the in
 
 ZERO third-party deps: the CDP WebSocket client is hand-rolled on the stdlib `socket` + a
 minimal RFC6455 implementation, so the product needs no `websockets`/`websocket-client` package.
-CAPTURE is read-only on the feed (only Network.enable); it never sends an order. Order entry is the
-separate bltd_exec engine (OFF by default), invoked after a fire. Never Yahoo.
+CAPTURE is read-only on the feed (only Network.enable); it has no broker-order path. Never Yahoo.
 Never fabricates a price — junk frames are dropped. Gates honestly when the feed is unreachable.
 
 Run:  python3 bltd_capture.py
@@ -34,6 +33,8 @@ from urllib.parse import quote, urlparse
 
 import bltd_store as S
 import bltd_parsers as P
+import bltd_paths      # cross-platform app-support / profile paths (macOS gold master + Windows W1)
+import bltd_browser    # cross-platform Chromium-family resolution + remote-debug launch
 
 log = logging.getLogger("bltd.capture")
 
@@ -42,8 +43,7 @@ CDP_HOSTS = ("127.0.0.1", "[::1]")
 WC_HOST = "wealthcharts.com"   # matches app.wealthcharts.com / www.wealthcharts.com
 BAR_SECONDS = int(os.environ.get("BLTD_BAR_SECONDS", "15"))
 LOOKBACK = int(os.environ.get("BLTD_LOOKBACK", "20"))
-ENGINES = ("meanrev", "breakout", "research", "momentum", "structure", "regime",
-           "channel", "context_a", "context_b")
+ENGINES = S.ACTIVE_ENGINE_FAMILY
 EDGE_GATE = os.environ.get("BLTD_EDGE_GATE", "1") != "0"
 MAX_BARS = 400
 # Stall watchdog: WC streams candles continuously while a chart is open (a flat market still
@@ -292,31 +292,23 @@ def watchdog_feed_available() -> bool:
 # the reference, but Chromium/Brave/Edge all speak the SAME CDP, so the buyer is NOT hard-blocked on a
 # single vendor — resolve the first one actually installed. If NONE is present we never pretend a
 # launch succeeded; we write an honest prerequisite sentinel the app surfaces (RC4 — no silent block).
-_CHROME_CANDIDATES = (
-    "/Applications/Google Chrome.app",
-    "/Applications/Chromium.app",
-    "/Applications/Brave Browser.app",
-    "/Applications/Microsoft Edge.app",
-)
+# Cross-platform browser resolution lives in bltd_browser (macOS `.app` bundles + Windows/Linux
+# executables, same CDP). Kept here as thin delegates so every existing caller and the daemon's
+# behavior on darwin are unchanged, while the Windows W1 port reuses the identical connect flow.
+_CHROME_CANDIDATES = bltd_browser._MAC_CANDIDATES
 
 
 def resolve_chrome() -> str | None:
     """The first installed Chromium-family browser (env override wins). None if nothing is installed."""
-    env = (os.environ.get("BLTD_CHROME_APP") or "").strip()
-    if env and os.path.isdir(env):
-        return env
-    for app in _CHROME_CANDIDATES:
-        if os.path.isdir(app):
-            return app
-    return None
+    return bltd_browser.resolve_browser()
 
 
 def chrome_present() -> bool:
-    return resolve_chrome() is not None
+    return bltd_browser.browser_present()
 
 
 def _support_dir() -> str:
-    return os.path.expanduser("~/Library/Application Support/Black Label Trading")
+    return bltd_paths.app_support_dir()
 
 
 def write_chrome_prereq() -> None:
@@ -339,8 +331,7 @@ def write_chrome_prereq() -> None:
 # Backwards-compatible module constant (messaging / default path). Launch functions re-resolve at
 # call time so a browser installed after startup is picked up without forcing a daemon restart.
 CHROME_APP = resolve_chrome() or _CHROME_CANDIDATES[0]
-CHROME_PROFILE = os.path.expanduser(os.environ.get(
-    "BLTD_CHROME_PROFILE", "~/Library/Application Support/Black Label Trading/chrome-topstepx"))
+CHROME_PROFILE = bltd_paths.chrome_profile_dir()
 # Don't let Chrome throttle the (possibly backgrounded) WC feed tab — same reason as Utah.
 _NO_THROTTLE = ("--disable-background-timer-throttling",
                 "--disable-backgrounding-occluded-windows",
@@ -356,7 +347,6 @@ def launch_chrome(source=None) -> bool:
     """Open the product's remote-debug Chrome on a supported browser source using a dedicated,
     product-owned profile. The buyer logs into THEIR platform here once; the session
     persists in the product's own profile dir. Never raises."""
-    import subprocess
     chrome = resolve_chrome()
     if not chrome:
         write_chrome_prereq()
@@ -364,18 +354,11 @@ def launch_chrome(source=None) -> bool:
         return False
     try:
         os.makedirs(CHROME_PROFILE, exist_ok=True)
-        subprocess.Popen(
-            ["open", "-g", "-n", "-a", chrome, "--args",
-             f"--remote-debugging-port={CDP_PORT}", "--remote-debugging-address=127.0.0.1",
-             # SECURITY: pin the CDP listener to loopback (off-machine TCP can't reach it). The
-             # "*" origin is a known residual — tightening it needs a live Chrome handshake test
-             # (the capture WS client sends no Origin header), so it is NOT changed blind here.
-             "--remote-allow-origins=*",
-             f"--user-data-dir={CHROME_PROFILE}", "--no-first-run",
-             "--no-default-browser-check", *_NO_THROTTLE, *_WINDOW,
-             _login_url_for(source)],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return True
+        # The loopback-pinned CDP flag set (incl. the known "--remote-allow-origins=*" residual)
+        # lives in bltd_browser so it is identical on macOS and the Windows port.
+        return bltd_browser.launch_debug_browser(
+            chrome, CDP_PORT, CHROME_PROFILE, [_login_url_for(source)],
+            extra_args=(*_NO_THROTTLE, *_WINDOW))
     except Exception as exc:  # noqa: BLE001
         log.warning("capture: chrome launch failed: %s", exc)
         return False
@@ -457,7 +440,6 @@ def browser_tab_present(source=None) -> bool:
 def _launch_chrome_multi(source=None) -> bool:
     """Open the product's remote-debug Chrome to the requested browser source. Only used when Chrome is cold —
     never piles tabs onto a running Chrome. Never raises."""
-    import subprocess
     chrome = resolve_chrome()
     if not chrome:
         write_chrome_prereq()
@@ -465,18 +447,12 @@ def _launch_chrome_multi(source=None) -> bool:
         return False
     try:
         os.makedirs(CHROME_PROFILE, exist_ok=True)
-        subprocess.Popen(
-            ["open", "-g", "-n", "-a", chrome, "--args",
-             f"--remote-debugging-port={CDP_PORT}", "--remote-debugging-address=127.0.0.1",
-             # SECURITY: pin the CDP listener to loopback (off-machine TCP can't reach it). The
-             # "*" origin is a known residual — tightening it needs a live Chrome handshake test
-             # (the capture WS client sends no Origin header), so it is NOT changed blind here.
-             "--remote-allow-origins=*",
-             f"--user-data-dir={CHROME_PROFILE}", "--no-first-run",
-             "--no-default-browser-check", *_NO_THROTTLE, _login_url_for(source)],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        _mark_browser_opened(source)
-        return True
+        ok = bltd_browser.launch_debug_browser(
+            chrome, CDP_PORT, CHROME_PROFILE, [_login_url_for(source)],
+            extra_args=(*_NO_THROTTLE,))
+        if ok:
+            _mark_browser_opened(source)
+        return ok
     except Exception as exc:  # noqa: BLE001
         log.warning("capture: chrome launch failed: %s", exc)
         return False
@@ -529,26 +505,23 @@ class Capture:
         self.store = store
         cfg = store.config()
         # Buyer-tuned config wins; constructor args (tests) override; module defaults last.
+        self._bar_seconds_override = bar_seconds
+        self._lookback_override = lookback
+        self._edge_gate_override = edge_gate
         self.bar_seconds = bar_seconds if bar_seconds is not None else cfg.get("barSeconds", BAR_SECONDS)
         self.lookback = lookback if lookback is not None else cfg.get("lookback", LOOKBACK)
         self.edge_gate = edge_gate if edge_gate is not None else cfg.get("edgeGate", EDGE_GATE)
         self.engines = tuple(cfg.get("engines", ENGINES)) or ENGINES
         self.symbol_filter = {"ES"}          # legacy attr (unused); scope now via S.in_scope
         self.alert_webhook = cfg.get("alertWebhook", "")
-        # Execution engine — DEFAULT is a DisarmedExecutor no-op (make_executor falls back to it on
-        # ANY construction error), so capture is byte-identical to signals-only unless the buyer has
-        # explicitly armed live execution. A LIVE order is then still impossible unless every gate in
-        # bltd_exec.precheck passes (arm+live+own-creds+firm-ToS+risk+edge+kill-clear+confirm).
-        try:
-            import bltd_exec
-            self.executor = bltd_exec.make_executor(store)
-        except Exception:  # noqa: BLE001 — no execution if the engine can't load (fail-safe)
-            class _Noop:
-                def on_fire(self, *a, **k): return None
-            self.executor = _Noop()
         self.buf = {}                      # symbol -> [(epoch, close), ...] still-forming
         self.last_key = {}                 # symbol -> last persisted bar_key
         self.last_sig = {}                 # (engine, symbol) -> last direction (fire on flip)
+        self.last_evaluated_bar = {}       # symbol -> newest closed bar already evaluated this process
+        # symbol -> (preceding closed-bar ts, first observed price of the new forming bar). Set only
+        # on a bucket transition this process witnessed, so a mid-bar daemon restart never labels
+        # an arbitrary later tick as the open.
+        self.next_bar_open = {}
         # In-memory write buffers. The frame read loop touches ONLY these (pure memory, as fast as
         # a bare reader); a separate flusher thread (see _flusher_loop) batches them into SQLite
         # every ~0.3s. Doing a SQLite write per candle in the read loop (a fresh connection each)
@@ -588,6 +561,7 @@ class Capture:
         prev = self.last_key.get(sym)
         if prev is not None and key > prev:
             self._roll(sym)
+            self.next_bar_open[sym] = (key * self.bar_seconds, float(close))
         self.last_key[sym] = max(key, self.last_key.get(sym, key))
 
     def _roll(self, sym: str):
@@ -628,49 +602,107 @@ class Capture:
         _evaluator_loop thread, decoupled from frame ingestion, so the heavy edge-gate work can
         never stall live capture. Symbols come from the store, not the read loop, so this path
         shares no mutable frame state with on_candle."""
+        cfg = self.store.config()
+        # Settings are buyer-tunable at runtime. Reload the evaluator contract each cycle unless a
+        # test/embedding explicitly supplied a constructor override.
+        if self._lookback_override is None:
+            self.lookback = cfg.get("lookback", LOOKBACK)
+        if self._edge_gate_override is None:
+            self.edge_gate = cfg.get("edgeGate", EDGE_GATE)
+        self.engines = tuple(cfg.get("engines", ENGINES)) or ENGINES
+        self.alert_webhook = cfg.get("alertWebhook", "")
         syms = self.store.symbols()
-        active = (set(syms.get("live", [])) | set(syms.get("liveTicks", []))
-                  | set(syms.get("backtestable", [])))
-        for sym in active:
+        # Backtestable is a research catalog, NOT evidence that a symbol is currently producing.
+        # Unioning it here made every historical contract re-evaluate forever and allowed a stale
+        # endpoint to fire after each daemon restart. A fresh CLOSED bar is the live-fire floor.
+        active = set(syms.get("live", []))
+        if not active:
+            return
+        latest_by_symbol = {sym: self.store.latest_bar_ts(sym) for sym in active}
+        changed = {
+            sym for sym, latest in latest_by_symbol.items()
+            if latest is not None and self.last_evaluated_bar.get(sym) != latest
+        }
+        # The evaluator wakes every eight seconds for liveness, while default bars close every
+        # fifteen. Do no research work when the immutable closed-bar endpoint is unchanged.
+        if not changed:
+            return
+        gate_rows = None
+        if self.edge_gate:
             try:
-                self._evaluate(sym)
+                import bltd_analytics
+                family_symbols = list(syms.get("backtestable", []))
+                rows = bltd_analytics.screen(
+                    self.store, family_symbols, list(self.engines), cfg)
+                gate_rows = {(r.get("engine"), r.get("symbol")): r for r in rows}
+            except Exception as exc:  # noqa: BLE001 — family gate failure pauses every live fire
+                log.info("evaluate_all: family-wide edge gate unavailable: %s", exc)
+                gate_rows = {}
+        for sym in changed:
+            try:
+                self.store.grade_open_fires(sym)
+                self._evaluate(sym, gate_rows=gate_rows)
+                self.last_evaluated_bar[sym] = latest_by_symbol[sym]
             except Exception as exc:  # noqa: BLE001 — one symbol's failure must not stop the rest
                 log.info("evaluate_all: %s failed: %s", sym, exc)
 
-    def _evaluate(self, sym: str):
-        ohlc = self.store.ohlc(sym)
-        if len(ohlc) < self.lookback + 1:
+    def _evaluate(self, sym: str, gate_rows=None):
+        # A signal is knowable only at a CLOSED bar, while its causal entry is the NEXT bar's
+        # observable open. When this capture process witnessed the bucket transition, evaluate the
+        # newest closed row immediately against that first forming-bar tick. A cold/restarted
+        # process never invents an open from a mid-bar tick; once the bar closes, its stored OHLC
+        # supports the same causal catch-up using penultimate signal + newest entry row.
+        timestamped = self.store.ohlc_between_timestamped(
+            sym, limit=S.LIVE_ENGINE_BARS)
+        if len(timestamped) < self.lookback + 1:
+            return
+        latest_ts = int(timestamped[-1][4])
+        observed = self.next_bar_open.get(sym)
+        if observed and int(observed[0]) == latest_ts:
+            signal_rows = timestamped
+            entry_open = float(observed[1])
+        else:
+            if len(timestamped) < self.lookback + 2:
+                return
+            signal_rows = timestamped[:-1]
+            entry_open = float(timestamped[-1][0])
+        signal_ohlc = [row[:4] for row in signal_rows]
+        signal_bar_ts = int(signal_rows[-1][4])
+        cfg = self.store.config()
+        tick_size = S._research_tick_size(cfg)
+        if tick_size is None:
             return
         for eng in self.engines:
-            sig = self._signal(eng, ohlc)
+            sig = self._signal(eng, signal_ohlc, entry_open=entry_open)
+            direction = sig.get("direction") if sig else None
             prev = self.last_sig.get((eng, sym))
-            self.last_sig[(eng, sym)] = sig["direction"] if sig else None
-            if not sig or not sig["direction"] or sig["direction"] == prev:
-                continue   # fire only on appear/flip, never on every extended bar
+            self.last_sig[(eng, sym)] = direction
+            edge_ok = True
+            verdict = None
             if self.edge_gate:
-                verdict = self.store.edge_ok(eng, sym)
-                if not verdict.get("ok"):
+                if gate_rows is None:
+                    verdict = self.store.edge_ok(eng, sym)
+                    edge_ok = bool(verdict.get("ok"))
+                else:
+                    verdict = gate_rows.get((eng, sym))
+                    edge_ok = bool(verdict and verdict.get("edge"))
+                if direction and not edge_ok and direction != prev:
                     log.info("suppressed %s %s %s (no edge: %s)", eng, sym,
-                             sig["direction"], verdict.get("reason", ""))
-                    continue
-            self.store.record_fire(eng, sig["direction"], entry=ohlc[-1][3], symbol=sym,
-                                   stop=sig.get("stop"), target=sig.get("target"),
-                                   rationale=sig.get("rationale"), synthetic=False)
-            log.info("FIRE %s %s %s @ %.4f", eng, sym, sig["direction"], ohlc[-1][3])
-            self._alert(eng, sym, sig, ohlc[-1][3])
-            self._execute(eng, sym, sig, ohlc[-1][3], len(ohlc))
-
-    def _execute(self, engine, symbol, sig, entry, bar_key):
-        """Hand a gate-passing fire to the EXECUTION engine. Best-effort, never raises into capture.
-        The executor defaults to a DisarmedExecutor no-op (and precheck fails closed) so this is a
-        pure signals-only no-op unless the buyer has explicitly armed live execution with their own
-        creds, their firm permits it, and every risk/edge/kill gate passes (see bltd_exec)."""
-        try:
-            self.executor.on_fire(symbol, sig["direction"], entry, sig.get("stop"),
-                                  sig.get("target"), engine, bar_key)
-        except Exception as exc:  # noqa: BLE001 — execution must NEVER stop capture
-            log.info("executor on_fire skipped: %s", exc)
-
+                             direction, (verdict or {}).get("reason", ""))
+            inserted = self.store.record_signal_evaluation(
+                eng, sym, direction, edge_ok, signal_bar_ts,
+                entry=(sig.get("entry") if sig and direction else None),
+                stop=(sig.get("stop") if sig else None),
+                target=(sig.get("target") if sig else None),
+                rationale=(sig.get("rationale") if sig else None),
+                max_hold=(S._breakout_max_hold(cfg)
+                          if eng in ("breakout", "research") else S.MR_MAX_HOLD),
+                tick_size=tick_size)
+            if inserted <= 0:
+                continue
+            entry = sig["entry"]
+            log.info("FIRE %s %s %s @ %.4f", eng, sym, direction, entry)
+            self._alert(eng, sym, sig, entry)
     def _alert(self, engine, symbol, sig, entry):
         """Mirror a real fire out to the buyer's configured alert channel (webhook). Best-effort,
         signals-only — never blocks capture, never raises, never executes anything."""
@@ -699,9 +731,35 @@ class Capture:
         "context_a": S._context_a_signal, "context_b": S._context_b_signal,
     }
 
-    def _signal(self, engine: str, ohlc):
-        """Current live signal for *engine* on the latest bar — same geometry the gate proves."""
+    def _signal(self, engine: str, ohlc, entry_open=None):
+        """Signal on ``ohlc[-1]`` with optional causal next-bar-open geometry.
+
+        Without ``entry_open`` this retains the narrow signal-inspection behavior used by the UI
+        tests. Production passes the next observable open, matching every canonical prover: entry
+        is adversely rounded first, then stop/target orders are rounded conservatively and fixed
+        around that entry.
+        """
+        cfg = self.store.config()
         closes = [b[3] for b in ohlc]
+
+        def causal_geometry(direction, raw_entry, stop, target, rationale):
+            tick_size = S._research_tick_size(cfg)
+            if tick_size is None:
+                return None
+            entry = S._round_fill(raw_entry, direction, tick_size, is_entry=True)
+            order_stop = S._round_order_level(stop, direction, "stop", tick_size)
+            order_target = S._round_order_level(target, direction, "target", tick_size)
+            if entry is None or order_stop is None or order_target is None:
+                return None
+            if direction == "long":
+                valid = order_stop <= entry < order_target
+            else:
+                valid = order_target < entry <= order_stop
+            if not valid:
+                return None
+            return {"direction": direction, "entry": entry, "stop": order_stop,
+                    "target": order_target, "rationale": rationale}
+
         if engine == "meanrev":
             prior = closes[-self.lookback - 1:-1]
             if len(prior) < self.lookback:
@@ -711,31 +769,91 @@ class Capture:
             if var <= 0:
                 return None
             sd = var ** 0.5
-            entry = closes[-1]
-            z = (entry - mean) / sd
-            if z <= -S.MR_Z:
-                return {"direction": "long", "stop": entry - S.MR_STOP_MULT * sd,
-                        "target": entry + S.MR_TGT_FRAC * (mean - entry),
-                        "rationale": f"z={z:.2f} <= -{S.MR_Z}: revert up to mean"}
-            if z >= S.MR_Z:
-                return {"direction": "short", "stop": entry + S.MR_STOP_MULT * sd,
-                        "target": entry - S.MR_TGT_FRAC * (entry - mean),
-                        "rationale": f"z={z:.2f} >= {S.MR_Z}: revert down to mean"}
+            signal_close = closes[-1]
+            z = (signal_close - mean) / sd
+            z_enter = cfg.get("mrZ", S.MR_Z)
+            stop_mult = cfg.get("mrStopMult", S.MR_STOP_MULT)
+            target_frac = cfg.get("mrTgtFrac", S.MR_TGT_FRAC)
+            if z <= -z_enter:
+                rationale = f"z={z:.2f} <= -{z_enter}: revert up to mean"
+                if entry_open is None:
+                    return {"direction": "long", "stop": signal_close - stop_mult * sd,
+                            "target": signal_close + target_frac * (mean - signal_close),
+                            "rationale": rationale}
+                entry = S._round_fill(entry_open, "long", S._research_tick_size(cfg),
+                                      is_entry=True)
+                if entry is None:
+                    return None
+                return causal_geometry(
+                    "long", entry, entry - stop_mult * sd,
+                    entry + target_frac * (mean - entry), rationale)
+            if z >= z_enter:
+                rationale = f"z={z:.2f} >= {z_enter}: revert down to mean"
+                if entry_open is None:
+                    return {"direction": "short", "stop": signal_close + stop_mult * sd,
+                            "target": signal_close - target_frac * (signal_close - mean),
+                            "rationale": rationale}
+                entry = S._round_fill(entry_open, "short", S._research_tick_size(cfg),
+                                      is_entry=True)
+                if entry is None:
+                    return None
+                return causal_geometry(
+                    "short", entry, entry + stop_mult * sd,
+                    entry - target_frac * (entry - mean), rationale)
             return None
         fn = self._SIG.get(engine)
         if fn:
-            return fn(closes, ohlc, self.lookback, self.store.config())
+            sig = fn(closes, ohlc, self.lookback, cfg)
+            if not sig or entry_open is None:
+                return sig
+            direction = sig.get("direction")
+            entry = S._round_fill(entry_open, direction, S._research_tick_size(cfg),
+                                  is_entry=True)
+            if entry is None:
+                return None
+            stop, target = S._atr_stop_target(
+                ohlc, entry, direction, S.MO_ATR_MULT, S.MO_TARGET_R)
+            return causal_geometry(
+                direction, entry, stop, target, sig.get("rationale", ""))
         # breakout / research are momentum-directional on the lookback range
         prior = closes[-self.lookback - 1:-1]
         if len(prior) < self.lookback:
             return None
         last = closes[-1]
         if last > max(prior):
-            return {"direction": "long", "stop": min(prior),
-                    "rationale": f"close {last:.4f} > {self.lookback}-bar high {max(prior):.4f}"}
+            stop = min(prior)
+            if entry_open is None:
+                target = last + cfg.get("bkTargetR", S.BK_TARGET_R) * (last - stop)
+                return {"direction": "long", "stop": stop, "target": target,
+                        "rationale": f"close {last:.4f} > {self.lookback}-bar high {max(prior):.4f}"}
+            entry = S._round_fill(entry_open, "long", S._research_tick_size(cfg),
+                                  is_entry=True)
+            order_stop = S._round_order_level(
+                stop, "long", "stop", S._research_tick_size(cfg))
+            if entry is None or order_stop is None:
+                return None
+            risk = abs(entry - order_stop) or abs(entry - float(stop))
+            target = entry + cfg.get("bkTargetR", S.BK_TARGET_R) * risk
+            return causal_geometry(
+                "long", entry, stop, target,
+                f"close {last:.4f} > {self.lookback}-bar high {max(prior):.4f}")
         if last < min(prior):
-            return {"direction": "short", "stop": max(prior),
-                    "rationale": f"close {last:.4f} < {self.lookback}-bar low {min(prior):.4f}"}
+            stop = max(prior)
+            if entry_open is None:
+                target = last - cfg.get("bkTargetR", S.BK_TARGET_R) * (stop - last)
+                return {"direction": "short", "stop": stop, "target": target,
+                        "rationale": f"close {last:.4f} < {self.lookback}-bar low {min(prior):.4f}"}
+            entry = S._round_fill(entry_open, "short", S._research_tick_size(cfg),
+                                  is_entry=True)
+            order_stop = S._round_order_level(
+                stop, "short", "stop", S._research_tick_size(cfg))
+            if entry is None or order_stop is None:
+                return None
+            risk = abs(entry - order_stop) or abs(entry - float(stop))
+            target = entry - cfg.get("bkTargetR", S.BK_TARGET_R) * risk
+            return causal_geometry(
+                "short", entry, stop, target,
+                f"close {last:.4f} < {self.lookback}-bar low {min(prior):.4f}")
         return None
 
 

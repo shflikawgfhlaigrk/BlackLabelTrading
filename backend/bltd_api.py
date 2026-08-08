@@ -26,7 +26,8 @@ Endpoints (Bearer token from /auth/signin required on /api/*):
   GET  /api/gate/rerun?symbols=&engines=  -> {available,prover_sha,sigMinN,alpha,engines:[{engine,status,contracts:[{n,wins,losses,maxDrawdownR,pEdge...}]}], ...}
   GET  /api/backtest/run?engine=&symbol=&start=&end=&folds= -> {available,prover_sha,whole,folds:[{fold,trades,wins,losses,maxDrawdownR,pEdge,insufficient...}]}  (no-code lab)
   GET  /api/backtest/bounds?symbol=       -> {symbol, count, firstTs, lastTs}  (date-range defaults for the lab)
-  GET  /api/backtest/farm?engine=&symbol=&start=&end=&workers= -> {available,prover_sha,cellsTried,provenCells,cells:[{params,trades,wins,losses,maxDrawdownR,pEdgeAdj,proven,insufficient}],best,status}  (TR-19 own-silicon parameter-sweep farm; BH-FDR-corrected p per cell)
+  GET  /api/backtest/farm?engine=&symbol=&start=&end=&workers= -> {available,prover_sha,cellsTried,selectionHits,cells:[{params,trades,wins,losses,maxDrawdownR,pEdgeAdj,selectionHit,insufficient}],best,status}  (TR-19 own-silicon parameter-sweep farm; BH-FDR-corrected screening hits per cell)
+  GET  /api/research/optimizer/latest    -> latest completed bounded optimizer report (read-only)
   GET  /api/fires?limit=&symbol=&engine=  -> {fires:[{...}]}   (the signal journal)
   GET  /api/journal?symbol=&engine=       -> {graded, winRate, netPnl, byEngine}
   GET  /api/feed/sources                  -> {sources:[{key,label,kind,credFields,note}], active}
@@ -40,10 +41,11 @@ Instrument scope is set by bltd_store.in_scope. Release default is the Topstep E
 stale non-ES rows never populate the app. Developers can set BLTD_SCOPE=all for wider parser/feed
 tests; signals still fire only where the edge-gate proves an OOS edge per (engine, symbol).
 
-Run:  python3 bltd_api.py 8787
+Run:  python3 bltd_api.py 8793
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -56,13 +58,43 @@ from urllib.parse import parse_qs, urlparse
 import bltd_store
 import bltd_analytics
 import bltd_alerts   # TR-06 honest edge-gate alert delivery (off by default; buyer-owned endpoint)
+import bltd_paths
+
+RUNTIME_CONTRACT = "bltd-signals-only-runtime-v1"
+BUILD_ID = str(os.environ.get("BLTD_BUILD") or "dev").strip()[:64] or "dev"
+BACKEND_SCRIPT = os.path.realpath(__file__)
+
+
+def _health_payload() -> dict:
+    """Exact runtime identity used by the bundle launcher during safe upgrade takeover."""
+    return {
+        "ok": True,
+        "service": "black-label-trading",
+        "build": BUILD_ID,
+        "runtimeContract": RUNTIME_CONTRACT,
+        "backendScript": BACKEND_SCRIPT,
+        "capabilities": {
+            "signals": True,
+            "execution": False,
+            "optimizerCompute": False,
+        },
+        "ts": time.time(),
+        "store": "pg" if USING_PG else "own",
+    }
 
 # A real deployment issues per-user tokens; for the local/dev backend any sign-in mints this.
-# SECURITY: never default to a publicly-known constant (the source ships in the repo). When
-# BLTD_TOKEN is unset, mint a RANDOM token per launch so a local attacker can't guess it; the
-# Swift app learns it the normal way, via POST /auth/signin. BLTD_TOKEN stays honored for
-# tests / a pinned dev value.
+# SECURITY: the app launcher passes only a 0600 token-file path into long-lived processes, never
+# the bearer token in argv. Direct tests/dev callers may still use BLTD_TOKEN for compatibility.
 def _resolve_token() -> str:
+    token_file = os.environ.get("BLTD_TOKEN_FILE")
+    if token_file:
+        try:
+            with open(token_file, encoding="utf-8") as handle:
+                token = handle.read(4097).strip()
+            if token and len(token) <= 4096:
+                return token
+        except OSError:
+            pass
     t = os.environ.get("BLTD_TOKEN")
     if t:
         return t
@@ -109,6 +141,20 @@ def _heartbeat_fresh(mtime, now, max_age=30.0) -> bool:
 # says "no edge". It is read-only, contains NO buyer data, and does not touch the store.
 _REFERENCE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reference_oos.json")
 _reference_cache = {"mtime": None, "payload": None}
+_OPTIMIZER_REPORT_MAX_BYTES = 64 * 1024 * 1024
+_OPTIMIZER_RESERVATION_KIND = "bltd_optimizer_reservation_v1"
+_OPTIMIZER_PROTOCOL_KIND = "bltd_bounded_nested_validation_v1"
+_OPTIMIZER_DISCLAIMER = (
+    "Research only — this report is not adopted, is not eligible for live use, and never changes "
+    "the buyer's configuration. Separate forward evidence and an explicit release process are "
+    "required before any parameter could be considered."
+)
+_OPTIMIZER_REPORT_FIELDS = {
+    "kind", "available", "label", "contracts", "engines", "costBandsPoints", "outerFolds",
+    "embargoBars", "priorFamilySize", "provenance", "folds", "researchCandidates",
+    "eligibleForLive", "adopted", "reason", "familyTestsThisRun", "familyTestsCumulative",
+    "reservationId", "generatedUTC", "researchOnly", "disclaimer", "hypothesisReservation",
+}
 
 
 def _load_reference() -> dict:
@@ -133,6 +179,148 @@ def _load_reference() -> dict:
                     "label": ("Reference only — computed on historical ES data, NOT your account, "
                               "NOT a promise, no performance guaranteed.")}
     return _reference_cache["payload"]
+
+
+def _optimizer_report_unavailable(reason: str) -> dict:
+    return {
+        "kind": "nested_strategy_validation",
+        "available": False,
+        "researchOnly": True,
+        "eligibleForLive": False,
+        "adopted": False,
+        "researchCandidates": [],
+        "reason": reason,
+        "label": ("Research only — no completed bounded optimizer report is available. "
+                  "This endpoint never computes research or changes configuration."),
+    }
+
+
+def _optimizer_hash(value) -> str:
+    raw = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        allow_nan=False).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _optimizer_sha256(value) -> bool:
+    return (isinstance(value, str) and len(value) == 64
+            and all(char in "0123456789abcdef" for char in value.lower()))
+
+
+def _optimizer_report_trusted(report) -> bool:
+    if not isinstance(report, dict):
+        return False
+    if set(report) - _OPTIMIZER_REPORT_FIELDS:
+        return False
+    provenance = report.get("provenance")
+    binding = report.get("hypothesisReservation")
+    if not isinstance(provenance, dict) or not isinstance(binding, dict):
+        return False
+    if (report.get("kind") != "nested_strategy_validation"
+            or report.get("available") is not True
+            or report.get("researchOnly") is not True
+            or report.get("eligibleForLive") is not False
+            or report.get("adopted") is not False
+            or report.get("disclaimer") != _OPTIMIZER_DISCLAIMER
+            or not isinstance(report.get("label"), str)
+            or "research only" not in report["label"].lower()
+            or not isinstance(report.get("reason"), str)
+            or not isinstance(report.get("researchCandidates"), list)
+            or not isinstance(report.get("folds"), list)
+            or not isinstance(report.get("generatedUTC"), str)):
+        return False
+
+    engine = binding.get("engine")
+    symbols = binding.get("symbols")
+    inputs = binding.get("inputHashes")
+    protocol = binding.get("protocol")
+    sources = binding.get("sourceHashes")
+    if (not isinstance(engine, str) or not engine
+            or not isinstance(symbols, list) or not 2 <= len(symbols) <= 8
+            or any(not isinstance(symbol, str) or not symbol for symbol in symbols)
+            or symbols != sorted(set(symbols))
+            or not isinstance(inputs, dict) or set(inputs) != set(symbols)
+            or not isinstance(protocol, dict)
+            or protocol.get("kind") != _OPTIMIZER_PROTOCOL_KIND
+            or not isinstance(sources, dict)):
+        return False
+    for symbol in symbols:
+        item = inputs.get(symbol)
+        if (not isinstance(item, dict)
+                or isinstance(item.get("bars"), bool)
+                or not isinstance(item.get("bars"), int)
+                or not 0 <= item["bars"] <= 30_000
+                or not _optimizer_sha256(item.get("sha256"))):
+            return False
+    for name in ("optimizerSha256", "proverSha256", "cliSha256"):
+        if not _optimizer_sha256(sources.get(name)):
+            return False
+    protocol_hash = binding.get("protocolHash")
+    source_hash = binding.get("sourceHash")
+    grid_hash = binding.get("gridSha256")
+    hypothesis_count = binding.get("hypothesisCount")
+    prior_family = binding.get("priorFamilySize")
+    if (protocol_hash != _optimizer_hash(protocol)
+            or source_hash != _optimizer_hash(sources)
+            or not _optimizer_sha256(grid_hash)
+            or isinstance(hypothesis_count, bool) or not isinstance(hypothesis_count, int)
+            or hypothesis_count <= 0
+            or isinstance(prior_family, bool) or not isinstance(prior_family, int)
+            or prior_family < 350):
+        return False
+    identity = {
+        "kind": _OPTIMIZER_RESERVATION_KIND,
+        "engine": engine,
+        "symbols": symbols,
+        "inputHashes": inputs,
+        "protocolHash": protocol_hash,
+        "gridSha256": grid_hash,
+        "sourceHash": source_hash,
+    }
+    if report.get("reservationId") != _optimizer_hash(identity):
+        return False
+    if (provenance.get("inputs") != inputs
+            or provenance.get("engines") != [engine]
+            or provenance.get("contracts") != symbols
+            or provenance.get("gridSha256") != grid_hash
+            or provenance.get("optimizerSha256") != sources["optimizerSha256"]
+            or provenance.get("proverSha256") != sources["proverSha256"]
+            or provenance.get("configSha256") != protocol.get("configSha256")
+            or not _optimizer_sha256(provenance.get("runId"))):
+        return False
+    for report_key, protocol_key in (
+            ("costBandsPoints", "costBandsPoints"),
+            ("outerFolds", "outerFolds"),
+            ("embargoBars", "embargoBars"),
+            ("priorFamilySize", None)):
+        expected = prior_family if protocol_key is None else protocol.get(protocol_key)
+        if report.get(report_key) != expected:
+            return False
+    return True
+
+
+def _load_optimizer_report() -> dict:
+    """Read the CLI's one atomically published report; never compute, adopt, or write."""
+    try:
+        with open(bltd_paths.optimizer_report_path(), "rb") as handle:
+            if os.fstat(handle.fileno()).st_size > _OPTIMIZER_REPORT_MAX_BYTES:
+                raise ValueError("optimizer report exceeds bounded size")
+            report = json.load(handle)
+    except FileNotFoundError:
+        return _optimizer_report_unavailable(
+            "no completed optimizer research report is available")
+    except (OSError, ValueError, TypeError, RecursionError, MemoryError):
+        return _optimizer_report_unavailable(
+            "the completed optimizer research report is unavailable or invalid")
+    try:
+        trusted = _optimizer_report_trusted(report)
+    except (ValueError, TypeError, RecursionError, MemoryError):
+        trusted = False
+    if not trusted:
+        return _optimizer_report_unavailable(
+            "the completed optimizer research report is unavailable or invalid")
+    return {key: report[key] for key in _OPTIMIZER_REPORT_FIELDS if key in report}
+
 
 # --- store selection ------------------------------------------------------
 # Default: the product's OWN SQLite store. The Utah Postgres DSN is an OPT-IN dev override only:
@@ -440,7 +628,7 @@ def _webhook_authorized(handler, parsed_url) -> bool:
 
 
 def _webhook_info(host_header: str) -> dict:
-    host = (host_header or f"127.0.0.1:{os.environ.get('BLTD_PORT', '8787')}").strip()
+    host = (host_header or f"127.0.0.1:{os.environ.get('BLTD_PORT', '8793')}").strip()
     endpoint = f"http://{host}/webhook/feed"
     example = {"symbol": "ESU6", "price": 6123.25, "ts": int(time.time())}
     return {"source": "webhook", "endpoint": endpoint,
@@ -465,98 +653,6 @@ def _evaluator_alive() -> bool:
         return False                          # no heartbeat file yet => evaluator not running
     except Exception:  # noqa: BLE001
         return False
-
-
-# --- execution control plane -----------------------------------------------------------------
-# Dedicated, auth-gated, single-purpose exec routes. Arm/mode/kill live in the store's exec_kv
-# table (NOT config), so a /api/config POST can never enable execution. Live mode additionally
-# requires a FRESH human OS-auth capability the Swift app sets after Touch ID/password — recorded
-# here as a short-lived expiry, never the shared signin token. KILL is the master override.
-import time as _time   # noqa: E402
-
-
-def _exec_command(path: str, body: dict) -> dict:
-    cmd = path[len("/api/exec/"):]
-    if cmd == "arm":
-        STORE.set_exec_kv("armed", "1")
-    elif cmd == "disarm":
-        STORE.set_exec_kv("armed", "0")
-    elif cmd == "kill":
-        # Master halt: set the flag AND drop the out-of-band sentinel file; flatten via the engine.
-        STORE.set_exec_kv("kill", "1")
-        try:
-            import bltd_exec
-            open(bltd_exec.kill_sentinel_path(os.path.dirname(STORE.path) or "."), "w").close()
-        except Exception:  # noqa: BLE001
-            pass
-        return {"ok": True, "kill": True}
-    elif cmd == "clearkill":
-        STORE.set_exec_kv("kill", "0")
-        try:
-            import bltd_exec
-            p = bltd_exec.kill_sentinel_path(os.path.dirname(STORE.path) or ".")
-            if os.path.exists(p):
-                os.remove(p)
-        except Exception:  # noqa: BLE001
-            pass
-    elif cmd == "mode":
-        mode = (body.get("mode") or "paper").strip().lower()
-        if mode == "live":
-            # Live requires the caller to present a fresh OS-auth capability (the Swift app does
-            # LocalAuthentication/Touch ID, then posts osAuth:true). Without it, live is refused.
-            if not body.get("osAuth"):
-                return {"ok": False, "error": "live mode requires a fresh device authentication"}
-            STORE.set_exec_kv("liveAuthExpiry", str(_time.time() + 300))   # 5-min capability window
-            STORE.set_exec_kv("mode", "live")
-        else:
-            STORE.set_exec_kv("mode", "paper")
-            STORE.set_exec_kv("liveAuthExpiry", "0")
-    elif cmd == "firm":
-        STORE.set_exec_kv("firm", str(body.get("firm", "")).strip().lower())
-        STORE.set_exec_kv("firmAck", "1" if body.get("ack") else "0")
-    elif cmd == "broker":
-        STORE.set_exec_kv("broker", str(body.get("broker", "")).strip().lower())
-    elif cmd == "creds":
-        # Record only the NON-SECRET broker username/account label + which broker. The API key itself
-        # is written by the Swift app to the macOS Keychain and never sent here (ship-no-data).
-        STORE.set_exec_kv("broker", str(body.get("broker", "projectx")).strip().lower())
-        STORE.set_exec_kv("execUser", str(body.get("username", "")))
-        STORE.set_exec_kv("execAccount", str(body.get("account", "")))
-    elif cmd == "confirm":
-        cid = str(body.get("clientOrderId", ""))
-        if cid:
-            STORE.exec_confirm_order(cid)
-    elif cmd == "confirmeachorder":
-        # Turning per-order confirm OFF is a live-risk relaxation: require a fresh OS-auth (Touch ID),
-        # exactly like going live. Turning it back ON (stricter) is always allowed without auth.
-        want = bool(body.get("enabled", True))
-        if not want and not body.get("osAuth"):
-            return {"ok": False, "error": "disabling per-order confirm requires a fresh device authentication"}
-        STORE.set_exec_kv("confirmEachOrder", "1" if want else "0")
-    elif cmd == "demovalidate":
-        # Mark that the buyer has validated the live order path on a broker DEMO/eval account. Until
-        # this is set, a live order on ANY account is blocked (the order code is built to the docs
-        # but unproven against the real endpoint). Requires a fresh OS-auth like going live.
-        if not body.get("osAuth"):
-            return {"ok": False, "error": "demo validation requires a fresh device authentication"}
-        STORE.set_exec_kv("demoValidated", "1" if body.get("validated", True) else "0")
-    else:
-        return {"ok": False, "error": f"unknown exec command '{cmd}'"}
-    return {"ok": True, **_exec_status()}
-
-
-def _exec_status() -> dict:
-    f = STORE.exec_flags()
-    cfg = STORE.config()
-    return {"armed": f["armed"], "mode": f["mode"], "kill": f["kill"], "firm": f["firm"],
-            "firmAck": f["firmAck"], "broker": f["broker"],
-            "brokerUser": STORE._exec_kv("execUser"), "brokerAccount": STORE._exec_kv("execAccount"),
-            "confirmEachOrder": f["confirmEachOrder"],
-            "liveAuthorized": STORE.exec_live_authorized(), "demoValidated": STORE.exec_demo_validated(),
-            "openContractsES": STORE.exec_open_contracts("ES"), "tradesToday": STORE.exec_trades_today(),
-            "dayRealizedLoss": STORE.exec_day_realized_loss(),
-            "maxContracts": cfg.get("execMaxContracts", 0), "maxDailyLossPct": cfg.get("maxDailyLossPct", 0),
-            "accountSize": cfg.get("accountSize", 0)}
 
 
 class Server(ThreadingHTTPServer):
@@ -625,13 +721,9 @@ class H(BaseHTTPRequestHandler):
                 return self._send(401, {"error": "unauthorized"})
             mgr = _feed_manager_if_exists()
             return self._send(200, mgr.disconnect() if mgr else {"state": "disconnected"})
-        if u.path.startswith("/api/exec/"):
-            if not self._authed():
-                return self._send(401, {"error": "unauthorized"})
-            return self._send(200, _exec_command(u.path, body if isinstance(body, dict) else {}))
         # TR-06 honest alert: post the edge-gate verdict (incl. "no edge") to the buyer's OWN
         # endpoint. OFF/no-endpoint => zero egress (bltd_alerts guards before any socket). This path
-        # can NEVER place an order — it imports nothing from bltd_exec.
+        # can NEVER place an order — the shipping backend has no order control plane.
         if u.path == "/api/alerts/test":
             if not self._authed():
                 return self._send(401, {"error": "unauthorized"})
@@ -652,14 +744,14 @@ class H(BaseHTTPRequestHandler):
         q = parse_qs(u.query)
         g = lambda k, d="": (q.get(k, [d])[0] or d)  # noqa: E731
         if u.path == "/health":
-            return self._send(200, {"ok": True, "ts": time.time(), "store": "pg" if USING_PG else "own"})
+            return self._send(200, _health_payload())
         if not u.path.startswith("/api/"):
             return self._send(404, {"error": "not found"})
         if not self._authed():
             return self._send(401, {"error": "unauthorized"})
         # Reference OOS verdicts (Black Label's own ES history, no buyer data) render in the app as an
         # EARNED edge-gate verdict ("no edge" / candidate). They were once served BEFORE this auth
-        # gate as "public research", which let a cold, UNAUTHENTICATED GET on :8787 scrape a signed
+        # gate as "public research", which let a cold, UNAUTHENTICATED GET on the local API scrape a signed
         # verdict the server cannot attribute to a buyer session — a fail-open (trading-analyst
         # 2026-07-23). FAIL CLOSED: the reference artifact requires the same per-launch Bearer token
         # as every other /api/* read. The app already holds that token before its reference screen
@@ -667,6 +759,8 @@ class H(BaseHTTPRequestHandler):
         if u.path == "/api/reference":
             return self._send(200, _load_reference())
         try:
+            if u.path == "/api/research/optimizer/latest":
+                return self._send(200, _load_optimizer_report())
             if u.path == "/api/meta":
                 return self._send(200, STORE.meta())
             if u.path == "/api/symbols":
@@ -693,10 +787,6 @@ class H(BaseHTTPRequestHandler):
                 return self._send(200, feed_manager().status())
             if u.path == "/api/webhook/info":
                 return self._send(200, _webhook_info(self.headers.get("Host", "")))
-            if u.path == "/api/exec/status":
-                return self._send(200, _exec_status())
-            if u.path == "/api/exec/orders":
-                return self._send(200, STORE.exec_orders(int(g("limit", "100"))))
             if u.path == "/api/studies":
                 sym = g("symbol")
                 ohlc = STORE.ohlc(sym, int(g("limit", "300")))
@@ -782,7 +872,7 @@ class H(BaseHTTPRequestHandler):
 
 
 def main():
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8787
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8793
     where = f"Postgres DSN (dev override)" if USING_PG else f"own store {STORE.path}"
     print(f"Black Label Trading API on http://127.0.0.1:{port}/  (data: {where})", flush=True)
     Server(("127.0.0.1", port), H).serve_forever()

@@ -111,7 +111,11 @@ def _apply_grid_fdr(cells: list[dict], q: float) -> int:
     per-test p<alpha verdict as "cleared significance", inflating candidateCount by grid size.
     Mutates each cell in place: proven -> False, fdrRejected -> True. It can only ever DEMOTE.
     """
-    testable = [c for c in cells if c["trades"] > 0]
+    # Every predeclared engine×contract cell belongs to the correction family. A completed active
+    # engine with zero trades is a tested null at p=1.0; a retired duplicate is permanent historical
+    # multiplicity debt at p=1.0. Dropping either would let today's activity shrink yesterday's
+    # family and loosen the threshold.
+    testable = list(cells)
     survivors = A._benjamini_hochberg([c["pEdge"] for c in testable], q)
     kept = {id(testable[i]) for i in survivors}
     m = len(testable)
@@ -126,9 +130,17 @@ def _load(cx, sym):
     rows = list(cx.execute(
         "SELECT o::float8,h::float8,l::float8,c::float8,extract(epoch from ts)::float8 "
         "FROM bars WHERE symbol=%s ORDER BY ts ASC, id ASC", (sym,)))
-    ohlc = [(r[0], r[1], r[2], r[3]) for r in rows if None not in (r[0], r[1], r[2], r[3])]
-    span = (rows[0][4], rows[-1][4]) if rows else (None, None)
-    return ohlc, span
+    valid = [r for r in rows if None not in (r[0], r[1], r[2], r[3], r[4])]
+    ohlc = [(r[0], r[1], r[2], r[3]) for r in valid]
+    span = (valid[0][4], valid[-1][4]) if valid else (None, None)
+    # The source table is mutable. Pin the exact ordered input bytes, not merely a human date range,
+    # so a clean commit plus this digest can reproduce (or refute) the evidence snapshot.
+    digest = hashlib.sha256()
+    for o, h, low, c, epoch in valid:
+        digest.update(
+            (f"{sym}|{float(epoch):.6f}|{float(o):.17g}|{float(h):.17g}|"
+             f"{float(low):.17g}|{float(c):.17g}\n").encode("utf-8"))
+    return ohlc, span, digest.hexdigest()
 
 
 def build(dsn: str, symbols: list[str]) -> dict:
@@ -136,16 +148,46 @@ def build(dsn: str, symbols: list[str]) -> dict:
     cx = psycopg.connect(dsn, autocommit=True, connect_timeout=5)
     cfg = S.CONFIG_DEFAULTS
     q = cfg.get("fdrQ", 0.10)
+    series = {}
+    source_inputs = []
+    for sym in symbols:
+        ohlc, (t0, t1), input_sha = _load(cx, sym)
+        if len(ohlc) < 40:
+            continue
+        series[sym] = (ohlc, t0, t1, input_sha)
+        source_inputs.append({
+            "symbol": sym,
+            "bars": len(ohlc),
+            "from": time.strftime("%Y-%m-%d", time.gmtime(t0)) if t0 else None,
+            "to": time.strftime("%Y-%m-%d", time.gmtime(t1)) if t1 else None,
+            "input_sha256": input_sha,
+        })
     engines = []
     all_cells = []                       # every (engine, contract) cell — the BH family
-    for eng, prover in S.PROVERS.items():
+    for eng in S.FDR_ENGINE_FAMILY:
+        if eng not in S.PROVERS:
+            continue
         # For each engine, evaluate every reference contract and keep the honest per-contract verdict.
         contracts = []
         for sym in symbols:
-            ohlc, (t0, t1) = _load(cx, sym)
-            if len(ohlc) < 40:
+            loaded = series.get(sym)
+            if loaded is None:
                 continue
-            v = prover(ohlc, cfg)
+            ohlc, t0, t1, input_sha = loaded
+            retired = eng in S.DUPLICATE_ENGINE_ALIASES
+            if retired:
+                # Retired aliases preserve the historical family size but supply no current
+                # evidence. Never run or clone the canonical prover: duplicated low p-values can
+                # advance BH rank and make a canonical result easier to pass.
+                v = {
+                    "ok": False, "trades": 0, "winRate": 0.0, "expectancyR": 0.0,
+                    "netPts": 0.0, "maxDrawdownR": 0.0, "pEdge": 1.0,
+                    "reason": (f"retired duplicate of "
+                               f"'{S.DUPLICATE_ENGINE_ALIASES[eng]}' — multiplicity debt only; "
+                               "no current evidence"),
+                }
+            else:
+                v = S.PROVERS[eng](ohlc, cfg)
             # Per-test candidacy ONLY. The grid-wide FDR pass below can demote this; nothing is
             # labeled a candidate until the whole family has been corrected.
             c = {
@@ -158,9 +200,14 @@ def build(dsn: str, symbols: list[str]) -> dict:
                 "winRate": round(float(v.get("winRate", 0.0)), 4),
                 "expectancyR": round(float(v.get("expectancyR", 0.0)), 4),
                 "netPts": round(float(v.get("netPts", 0.0)), 4),
+                "maxDrawdownR": round(float(v.get("maxDrawdownR", 0.0)), 4),
                 "pEdge": v.get("pEdge", 1.0),
+                "input_sha256": input_sha,
                 "reason": v.get("reason", ""),
             }
+            if retired:
+                c["retired"] = True
+                c["fdrDebt"] = True
             contracts.append(c)
             all_cells.append(c)
         if not contracts:
@@ -168,6 +215,7 @@ def build(dsn: str, symbols: list[str]) -> dict:
         engines.append({
             "engine": eng,
             "label": S.__dict__.get("ENGINE_LABELS", {}).get(eng, eng),
+            "retired": eng in S.DUPLICATE_ENGINE_ALIASES,
             "status": None,              # set after the family-wide correction
             "contracts": contracts,
         })
@@ -175,7 +223,9 @@ def build(dsn: str, symbols: list[str]) -> dict:
     # ── grid-wide Benjamini–Hochberg FDR control (the same guard the live buyer path applies) ──
     m = _apply_grid_fdr(all_cells, q)
     for c in all_cells:
-        if c["proven"]:
+        if c.get("fdrDebt"):
+            c["verdict"] = "retired hypothesis (multiplicity debt only)"
+        elif c["proven"]:
             c["verdict"] = "OOS candidate (cleared significance)"
         elif c.get("fdrRejected"):
             c["verdict"] = "no edge (FDR-rejected)"
@@ -186,9 +236,16 @@ def build(dsn: str, symbols: list[str]) -> dict:
     for e in engines:
         # Engine-level status is honest: "candidate" only if it survived the family-wide correction
         # on at least one real contract; otherwise "no edge". Never averaged into a single number.
-        e["status"] = "candidate" if any(c["proven"] for c in e["contracts"]) else "no_edge"
+        e["status"] = (
+            "retired" if e.get("retired") else
+            ("candidate" if any(c["proven"] for c in e["contracts"]) else "no_edge")
+        )
 
     provenN = sum(1 for e in engines if e["status"] == "candidate")
+    retired_debt_n = sum(1 for c in all_cells if c.get("fdrDebt"))
+    snapshot_sha = hashlib.sha256(
+        json.dumps(source_inputs, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
     return {
         "kind": "reference_oos",
         "label": REFERENCE_LABEL,
@@ -197,6 +254,8 @@ def build(dsn: str, symbols: list[str]) -> dict:
                        "results, not live, and not a guarantee. Your own engine fleet arms only "
                        "on the bars YOUR feed captures."),
         "source": "Black Label historical ES bars (WealthCharts-captured)",
+        "source_inputs": source_inputs,
+        "source_snapshot_sha256": snapshot_sha,
         "generated_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         # Provenance pins the math that ACTUALLY ran: the content hash of the prover module plus
         # the content hash of the module supplying the family-wide correction. git_sha is the tree
@@ -210,8 +269,10 @@ def build(dsn: str, symbols: list[str]) -> dict:
         "git_sha": _git_sha(),
         "significance": {
             "alpha": S.SIG_ALPHA, "minTrades": S.SIG_MIN_N, "fdrQ": q, "gridCells": m,
-            "test": (f"one-sided binomial vs R-geometry breakeven (alpha={S.SIG_ALPHA}, "
-                     f"n>={S.SIG_MIN_N}), then Benjamini-Hochberg FDR control at q={q} across the "
+            "retiredDebtCells": retired_debt_n,
+            "test": (f"one-sided realized-mean-R Student-t with Newey-West serial-dependence "
+                     f"variance (alpha={S.SIG_ALPHA}, n>={S.SIG_MIN_N}), then "
+                     f"Benjamini-Hochberg FDR control at q={q} across the "
                      f"m={m}-cell engine x contract grid"),
         },
         "engineCount": len(engines),

@@ -1,0 +1,21 @@
+# Provenance receipt — embeddable CPython pin authenticity
+# Records a real GPG + sha256 verification of the Windows embeddable CPython
+# runtime that build-windows.ps1 stages. The pin in python-embed.sha256 is
+# trustworthy ONLY because this upstream artifact carries a Good signature from
+# the CPython Windows release manager. Not fabricated (§5.1): every field below
+# was captured from a live `gpg --verify` + `shasum -a 256` run.
+#
+# Verify offline (side-effect-free) that this receipt matches the pin:
+#   grep matching_sha256 against python-embed.sha256's first non-comment line.
+
+artifact         = python-3.12.8-embed-amd64.zip
+source_url       = https://www.python.org/ftp/python/3.12.8/python-3.12.8-embed-amd64.zip
+sig_url          = https://www.python.org/ftp/python/3.12.8/python-3.12.8-embed-amd64.zip.asc
+size_bytes       = 11094114
+matching_sha256  = 8d3f33be9eb810f23c102f08475af2854e50484b8e4e06275e937be61ce3d2fb
+gpg_result       = Good signature
+gpg_signer       = Steve Dower (Python Release Signing) <steve.dower@microsoft.com>
+gpg_key_longid   = FC624643487034E5
+gpg_key_fpr      = 7ED10B6531D7C8E1BC296021FC624643487034E5
+verified_by      = trading-engineer (contract_38430599994c5aa3e65ea55c9a266cbf, cycle 3)
+verified_on      = 2026-07-20

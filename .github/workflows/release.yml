@@ -1,0 +1,689 @@
+name: Trading notarized release
+
+"on":
+  push:
+    tags:
+      - v1.0.27
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Exact b27 release tag
+        required: true
+        default: v1.0.27
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: trading-production-release
+  cancel-in-progress: false
+
+env:
+  BUILD_NUMBER: "27"
+  DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+  NOTARY_PROFILE: BL_NOTARY_CI
+  PUBLIC_MANIFEST_URL: https://blacklabelbots.com/api/version/trading
+  PYTHONDONTWRITEBYTECODE: "1"
+  PYTEST_ADDOPTS: -p no:cacheprovider
+
+jobs:
+  release:
+    name: Sign, notarize, verify, and preserve b27
+    runs-on: macos-15
+    timeout-minutes: 90
+    environment: production
+    permissions:
+      contents: read
+    outputs:
+      release_commit: ${{ steps.release_ref.outputs.release_commit }}
+    steps:
+      - name: Check out the release source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fail closed unless this is the exact b27 release
+        id: release_ref
+        shell: bash
+        env:
+          REQUESTED_RELEASE_TAG: ${{ inputs.release_tag }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GIT_FETCH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            test "$GITHUB_REF_TYPE" = "tag"
+            release_tag="$GITHUB_REF_NAME"
+            release_commit="$(git rev-list -n 1 "$release_tag")"
+          else
+            release_tag="$REQUESTED_RELEASE_TAG"
+            release_commit="$GITHUB_SHA"
+          fi
+          test "$release_tag" = "v1.0.27"
+          test -n "$DEFAULT_BRANCH"
+          askpass="$RUNNER_TEMP/bltd-git-askpass.sh"
+          trap 'rm -f "$askpass"; unset GIT_FETCH_TOKEN' EXIT
+          {
+            printf '%s\n' '#!/bin/sh'
+            printf '%s\n' 'case "$1" in'
+            printf '%s\n' '  *Username*) printf "%s\n" "x-access-token" ;;'
+            printf '%s\n' '  *Password*) printf "%s\n" "$GIT_FETCH_TOKEN" ;;'
+            printf '%s\n' 'esac'
+          } > "$askpass"
+          chmod 700 "$askpass"
+          GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 \
+            git -c credential.helper= fetch --no-tags \
+            "https://github.com/$GITHUB_REPOSITORY.git" \
+            "refs/heads/$DEFAULT_BRANCH:refs/remotes/origin/$DEFAULT_BRANCH"
+          rm -f "$askpass"
+          unset GIT_FETCH_TOKEN
+          trap - EXIT
+          if git config --local --get-regexp '^http\..*\.extraheader$' >/dev/null 2>&1; then
+            echo "FAIL: Git authentication persisted beyond the ancestry fetch" >&2
+            exit 1
+          fi
+          git merge-base --is-ancestor "$release_commit" "origin/$DEFAULT_BRANCH"
+          if [ "$GITHUB_EVENT_NAME" != "push" ] \
+            && git rev-parse --verify --quiet "refs/tags/$release_tag" >/dev/null
+          then
+            test "$(git rev-list -n 1 "$release_tag")" = "$release_commit"
+          fi
+          echo "RELEASE_TAG=$release_tag" >> "$GITHUB_ENV"
+          echo "RELEASE_COMMIT=$release_commit" >> "$GITHUB_ENV"
+          echo "release_commit=$release_commit" >> "$GITHUB_OUTPUT"
+          echo "CI_KEYCHAIN=$RUNNER_TEMP/bltd-signing.keychain-db" >> "$GITHUB_ENV"
+          echo "NOTARY_KEY_PATH=$RUNNER_TEMP/AuthKey_BLTD.p8" >> "$GITHUB_ENV"
+          echo "CERTIFICATE_PATH=$RUNNER_TEMP/DeveloperID_BLTD.p12" >> "$GITHUB_ENV"
+          test "$(uname -m)" = "arm64"
+          test -d "$DEVELOPER_DIR"
+          test "$(xcodebuild -version | sed -n '1p')" = "Xcode 26.3"
+          test "$(xcodebuild -version | sed -n '2p')" = "Build version 17C529"
+
+      - name: Require every Apple signing secret and the public release URL
+        shell: bash
+        env:
+          DEVELOPER_ID_P12_BASE64: ${{ secrets.DEVELOPER_ID_P12_BASE64 }}
+          DEVELOPER_ID_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
+          NOTARY_API_KEY_P8_BASE64: ${{ secrets.NOTARY_API_KEY_P8_BASE64 }}
+          NOTARY_API_KEY_ID: ${{ secrets.NOTARY_API_KEY_ID }}
+          NOTARY_API_ISSUER_ID: ${{ secrets.NOTARY_API_ISSUER_ID }}
+          TRADING_PUBLIC_DOWNLOAD_URL: ${{ secrets.TRADING_PUBLIC_DOWNLOAD_URL }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for name in \
+            DEVELOPER_ID_P12_BASE64 \
+            DEVELOPER_ID_P12_PASSWORD \
+            NOTARY_API_KEY_P8_BASE64 \
+            NOTARY_API_KEY_ID \
+            NOTARY_API_ISSUER_ID \
+            TRADING_PUBLIC_DOWNLOAD_URL
+          do
+            if [ -z "${!name:-}" ]; then
+              echo "FAIL: required repository/environment secret is absent: $name" >&2
+              missing=1
+            fi
+          done
+          test "$missing" -eq 0
+
+      - name: Create an ephemeral signing keychain
+        shell: bash
+        env:
+          DEVELOPER_ID_P12_BASE64: ${{ secrets.DEVELOPER_ID_P12_BASE64 }}
+          DEVELOPER_ID_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
+          NOTARY_API_KEY_P8_BASE64: ${{ secrets.NOTARY_API_KEY_P8_BASE64 }}
+        run: |
+          set -euo pipefail
+          umask 077
+          keychain_password="$(openssl rand -hex 32)"
+          echo "::add-mask::$keychain_password"
+          printf '%s' "$DEVELOPER_ID_P12_BASE64" | /usr/bin/base64 -D > "$CERTIFICATE_PATH"
+          printf '%s' "$NOTARY_API_KEY_P8_BASE64" | /usr/bin/base64 -D > "$NOTARY_KEY_PATH"
+          test -s "$CERTIFICATE_PATH"
+          test -s "$NOTARY_KEY_PATH"
+          security create-keychain -p "$keychain_password" "$CI_KEYCHAIN"
+          security set-keychain-settings -lut 7200 "$CI_KEYCHAIN"
+          security unlock-keychain -p "$keychain_password" "$CI_KEYCHAIN"
+          security list-keychains -d user -s "$CI_KEYCHAIN"
+          security default-keychain -d user -s "$CI_KEYCHAIN"
+          security import "$CERTIFICATE_PATH" \
+            -k "$CI_KEYCHAIN" \
+            -f pkcs12 \
+            -P "$DEVELOPER_ID_P12_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$keychain_password" \
+            "$CI_KEYCHAIN"
+          security find-identity -v -p codesigning "$CI_KEYCHAIN" \
+            | grep -q 'Developer ID Application:.*(745ZPGFRA5)'
+          rm -f "$CERTIFICATE_PATH"
+
+      - name: Store and validate ephemeral notary credentials
+        shell: bash
+        env:
+          NOTARY_API_KEY_ID: ${{ secrets.NOTARY_API_KEY_ID }}
+          NOTARY_API_ISSUER_ID: ${{ secrets.NOTARY_API_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          xcrun notarytool store-credentials "$NOTARY_PROFILE" \
+            --key "$NOTARY_KEY_PATH" \
+            --key-id "$NOTARY_API_KEY_ID" \
+            --issuer "$NOTARY_API_ISSUER_ID" \
+            --keychain "$CI_KEYCHAIN" \
+            --validate
+          rm -f "$NOTARY_KEY_PATH"
+
+      - name: Run the canonical maintained suites
+        shell: bash
+        run: bash Tests/run-all.sh
+
+      - name: Build, Developer-ID sign, notarize, staple, and launch-test
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "$GITHUB_WORKSPACE/build"
+          BUILD_NUMBER="$BUILD_NUMBER" \
+          NOTARY_PROFILE="$NOTARY_PROFILE" \
+            ./build-developer-id.sh --submit --launch-test \
+            2>&1 | tee "$RUNNER_TEMP/bltd-notarization.log"
+
+      - name: Run the canonical gate against the assembled app
+        shell: bash
+        run: bash Tests/run-all.sh
+
+      - name: Re-verify the final app and stapled archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          assert_python_runtime_universal2() {
+            local candidate="$1"
+            local runtime="$candidate/Contents/Resources/backend/python-runtime"
+            local binary architectures
+            local macho_count=0
+            test -d "$runtime"
+            while IFS= read -r -d '' binary; do
+              if file -b "$binary" | grep -q 'Mach-O'; then
+                macho_count=$((macho_count + 1))
+                architectures="$(
+                  lipo -archs "$binary" \
+                    | tr ' ' '\n' \
+                    | sed '/^$/d' \
+                    | LC_ALL=C sort -u \
+                    | paste -sd ' ' -
+                )"
+                if [ "$architectures" != "arm64 x86_64" ]; then
+                  echo "FAIL: bundled runtime Mach-O is not exact universal2: $binary ($architectures)" >&2
+                  return 1
+                fi
+              fi
+            done < <(find "$runtime" -type f -print0)
+            test "$macho_count" -gt 0
+          }
+          app="$GITHUB_WORKSPACE/build/Black Label Trading.app"
+          zip="$GITHUB_WORKSPACE/build/Black-Label-Trading-DeveloperID.zip"
+          test -d "$app"
+          test -f "$zip"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app/Contents/Info.plist")" = "$BUILD_NUMBER"
+          assert_python_runtime_universal2 "$app"
+          codesign --verify --deep --strict --all-architectures "$app"
+          signature="$(codesign -dv --verbose=4 "$app" 2>&1)"
+          grep -q '^Authority=Developer ID Application:.*(745ZPGFRA5)' <<<"$signature"
+          xcrun stapler validate "$app"
+          spctl -a -t exec -vv "$app"
+          bash Tests/signals-only-release-contract.sh "$app"
+          bash Tests/built-bundle-reference-contract.sh "$app"
+
+          verify_dir="$(mktemp -d)"
+          trap 'rm -rf "$verify_dir"' EXIT
+          ditto -x -k "$zip" "$verify_dir"
+          extracted="$verify_dir/Black Label Trading.app"
+          test -d "$extracted"
+          assert_python_runtime_universal2 "$extracted"
+          codesign --verify --deep --strict --all-architectures "$extracted"
+          xcrun stapler validate "$extracted"
+          spctl -a -t exec -vv "$extracted"
+
+      - name: Prepare immutable release files
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/trading-release"
+          mkdir -p "$out"
+          cp "$GITHUB_WORKSPACE/build/Black-Label-Trading-DeveloperID.zip" \
+            "$out/Black-Label-Trading-b27-macOS-universal-notarized.zip"
+          cd "$out"
+          shasum -a 256 "Black-Label-Trading-b27-macOS-universal-notarized.zip" \
+            > "Black-Label-Trading-b27-macOS-universal-notarized.zip.sha256"
+          notarization_id="$(
+            sed -nE \
+              's/^[[:space:]]*id:[[:space:]]*([0-9A-Fa-f-]{36})[[:space:]]*$/\1/p' \
+              "$RUNNER_TEMP/bltd-notarization.log" | tail -n 1
+          )"
+          if ! [[ "$notarization_id" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]]; then
+            echo "FAIL: accepted notarization submission ID was not captured exactly" >&2
+            exit 1
+          fi
+          printf '%s\n' "$notarization_id" > notarization-id.txt
+
+      - name: Generate the exact post-staple updater manifest
+        shell: bash
+        env:
+          PUBLIC_DOWNLOAD_URL: ${{ secrets.TRADING_PUBLIC_DOWNLOAD_URL }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/trading-release"
+          zip="$out/Black-Label-Trading-b27-macOS-universal-notarized.zip"
+          manifest="$out/trading-manifest-b27.json"
+          release_sha="$(awk 'NR == 1 {print $1}' "$zip.sha256")"
+          notarization_id="$(tr -d '\r\n' < "$out/notarization-id.txt")"
+          RELEASE_SHA="$release_sha" \
+          NOTARIZATION_ID="$notarization_id" \
+          RELEASE_COMMIT="$RELEASE_COMMIT" \
+          PUBLISHED_AT="$(git show -s --format=%cI "$RELEASE_COMMIT")" \
+          PUBLIC_DOWNLOAD_URL="$PUBLIC_DOWNLOAD_URL" \
+            python3 - "$manifest" <<'PY'
+          import json, os, re, sys
+          from urllib.parse import urlsplit
+
+          digest = os.environ["RELEASE_SHA"]
+          notarization_id = os.environ["NOTARIZATION_ID"]
+          download_url = os.environ["PUBLIC_DOWNLOAD_URL"]
+          parsed = urlsplit(download_url)
+          if not re.fullmatch(r"[0-9a-f]{64}", digest):
+              raise SystemExit("release SHA-256 is malformed")
+          if not re.fullmatch(
+              r"[0-9A-Fa-f]{8}-(?:[0-9A-Fa-f]{4}-){3}[0-9A-Fa-f]{12}",
+              notarization_id,
+          ):
+              raise SystemExit("notarization ID is malformed")
+          if (parsed.scheme != "https" or not parsed.hostname or parsed.username
+                  or parsed.password or parsed.query or parsed.fragment
+                  or not parsed.path.endswith("/trading/27.zip")):
+              raise SystemExit("public download URL must be credential-free HTTPS ending in /trading/27.zip")
+          payload = {
+              "product": "trading",
+              "latest_build": 27,
+              "latest_version": "1.0",
+              "min_supported_build": 1,
+              "download_url": download_url,
+              "sha256": digest,
+              "notarized": True,
+              "notarization_id": notarization_id,
+              "team_id": "745ZPGFRA5",
+              "published": os.environ["PUBLISHED_AT"],
+              "release_commit": os.environ["RELEASE_COMMIT"],
+          }
+          with open(sys.argv[1], "w", encoding="utf-8") as handle:
+              json.dump(payload, handle, sort_keys=True, separators=(",", ":"))
+              handle.write("\n")
+          PY
+
+      - name: Preserve the verified release artifact before public publication
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: Black-Label-Trading-b27-NOTARIZED-${{ github.sha }}
+          path: ${{ runner.temp }}/trading-release/
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+      - name: Delete ephemeral Apple credentials
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          if [ -n "${CI_KEYCHAIN:-}" ]; then
+            security delete-keychain "$CI_KEYCHAIN"
+          fi
+          if [ -n "${CERTIFICATE_PATH:-}" ]; then
+            rm -f "$CERTIFICATE_PATH"
+          fi
+          if [ -n "${NOTARY_KEY_PATH:-}" ]; then
+            rm -f "$NOTARY_KEY_PATH"
+          fi
+
+  publish-public:
+    name: Publish preserved b27 to the public updater
+    needs: release
+    runs-on: macos-15
+    timeout-minutes: 35
+    environment: production
+    permissions:
+      contents: read
+    steps:
+      - name: Download the exact preserved release artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: Black-Label-Trading-b27-NOTARIZED-${{ github.sha }}
+          path: ${{ runner.temp }}/trading-release/
+
+      - name: Require every rotated public-distribution secret
+        shell: bash
+        env:
+          ROTATED_R2_ACCESS_KEY_ID: ${{ secrets.ROTATED_R2_ACCESS_KEY_ID }}
+          ROTATED_R2_SECRET_ACCESS_KEY: ${{ secrets.ROTATED_R2_SECRET_ACCESS_KEY }}
+          ROTATED_R2_S3_ENDPOINT: ${{ secrets.ROTATED_R2_S3_ENDPOINT }}
+          ROTATED_R2_BUCKET: ${{ secrets.ROTATED_R2_BUCKET }}
+          ROTATED_R2_TRADING_MANIFEST_KEY: ${{ secrets.ROTATED_R2_TRADING_MANIFEST_KEY }}
+          TRADING_PUBLIC_DOWNLOAD_URL: ${{ secrets.TRADING_PUBLIC_DOWNLOAD_URL }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for name in \
+            ROTATED_R2_ACCESS_KEY_ID \
+            ROTATED_R2_SECRET_ACCESS_KEY \
+            ROTATED_R2_S3_ENDPOINT \
+            ROTATED_R2_BUCKET \
+            ROTATED_R2_TRADING_MANIFEST_KEY \
+            TRADING_PUBLIC_DOWNLOAD_URL
+          do
+            if [ -z "${!name:-}" ]; then
+              echo "FAIL: required production secret is absent: $name" >&2
+              missing=1
+            fi
+          done
+          test "$missing" -eq 0
+
+      - name: Publish publicly and atomically switch the updater manifest
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.ROTATED_R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.ROTATED_R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          AWS_EC2_METADATA_DISABLED: "true"
+          R2_S3_ENDPOINT: ${{ secrets.ROTATED_R2_S3_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.ROTATED_R2_BUCKET }}
+          R2_TRADING_MANIFEST_KEY: ${{ secrets.ROTATED_R2_TRADING_MANIFEST_KEY }}
+          PUBLIC_DOWNLOAD_URL: ${{ secrets.TRADING_PUBLIC_DOWNLOAD_URL }}
+          RELEASE_COMMIT: ${{ needs.release.outputs.release_commit }}
+        run: |
+          set -euo pipefail
+          command -v aws >/dev/null
+          out="$RUNNER_TEMP/trading-release"
+          zip="$out/Black-Label-Trading-b27-macOS-universal-notarized.zip"
+          checksum_file="$zip.sha256"
+          manifest="$out/trading-manifest-b27.json"
+          notarization_file="$out/notarization-id.txt"
+          test -f "$zip"
+          test -f "$checksum_file"
+          test -f "$manifest"
+          test -f "$notarization_file"
+          artifact_key="trading/27.zip"
+          release_sha="$(awk 'NR == 1 {print $1}' "$checksum_file")"
+          expected_checksum_line="$release_sha  $(basename "$zip")"
+          test "$(cat "$checksum_file")" = "$expected_checksum_line"
+          [[ "$release_sha" =~ ^[0-9a-f]{64}$ ]]
+          test "$(shasum -a 256 "$zip" | awk '{print $1}')" = "$release_sha"
+          notarization_id="$(tr -d '\r\n' < "$notarization_file")"
+
+          python3 - "$manifest" "$R2_S3_ENDPOINT" "$R2_BUCKET" \
+            "$R2_TRADING_MANIFEST_KEY" "$PUBLIC_DOWNLOAD_URL" \
+            "$PUBLIC_MANIFEST_URL" "$release_sha" "$RELEASE_COMMIT" \
+            "$notarization_id" <<'PY'
+          import json
+          import re
+          import sys
+          from urllib.parse import urlsplit
+
+          (
+              manifest_path,
+              endpoint,
+              bucket,
+              manifest_key,
+              download_url,
+              manifest_url,
+              release_sha,
+              release_commit,
+              notarization_id,
+          ) = sys.argv[1:]
+          for label, value in (
+              ("R2 endpoint", endpoint),
+              ("bucket", bucket),
+              ("manifest key", manifest_key),
+              ("download URL", download_url),
+              ("manifest URL", manifest_url),
+          ):
+              if not value or any(c in value for c in "\r\n\0"):
+                  raise SystemExit(f"invalid {label}")
+          for label, value in (
+              ("R2 endpoint", endpoint),
+              ("download URL", download_url),
+              ("manifest URL", manifest_url),
+          ):
+              parsed = urlsplit(value)
+              if (parsed.scheme != "https" or not parsed.hostname or parsed.username
+                      or parsed.password or parsed.fragment):
+                  raise SystemExit(f"{label} must be credential-free HTTPS")
+          if urlsplit(endpoint).query or urlsplit(download_url).query:
+              raise SystemExit("R2 endpoint and download URL must not contain a query")
+          if not urlsplit(download_url).path.endswith("/trading/27.zip"):
+              raise SystemExit("public download URL must end in /trading/27.zip")
+          if manifest_url != "https://blacklabelbots.com/api/version/trading":
+              raise SystemExit("public manifest URL does not match the shipped updater")
+          if (manifest_key.startswith("/") or ".." in manifest_key.split("/")
+                  or len(manifest_key.encode()) > 900):
+              raise SystemExit("invalid R2 manifest object key")
+
+          with open(manifest_path, encoding="utf-8") as handle:
+              preserved = json.load(handle)
+          required_keys = {
+              "product",
+              "latest_build",
+              "latest_version",
+              "min_supported_build",
+              "download_url",
+              "sha256",
+              "notarized",
+              "notarization_id",
+              "team_id",
+              "published",
+              "release_commit",
+          }
+          if set(preserved) != required_keys:
+              raise SystemExit("preserved manifest fields do not match the b27 contract")
+          expected = {
+              "product": "trading",
+              "latest_build": 27,
+              "latest_version": "1.0",
+              "min_supported_build": 1,
+              "download_url": download_url,
+              "sha256": release_sha,
+              "notarized": True,
+              "notarization_id": notarization_id,
+              "team_id": "745ZPGFRA5",
+              "release_commit": release_commit,
+          }
+          for key, value in expected.items():
+              if preserved.get(key) != value:
+                  raise SystemExit(f"preserved manifest mismatch: {key}")
+          if not re.fullmatch(
+              r"[0-9A-Fa-f]{8}-(?:[0-9A-Fa-f]{4}-){3}[0-9A-Fa-f]{12}",
+              notarization_id,
+          ):
+              raise SystemExit("preserved notarization ID is malformed")
+          if not isinstance(preserved["published"], str) or not preserved["published"]:
+              raise SystemExit("preserved publication timestamp is absent")
+          PY
+
+          listing="$(
+            aws --endpoint-url "$R2_S3_ENDPOINT" s3api list-objects-v2 \
+              --bucket "$R2_BUCKET" \
+              --prefix "$artifact_key" \
+              --output json
+          )"
+          existing="$(
+            LISTING="$listing" python3 - "$artifact_key" <<'PY'
+          import json, os, sys
+          keys = [row.get("Key") for row in json.loads(os.environ["LISTING"]).get("Contents", [])]
+          print("yes" if sys.argv[1] in keys else "no")
+          PY
+          )"
+          if [ "$existing" = "yes" ]; then
+            prior="$RUNNER_TEMP/existing-trading-b27.zip"
+            aws --endpoint-url "$R2_S3_ENDPOINT" s3 cp \
+              "s3://$R2_BUCKET/$artifact_key" "$prior" --only-show-errors
+            prior_sha="$(shasum -a 256 "$prior" | awk '{print $1}')"
+            if [ "$prior_sha" != "$release_sha" ]; then
+              echo "FAIL: immutable public b27 key already contains different bytes" >&2
+              exit 1
+            fi
+          else
+            aws --endpoint-url "$R2_S3_ENDPOINT" s3 cp \
+              "$zip" "s3://$R2_BUCKET/$artifact_key" \
+              --content-type application/zip \
+              --cache-control 'public,max-age=31536000,immutable' \
+              --only-show-errors
+          fi
+
+          authenticated_readback="$RUNNER_TEMP/r2-trading-b27-readback.zip"
+          aws --endpoint-url "$R2_S3_ENDPOINT" s3 cp \
+            "s3://$R2_BUCKET/$artifact_key" "$authenticated_readback" --only-show-errors
+          test "$(shasum -a 256 "$authenticated_readback" | awk '{print $1}')" = "$release_sha"
+
+          public_readback="$RUNNER_TEMP/public-trading-b27-readback.zip"
+          curl --fail --silent --show-error --location \
+            --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            --retry 3 --retry-all-errors \
+            "$PUBLIC_DOWNLOAD_URL" -o "$public_readback"
+          test "$(shasum -a 256 "$public_readback" | awk '{print $1}')" = "$release_sha"
+
+          current="$RUNNER_TEMP/current-public-trading-manifest.json"
+          curl --fail --silent --show-error --location \
+            --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            -H 'Cache-Control: no-cache' \
+            "$PUBLIC_MANIFEST_URL?release_preflight=$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            -o "$current"
+          python3 - "$current" "$manifest" <<'PY'
+          import json, sys
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              current = json.load(handle)
+          with open(sys.argv[2], encoding="utf-8") as handle:
+              proposed = json.load(handle)
+          current_build = int(current.get("latest_build", 0))
+          if current_build > proposed["latest_build"]:
+              raise SystemExit("refusing to downgrade the public updater manifest")
+          if current_build == proposed["latest_build"] and current != proposed:
+              raise SystemExit("public b27 manifest already exists with different evidence")
+          PY
+
+          staged_key="$R2_TRADING_MANIFEST_KEY.staging.$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
+          aws --endpoint-url "$R2_S3_ENDPOINT" s3 cp \
+            "$manifest" "s3://$R2_BUCKET/$staged_key" \
+            --content-type application/json \
+            --cache-control no-store \
+            --only-show-errors
+          staged_readback="$RUNNER_TEMP/r2-staged-trading-manifest.json"
+          aws --endpoint-url "$R2_S3_ENDPOINT" s3 cp \
+            "s3://$R2_BUCKET/$staged_key" "$staged_readback" --only-show-errors
+          cmp -s "$manifest" "$staged_readback"
+          aws --endpoint-url "$R2_S3_ENDPOINT" s3 cp \
+            "s3://$R2_BUCKET/$staged_key" \
+            "s3://$R2_BUCKET/$R2_TRADING_MANIFEST_KEY" \
+            --content-type application/json \
+            --cache-control 'public,max-age=60,must-revalidate' \
+            --metadata-directive REPLACE \
+            --only-show-errors
+          final_r2_readback="$RUNNER_TEMP/r2-final-trading-manifest.json"
+          aws --endpoint-url "$R2_S3_ENDPOINT" s3 cp \
+            "s3://$R2_BUCKET/$R2_TRADING_MANIFEST_KEY" \
+            "$final_r2_readback" --only-show-errors
+          cmp -s "$manifest" "$final_r2_readback"
+
+          public_manifest="$RUNNER_TEMP/public-trading-manifest-b27.json"
+          published=""
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent --show-error --location \
+              --proto '=https' --proto-redir '=https' --tlsv1.2 \
+              -H 'Cache-Control: no-cache' \
+              "$PUBLIC_MANIFEST_URL?release_verify=$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$attempt" \
+              -o "$public_manifest" \
+              && python3 - "$manifest" "$public_manifest" <<'PY'
+          import json, sys
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              expected = json.load(handle)
+          with open(sys.argv[2], encoding="utf-8") as handle:
+              actual = json.load(handle)
+          raise SystemExit(0 if actual == expected else 1)
+          PY
+            then
+              published="yes"
+              break
+            fi
+            sleep 2
+          done
+          test "$published" = "yes"
+
+  github-release:
+    name: Publish verified GitHub Release
+    needs:
+      - release
+      - publish-public
+    runs-on: macos-15
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download the publicly verified release artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: Black-Label-Trading-b27-NOTARIZED-${{ github.sha }}
+          path: ${{ runner.temp }}/trading-release/
+
+      - name: Verify checksum and create the immutable GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_COMMIT: ${{ needs.release.outputs.release_commit }}
+        run: |
+          set -euo pipefail
+          release_tag="v1.0.27"
+          zip="$RUNNER_TEMP/trading-release/Black-Label-Trading-b27-macOS-universal-notarized.zip"
+          checksum="$zip.sha256"
+          manifest="$RUNNER_TEMP/trading-release/trading-manifest-b27.json"
+          test -n "$RELEASE_COMMIT"
+          test -f "$zip"
+          test -f "$checksum"
+          test -f "$manifest"
+          expected="$(awk 'NR == 1 {print $1}' "$checksum")"
+          actual="$(shasum -a 256 "$zip" | awk '{print $1}')"
+          test "$actual" = "$expected"
+          EXPECTED_SHA="$expected" python3 - "$manifest" <<'PY'
+          import json, os, sys
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              manifest = json.load(handle)
+          assert manifest["product"] == "trading"
+          assert manifest["latest_build"] == 27
+          assert manifest["sha256"] == os.environ["EXPECTED_SHA"]
+          assert manifest["notarized"] is True
+          assert manifest["team_id"] == "745ZPGFRA5"
+          assert manifest["download_url"].startswith("https://")
+          PY
+          if gh release view "$release_tag" >/dev/null 2>&1; then
+            echo "FAIL: release $release_tag already exists; refusing to overwrite it" >&2
+            exit 1
+          fi
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            test "$GITHUB_REF_TYPE" = "tag"
+            test "$GITHUB_REF_NAME" = "$release_tag"
+            gh release create "$release_tag" \
+              "$zip#Black Label Trading b27 — notarized macOS universal app" \
+              "$checksum#SHA-256 checksum" \
+              "$manifest#Exact public updater manifest" \
+              --verify-tag \
+              --title "Black Label Trading v1.0 (build 27)" \
+              --generate-notes
+          else
+            gh release create "$release_tag" \
+              "$zip#Black Label Trading b27 — notarized macOS universal app" \
+              "$checksum#SHA-256 checksum" \
+              "$manifest#Exact public updater manifest" \
+              --target "$RELEASE_COMMIT" \
+              --title "Black Label Trading v1.0 (build 27)" \
+              --generate-notes
+          fi

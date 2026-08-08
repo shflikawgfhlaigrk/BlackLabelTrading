@@ -696,8 +696,8 @@ struct BacktestScreen: View {
     @State private var labReport: BacktestLabReport? = nil
     @State private var labRunning = false
 
-    // TR-19 own-silicon parameter-sweep FARM: fan the SHIPPED prover's hyperparameter grid across
-    // this Mac's cores over the buyer's OWN bars. Over-fit-transparent (BH-FDR p per cell), no cloud.
+    // TR-19 local parameter research screen: fan the fixed grid across this Mac's cores over the
+    // buyer's OWN bars. A pass is selection-only and must survive separate nested confirmation.
     @State private var farmEngine = "meanrev"
     @State private var farmSymbol = ""
     @State private var farmReport: BacktestFarmReport? = nil
@@ -802,7 +802,7 @@ struct BacktestScreen: View {
     // NO aggregate win-rate, NO equity, NO $ figure — the buyer's own edge math on their own data.
     private var labPanel: some View {
         Panel(title: "No-code edge-gate lab", icon: "flask.fill", accent: BLTheme.gold) {
-            Text("Pick an engine and one instrument you've captured, choose the whole range or a slice, and run the SAME shipped prover Black Label's live fleet uses — on YOUR captured bars only. You get the out-of-sample trade count, wins / losses, max drawdown in R, and the one-sided binomial p-value per fold, plus the prover fingerprint so you can reproduce it (shasum -a 256 bltd_store.py). Fewer than \(labReport?.minTrades ?? 30) OOS trades in a fold shows as insufficient — never a painted number.")
+            Text("Pick an engine and one captured instrument, then run the shipped research screen over the whole range or a slice. You get the out-of-sample trade count, wins / losses, max drawdown in R, and one-sided realized-mean-R p-value with serial-dependence penalty per fold, plus the prover fingerprint for reproduction (shasum -a 256 bltd_store.py). Fewer than \(labReport?.minTrades ?? 30) OOS trades in a fold shows as insufficient. Any pass still requires separate nested confirmation and is never live-adopted by this screen.")
                 .font(.system(size: 11, design: .rounded)).foregroundColor(BLTheme.sub).fixedSize(horizontal: false, vertical: true)
 
             if !feed.isSignedIn {
@@ -863,7 +863,7 @@ struct BacktestScreen: View {
             // Mandatory honesty label — verbatim, always shown with results.
             HStack(spacing: 6) {
                 Image(systemName: "info.circle.fill").font(.system(size: 11)).foregroundColor(BLTheme.gold)
-                Text("On your captured bars only — the shipped prover re-run, NOT a promise and no performance guaranteed.")
+                Text("Research screen on your captured bars only. A pass requires separate nested confirmation; this screen never enables or live-adopts a strategy.")
                     .font(.system(size: 11, weight: .semibold, design: .rounded)).foregroundColor(BLTheme.gold).fixedSize(horizontal: false, vertical: true)
             }
             .padding(10).frame(maxWidth: .infinity, alignment: .leading)
@@ -884,10 +884,10 @@ struct BacktestScreen: View {
     }
 
     private func labFoldRow(_ f: BacktestLabFold, minTrades: Int, headline: Bool) -> some View {
-        let tint = f.proven ? BLTheme.green : (f.insufficient ? BLTheme.sub : BLTheme.gold)
-        let status = f.proven ? "OOS CAND" : (f.insufficient ? "THIN" : "NO EDGE")
+        let tint = f.proven ? BLTheme.blue : (f.insufficient ? BLTheme.sub : BLTheme.gold)
+        let status = f.proven ? "SCREEN PASS" : (f.insufficient ? "THIN" : "NO EDGE")
         return HStack(spacing: 12) {
-            Image(systemName: f.proven ? "checkmark.seal.fill" : (f.insufficient ? "hourglass" : "xmark.seal"))
+            Image(systemName: f.proven ? "checkmark.circle.fill" : (f.insufficient ? "hourglass" : "xmark.seal"))
                 .font(.system(size: 14, weight: .bold)).foregroundColor(tint)
             VStack(alignment: .leading, spacing: 2) {
                 Text(headline ? "Whole range" : "Fold \(f.fold)").font(.system(size: 13, weight: .bold, design: .rounded)).foregroundColor(BLTheme.text)
@@ -902,14 +902,14 @@ struct BacktestScreen: View {
 
     private func labStatusText(_ r: BacktestLabReport) -> String {
         switch r.status {
-        case "candidate": return "OOS CANDIDATE"
+        case "candidate": return "RESEARCH SCREEN PASS"
         case "no_edge": return "NO EDGE"
         default: return "INSUFFICIENT"
         }
     }
     private func labStatusTint(_ r: BacktestLabReport) -> Color {
         switch r.status {
-        case "candidate": return BLTheme.green
+        case "candidate": return BLTheme.blue
         case "no_edge": return BLTheme.gold
         default: return BLTheme.sub
         }
@@ -950,23 +950,21 @@ struct BacktestScreen: View {
         await MainActor.run { labReport = r; labRunning = false }
     }
 
-    // MARK: - TR-19 own-silicon parameter-sweep FARM. Pick engine + instrument; the backend fans the
-    // SHIPPED prover's hyperparameter grid across THIS Mac's cores (concurrent.futures) over the
-    // buyer's OWN captured bars — no cloud, no data fee, no network. The whole point is honest over-fit
-    // transparency: it reports the number of cells tried and a Benjamini–Hochberg FDR-corrected p per
-    // cell, NEVER a raw best-cell p, and shows NO aggregate win-rate/$ figure.
+    // MARK: - TR-19 local parameter research screen. Pick engine + instrument; the backend fans the
+    // fixed grid across THIS Mac's cores over the buyer's OWN captured bars. Every pass is a
+    // selection for separate nested confirmation, never a strategy enablement or live adoption.
     private var farmPanel: some View {
-        Panel(title: "Own-silicon backtest farm", icon: "cpu.fill", accent: BLTheme.gold) {
-            Text("Sweep an engine's parameters across many settings at once — fanned over this Mac's own performance cores. No cloud, no data fee, nothing downloaded. Because searching many parameter sets inflates significance, every p-value here is Benjamini–Hochberg FDR-corrected across ALL cells tried — a raw best-cell p is never shown. Fewer than \(farmReport?.minTrades ?? 30) OOS trades in a cell shows as insufficient. On your captured bars only — NOT a promise.")
+        Panel(title: "Local parameter research screen", icon: "cpu.fill", accent: BLTheme.gold) {
+            Text("Screen a fixed parameter grid on this Mac's performance cores using only your captured bars. No cloud, no data fee, nothing downloaded. Every p-value is Benjamini–Hochberg FDR-corrected across ALL cells tried; a raw best-cell p is never shown. Fewer than \(farmReport?.minTrades ?? 30) OOS trades in a cell shows as insufficient. A screen pass is selection-only, requires separate anchored nested confirmation, and is never live-adopted by this screen.")
                 .font(.system(size: 11, design: .rounded)).foregroundColor(BLTheme.sub).fixedSize(horizontal: false, vertical: true)
 
             if !feed.isSignedIn {
-                EmptyState(icon: "person.crop.circle.badge.questionmark", title: "Sign in to run the farm",
-                           hint: "The farm runs entirely on your own local backend and your own captured bars. Connect in the Feeds tab.")
+                EmptyState(icon: "person.crop.circle.badge.questionmark", title: "Sign in to run the research screen",
+                           hint: "The screen runs entirely on your local backend and your captured bars. Connect in the Feeds tab.")
                 GhostButton(label: "Go to Feeds", icon: "globe") { nav.section = .feeds }
             } else if labSymbols.isEmpty {
                 EmptyState(icon: "square.stack.3d.up.slash", title: "No captured instruments yet",
-                           hint: "Connect your feed and let bars accumulate — the farm can sweep once enough bars are stored. Nothing is downloaded or invented.")
+                           hint: "Connect your feed and let bars accumulate — screening can start once enough bars are stored. Nothing is downloaded or invented.")
                 GhostButton(label: "Connect my feed", icon: "globe") { nav.section = .feeds }
             } else {
                 HStack(spacing: 10) {
@@ -974,7 +972,7 @@ struct BacktestScreen: View {
                     pickerField("Instrument", $farmSymbol, labSymbols) { $0 }
                 }
                 HStack(spacing: 10) {
-                    GoldButton(label: farmRunning ? "Sweeping on your cores…" : "Run the sweep on my bars", fill: true, icon: "cpu") {
+                    GoldButton(label: farmRunning ? "Screening on your cores…" : "Run research screen", fill: true, icon: "cpu") {
                         Task { await runFarm() }
                     }.disabled(farmRunning || farmSymbol.isEmpty)
                     if let r = farmReport, r.available {
@@ -994,10 +992,10 @@ struct BacktestScreen: View {
                        hint: r.reason.isEmpty ? "Not enough captured bars for this instrument." : r.reason)
         } else {
             Divider().background(BLTheme.stroke).padding(.vertical, 2)
-            // Mandatory over-fit-transparency banner — verbatim, always shown with results.
+            // Mandatory selection-only banner, always shown with results.
             HStack(alignment: .top, spacing: 6) {
                 Image(systemName: "info.circle.fill").font(.system(size: 11)).foregroundColor(BLTheme.gold)
-                Text("\(r.cellsTried) parameter cells tried on your captured bars only — NOT a promise. \(r.overfitNote)")
+                Text("\(r.cellsTried) parameter cells screened on your captured bars. Any pass is selection-only; separate anchored nested confirmation is required. This screen never enables or live-adopts a strategy. \(r.overfitNote)")
                     .font(.system(size: 11, weight: .semibold, design: .rounded)).foregroundColor(BLTheme.gold).fixedSize(horizontal: false, vertical: true)
             }
             .padding(10).frame(maxWidth: .infinity, alignment: .leading)
@@ -1005,8 +1003,8 @@ struct BacktestScreen: View {
             .overlay(RoundedRectangle(cornerRadius: 10).stroke(BLTheme.gold.opacity(0.35), lineWidth: 1))
 
             HStack(spacing: 12) {
-                Stat(label: "Cells tried", value: "\(r.cellsTried)")
-                Stat(label: "Candidates", value: "\(r.provenCells)")
+                Stat(label: "Cells screened", value: "\(r.cellsTried)")
+                Stat(label: "Selections", value: "\(r.selectionCount)")
                 Stat(label: "Insufficient", value: "\(r.cellsInsufficient)")
                 Stat(label: "Compute", value: r.compute.isEmpty ? "—" : r.compute)
             }
@@ -1014,7 +1012,7 @@ struct BacktestScreen: View {
                 Text(r.reason).font(.system(size: 10.5, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub).fixedSize(horizontal: false, vertical: true)
             }
             if let b = r.best {
-                Text("BEST CELL (BY FDR-ADJUSTED p)").font(.system(size: 9.5, weight: .bold, design: .rounded)).foregroundColor(BLTheme.sub).tracking(0.6)
+                Text("TOP SCREENED CELL (BY FDR-ADJUSTED p)").font(.system(size: 9.5, weight: .bold, design: .rounded)).foregroundColor(BLTheme.sub).tracking(0.6)
                 farmCellRow(b, headline: true)
             }
             let shown = Array(r.cells.prefix(12))
@@ -1028,10 +1026,10 @@ struct BacktestScreen: View {
     }
 
     private func farmCellRow(_ c: BacktestFarmCell, headline: Bool) -> some View {
-        let tint = c.proven ? BLTheme.green : (c.insufficient ? BLTheme.sub : BLTheme.gold)
-        let status = c.proven ? "CAND" : (c.insufficient ? "THIN" : "NO EDGE")
+        let tint = c.selectedForConfirmation ? BLTheme.blue : (c.insufficient ? BLTheme.sub : BLTheme.gold)
+        let status = c.selectedForConfirmation ? "SELECTED ONLY" : (c.insufficient ? "THIN" : "NO EDGE")
         return HStack(spacing: 12) {
-            Image(systemName: c.proven ? "checkmark.seal.fill" : (c.insufficient ? "hourglass" : "xmark.seal"))
+            Image(systemName: c.selectedForConfirmation ? "checkmark.circle.fill" : (c.insufficient ? "hourglass" : "xmark.seal"))
                 .font(.system(size: 14, weight: .bold)).foregroundColor(tint)
             VStack(alignment: .leading, spacing: 2) {
                 Text(c.params.isEmpty ? "default" : c.params).font(.system(size: 12, weight: .bold, design: .rounded)).foregroundColor(BLTheme.text).lineLimit(1)
@@ -1046,14 +1044,14 @@ struct BacktestScreen: View {
 
     private func farmStatusText(_ r: BacktestFarmReport) -> String {
         switch r.status {
-        case "candidate": return "OOS CANDIDATE"
+        case "candidate": return "SELECTED FOR CONFIRMATION"
         case "no_edge": return "NO EDGE"
         default: return "INSUFFICIENT"
         }
     }
     private func farmStatusTint(_ r: BacktestFarmReport) -> Color {
         switch r.status {
-        case "candidate": return BLTheme.green
+        case "candidate": return BLTheme.blue
         case "no_edge": return BLTheme.gold
         default: return BLTheme.sub
         }

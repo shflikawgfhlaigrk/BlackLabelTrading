@@ -26,9 +26,67 @@ os.environ["BLTD_TOKEN"] = "test-token-xyz"          # deterministic Bearer for 
 
 import bltd_api as A            # noqa: E402 — env must be set first
 import bltd_capture as C        # noqa: E402
+import bltd_optimizer_cli as OC  # noqa: E402
 import bltd_store as S          # noqa: E402
 
 TOK = "test-token-xyz"
+
+
+def _optimizer_report_fixture(run_id=None):
+    symbols = ["ESU6", "MESU6"]
+    series = {
+        "ESU6": [(100.0, 101.0, 99.0, 100.0, 1)],
+        "MESU6": [(200.0, 201.0, 199.0, 200.0, 2)],
+    }
+    cfg = {**S.CONFIG_DEFAULTS, "engines": list(S.ACTIVE_ENGINE_FAMILY)}
+    reservation = OC._build_reservation(
+        "momentum", symbols, series, cfg, bootstrap_samples=1)
+    protocol = reservation["protocol"]
+    sources = reservation["sourceHashes"]
+    prior = 350
+    binding = {
+        "engine": reservation["engine"],
+        "symbols": reservation["symbols"],
+        "inputHashes": reservation["inputHashes"],
+        "protocol": protocol,
+        "protocolHash": reservation["protocolHash"],
+        "gridSha256": reservation["gridSha256"],
+        "sourceHashes": sources,
+        "sourceHash": reservation["sourceHash"],
+        "hypothesisCount": reservation["hypothesisCount"],
+        "priorFamilySize": prior,
+    }
+    return {
+        "kind": "nested_strategy_validation",
+        "available": True,
+        "researchOnly": True,
+        "reservationId": reservation["reservationId"],
+        "generatedUTC": "2026-07-23T12:00:00Z",
+        "provenance": {
+            "runId": run_id or ("e" * 64),
+            "engines": ["momentum"],
+            "contracts": symbols,
+            "inputs": reservation["inputHashes"],
+            "gridSha256": reservation["gridSha256"],
+            "optimizerSha256": sources["optimizerSha256"],
+            "proverSha256": sources["proverSha256"],
+            "configSha256": protocol["configSha256"],
+        },
+        "contracts": symbols,
+        "engines": ["momentum"],
+        "costBandsPoints": protocol["costBandsPoints"],
+        "outerFolds": protocol["outerFolds"],
+        "embargoBars": protocol["embargoBars"],
+        "priorFamilySize": prior,
+        "folds": [],
+        "researchCandidates": [],
+        "eligibleForLive": False,
+        "adopted": False,
+        "label": "Bounded nested validation. Research only.",
+        "reason": "No confirmed research observation.",
+        "disclaimer": OC.RESEARCH_DISCLAIMER,
+        "hypothesisReservation": binding,
+    }
 
 
 # --- loopback test server helpers ------------------------------------------
@@ -107,6 +165,7 @@ def test_loopback_host_allowed():
     try:
         st, obj = _req(port, "GET", "/health", host=f"127.0.0.1:{port}")
         assert st == 200 and obj.get("ok") is True
+        assert obj.get("service") == "black-label-trading"
         st, _ = _req(port, "GET", "/health", host="localhost")
         assert st == 200
     finally:
@@ -269,89 +328,20 @@ def test_webhook_feed_signs_volume_delta_for_wc_tick_bars():
         srv.shutdown()
 
 
-# --- execution control-plane routes (auth + Host gated; live needs OS-auth) ------------------
-def test_exec_routes_require_auth_and_host():
-    srv, port = _start_server()
-    try:
-        # Cold-posture baseline: the suite shares one module-global store, and exec tests that sort
-        # earlier alphabetically (arm/mode-live) leave armed/mode persisted in the exec_kv table. This
-        # test asserts the DEFAULT disarmed/paper posture, so reset that state first (deterministic).
-        for _k, _v in (("armed", "0"), ("mode", "paper"), ("kill", "0"), ("liveAuthExpiry", "0")):
-            A.STORE.set_exec_kv(_k, _v)
-        st, _ = _req(port, "POST", "/api/exec/arm", host=f"127.0.0.1:{port}")          # no bearer
-        assert st == 401
-        st, _ = _req(port, "POST", "/api/exec/arm", host="attacker.com", token=TOK)     # foreign host
-        assert st == 403
-        st, o = _req(port, "GET", "/api/exec/status", host=f"127.0.0.1:{port}", token=TOK)
-        assert st == 200 and o.get("armed") is False and o.get("mode") == "paper"
-    finally:
-        srv.shutdown()
-
-
-def test_exec_arm_disarm_and_kill():
+# --- b27 signals-only boundary ---------------------------------------------------------------
+def test_execution_control_plane_is_absent_and_cannot_mutate_legacy_state():
     srv, port = _start_server()
     try:
         h = f"127.0.0.1:{port}"
-        _req(port, "POST", "/api/exec/arm", host=h, token=TOK, body={})
-        st, o = _req(port, "GET", "/api/exec/status", host=h, token=TOK)
-        assert o["armed"] is True
-        _req(port, "POST", "/api/exec/kill", host=h, token=TOK, body={})
-        st, o = _req(port, "GET", "/api/exec/status", host=h, token=TOK)
-        assert o["kill"] is True                                   # master halt set
-        _req(port, "POST", "/api/exec/clearkill", host=h, token=TOK, body={})
-        st, o = _req(port, "GET", "/api/exec/status", host=h, token=TOK)
-        assert o["kill"] is False
-    finally:
-        srv.shutdown()
-
-
-def test_exec_live_mode_requires_osauth():
-    srv, port = _start_server()
-    try:
-        h = f"127.0.0.1:{port}"
-        st, o = _req(port, "POST", "/api/exec/mode", host=h, token=TOK, body={"mode": "live"})
-        assert o.get("ok") is False and "authentication" in o.get("error", "").lower()
-        st, o2 = _req(port, "GET", "/api/exec/status", host=h, token=TOK)
-        assert o2["mode"] == "paper" and o2["liveAuthorized"] is False   # still not live
-        st, o3 = _req(port, "POST", "/api/exec/mode", host=h, token=TOK, body={"mode": "live", "osAuth": True})
-        assert o3.get("ok") is True and o3["mode"] == "live" and o3["liveAuthorized"] is True
-    finally:
-        srv.shutdown()
-
-
-def test_exec_config_post_cannot_arm():
-    # End-to-end via HTTP: a /api/config POST with exec flags must NOT arm/enable-live/clear-kill.
-    srv, port = _start_server()
-    try:
-        h = f"127.0.0.1:{port}"
-        # establish a known baseline via the DEDICATED routes (tests share one STORE)
-        _req(port, "POST", "/api/exec/disarm", host=h, token=TOK, body={})
-        _req(port, "POST", "/api/exec/mode", host=h, token=TOK, body={"mode": "paper"})
-        _req(port, "POST", "/api/exec/kill", host=h, token=TOK, body={})
-        # now a config POST trying to flip exec flags must be a no-op for them
-        _req(port, "POST", "/api/config", host=h, token=TOK,
-             body={"execArmed": True, "execMode": "live", "execKill": False, "armed": True})
-        st, o = _req(port, "GET", "/api/exec/status", host=h, token=TOK)
-        assert o["armed"] is False and o["mode"] == "paper" and o["kill"] is True, o
-        _req(port, "POST", "/api/exec/clearkill", host=h, token=TOK, body={})   # cleanup for other tests
-    finally:
-        srv.shutdown()
-
-
-def test_exec_creds_route_records_nonsecret_account():
-    srv, port = _start_server()
-    try:
-        h = f"127.0.0.1:{port}"
-        st, o = _req(port, "POST", "/api/exec/creds", host=h, token=TOK,
-                     body={"broker": "projectx", "username": "trader@example.com", "account": "EVAL-50K",
-                           "apiKey": "must-not-be-stored-here"})
-        assert st == 200 and o.get("ok") is True
-        st, status = _req(port, "GET", "/api/exec/status", host=h, token=TOK)
-        assert st == 200
-        assert status["broker"] == "projectx"
-        assert status["brokerUser"] == "trader@example.com"
-        assert status["brokerAccount"] == "EVAL-50K"
-        assert "apiKey" not in status
+        before = dict(A.STORE.exec_flags())
+        st, body = _req(port, "POST", "/api/exec/arm", host=h, token=TOK,
+                        body={"mode": "live", "osAuth": True})
+        assert st == 404 and body.get("error") == "not found"
+        st, body = _req(port, "GET", "/api/exec/status", host=h, token=TOK)
+        assert st == 404 and body.get("error") == "unknown endpoint"
+        after = dict(A.STORE.exec_flags())
+        assert after == before
+        assert after["armed"] is False and after["mode"] == "paper" and after["kill"] is True
     finally:
         srv.shutdown()
 
@@ -432,8 +422,9 @@ def test_backtest_farm_route_sweeps_and_reports_cells_over_fit_transparently():
             assert c["wins"] + c["losses"] == c["trades"]          # honest W/L split
             assert "pEdgeAdj" in c and "pEdge" not in c            # only the FDR-corrected p is shown
             assert 0.0 <= c["pEdgeAdj"] <= 1.0
+            assert "selectionHit" in c and "proven" not in c       # screening, not proof/adoption
             if c["trades"] < S.SIG_MIN_N:
-                assert c["insufficient"] is True and c["proven"] is False
+                assert c["insufficient"] is True and c["selectionHit"] is False
         # never a fabricated aggregate win-rate / $ headline
         assert "winRateAll" not in r and "netPnlDollars" not in r
     finally:
@@ -450,6 +441,175 @@ def test_backtest_farm_route_host_and_auth_gated():
         assert st == 401                                          # auth required (no token)
     finally:
         srv.shutdown()
+
+
+def test_optimizer_latest_is_authenticated_read_only_research_report():
+    saved = os.environ.get("BLTD_OPTIMIZER_REPORT")
+    with tempfile.TemporaryDirectory() as directory:
+        path = os.path.join(directory, "optimizer-latest.json")
+        os.environ["BLTD_OPTIMIZER_REPORT"] = path
+        report = _optimizer_report_fixture()
+        report["researchCandidates"] = [
+            {"engine": "momentum", "params": {"lookback": 20}}]
+        with open(path, "w") as handle:
+            json.dump(report, handle)
+        with open(path, "rb") as handle:
+            before_bytes = handle.read()
+        before_config = A.STORE.config()
+        srv, port = _start_server()
+        try:
+            h = f"127.0.0.1:{port}"
+            st, body = _req(
+                port, "GET", "/api/research/optimizer/latest",
+                host="optimizer.attacker.example", token=TOK)
+            assert st == 403 and body.get("error") == "forbidden"
+            st, body = _req(port, "GET", "/api/research/optimizer/latest", host=h)
+            assert st == 401 and body.get("error") == "unauthorized"
+            st, body = _req(
+                port, "GET", "/api/research/optimizer/latest", host=h, token=TOK)
+            assert st == 200
+            assert body["kind"] == "nested_strategy_validation"
+            assert body["provenance"]["runId"] == "e" * 64
+            assert body["researchCandidates"] == report["researchCandidates"]
+            assert body["researchOnly"] is True
+            assert body["eligibleForLive"] is False and body["adopted"] is False
+
+            # There is deliberately no HTTP compute control plane.
+            st, body = _req(
+                port, "POST", "/api/research/optimizer/run", host=h, token=TOK, body={})
+            assert st == 404 and body.get("error") == "not found"
+            st, body = _req(
+                port, "POST", "/api/research/optimizer/latest", host=h, token=TOK, body={})
+            assert st == 404 and body.get("error") == "not found"
+        finally:
+            srv.shutdown()
+        with open(path, "rb") as handle:
+            assert handle.read() == before_bytes
+        assert A.STORE.config() == before_config
+    if saved is None:
+        os.environ.pop("BLTD_OPTIMIZER_REPORT", None)
+    else:
+        os.environ["BLTD_OPTIMIZER_REPORT"] = saved
+
+
+def test_optimizer_latest_observes_only_canonical_side_of_atomic_replace():
+    saved = os.environ.get("BLTD_OPTIMIZER_REPORT")
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "optimizer-latest.json")
+            staged = os.path.join(directory, ".optimizer-next.json")
+            os.environ["BLTD_OPTIMIZER_REPORT"] = path
+            before = _optimizer_report_fixture("1" * 64)
+            after = _optimizer_report_fixture("2" * 64)
+            with open(path, "w") as handle:
+                json.dump(before, handle)
+            with open(staged, "w") as handle:
+                json.dump(after, handle)
+            srv, port = _start_server()
+            try:
+                h = f"127.0.0.1:{port}"
+                st, first = _req(
+                    port, "GET", "/api/research/optimizer/latest", host=h, token=TOK)
+                assert st == 200 and first["provenance"]["runId"] == "1" * 64
+                os.replace(staged, path)
+                st, second = _req(
+                    port, "GET", "/api/research/optimizer/latest", host=h, token=TOK)
+                assert st == 200 and second["provenance"]["runId"] == "2" * 64
+            finally:
+                srv.shutdown()
+    finally:
+        if saved is None:
+            os.environ.pop("BLTD_OPTIMIZER_REPORT", None)
+        else:
+            os.environ["BLTD_OPTIMIZER_REPORT"] = saved
+
+
+def test_optimizer_latest_missing_or_invalid_fails_closed_without_creating_report():
+    saved = os.environ.get("BLTD_OPTIMIZER_REPORT")
+    with tempfile.TemporaryDirectory() as directory:
+        path = os.path.join(directory, "optimizer-latest.json")
+        os.environ["BLTD_OPTIMIZER_REPORT"] = path
+        srv, port = _start_server()
+        try:
+            h = f"127.0.0.1:{port}"
+            # A sibling temp file is never visible before the CLI's atomic os.replace.
+            with open(path + ".tmp", "w") as handle:
+                json.dump({"kind": "nested_strategy_validation", "available": True}, handle)
+            st, missing = _req(
+                port, "GET", "/api/research/optimizer/latest", host=h, token=TOK)
+            assert st == 200 and missing["available"] is False
+            assert missing["researchCandidates"] == []
+            assert missing["researchOnly"] is True
+            assert missing["eligibleForLive"] is False and missing["adopted"] is False
+            assert "never computes" in missing["label"]
+            assert not os.path.exists(path)
+
+            with open(path, "w") as handle:
+                handle.write("{broken")
+            st, malformed = _req(
+                port, "GET", "/api/research/optimizer/latest", host=h, token=TOK)
+            assert st == 200 and malformed["available"] is False
+            assert malformed["researchCandidates"] == []
+
+            with open(path, "w") as handle:
+                json.dump([{"kind": "nested_strategy_validation"}], handle)
+            st, wrong_shape = _req(
+                port, "GET", "/api/research/optimizer/latest", host=h, token=TOK)
+            assert st == 200 and wrong_shape["available"] is False
+
+            with open(path, "w") as handle:
+                json.dump({
+                    "kind": "nested_strategy_validation",
+                    "available": False,
+                    "provenance": {"runId": "incomplete"},
+                    "eligibleForLive": False,
+                    "adopted": False,
+                }, handle)
+            st, incomplete = _req(
+                port, "GET", "/api/research/optimizer/latest", host=h, token=TOK)
+            assert st == 200 and incomplete["available"] is False
+            assert incomplete["reason"] != "incomplete"
+            assert incomplete["researchCandidates"] == []
+
+            # A report that claims adoption/live eligibility is rejected, never sanitized into an
+            # apparently valid result.
+            unsafe_report = _optimizer_report_fixture()
+            unsafe_report.update(
+                eligibleForLive=True, adopted=True,
+                researchCandidates=[{"engine": "momentum"}])
+            with open(path, "w") as handle:
+                json.dump(unsafe_report, handle)
+            st, unsafe = _req(
+                port, "GET", "/api/research/optimizer/latest", host=h, token=TOK)
+            assert st == 200 and unsafe["available"] is False
+            assert unsafe["researchCandidates"] == []
+            assert unsafe["eligibleForLive"] is False and unsafe["adopted"] is False
+
+            dishonest = _optimizer_report_fixture()
+            dishonest.update(
+                researchOnly=False, label="Guaranteed live profits",
+                disclaimer="Eligible for live deployment", executionApproved=True)
+            with open(path, "w") as handle:
+                json.dump(dishonest, handle)
+            st, rejected = _req(
+                port, "GET", "/api/research/optimizer/latest", host=h, token=TOK)
+            assert st == 200 and rejected["available"] is False
+            assert "executionApproved" not in rejected
+
+            # Pathologically deep but syntactically valid JSON is corrupt input, not an API error
+            # shape or traceback leak.
+            with open(path, "w") as handle:
+                handle.write('{"nested":' * 1_100 + "null" + "}" * 1_100)
+            st, deep = _req(
+                port, "GET", "/api/research/optimizer/latest", host=h, token=TOK)
+            assert st == 200 and deep["available"] is False
+            assert deep["researchOnly"] is True and "error" not in deep
+        finally:
+            srv.shutdown()
+    if saved is None:
+        os.environ.pop("BLTD_OPTIMIZER_REPORT", None)
+    else:
+        os.environ["BLTD_OPTIMIZER_REPORT"] = saved
 
 
 if __name__ == "__main__":

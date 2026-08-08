@@ -6,6 +6,7 @@ synthetic OHLC series that SHOULD prove edge does; one that should NOT doesn't; 
 yield an honest empty result (no fabrication). Runnable via `python3 -m pytest test_engines.py`
 or plain `python3 test_engines.py`.
 """
+import math
 import os
 import tempfile
 import time
@@ -95,6 +96,155 @@ def test_analytics_trades_for_matches_gate():
     trades, split = A._trades_for("breakout", ohlc, cfg)
     oos = ohlc[int(len(ohlc) * (1.0 - cfg["oosFrac"])):]
     assert trades == S._bk_trades(oos, cfg["lookback"], cfg)
+
+
+def test_research_fill_config_is_sanitized_and_bounded():
+    assert S.CONFIG_DEFAULTS["bkMaxHold"] == 80
+    assert S.CONFIG_DEFAULTS["researchTickSize"] == 0.25
+    low = S._sanitize({"bkMaxHold": -5, "researchTickSize": -1})
+    high = S._sanitize({"bkMaxHold": 999_999, "researchTickSize": 999})
+    assert low["bkMaxHold"] == S._CONFIG_RANGES["bkMaxHold"][0]
+    assert low["researchTickSize"] == S._CONFIG_RANGES["researchTickSize"][0]
+    assert high["bkMaxHold"] == S._CONFIG_RANGES["bkMaxHold"][1]
+    assert high["researchTickSize"] == S._CONFIG_RANGES["researchTickSize"][1]
+    nonfinite = S._sanitize({"bkMaxHold": float("nan"), "researchTickSize": float("inf")})
+    assert nonfinite["bkMaxHold"] == S.CONFIG_DEFAULTS["bkMaxHold"]
+    assert nonfinite["researchTickSize"] == S.CONFIG_DEFAULTS["researchTickSize"]
+
+
+def test_all_trade_generator_families_enter_only_at_next_bar_open():
+    cfg = dict(S.CONFIG_DEFAULTS)
+    cfg.update({"lookback": 3, "mrZ": 1.0, "mrStopMult": 2.0,
+                "mrTgtFrac": 0.5, "bkMaxHold": 1})
+
+    # Breakout signal is knowable only at index 3's close (103); fill is index 4's open,
+    # adversely rounded up for a long — never the already-known 103 close.
+    breakout_bars = [(100.0, 100.0, 100.0, 100.0),
+                     (101.0, 101.0, 101.0, 101.0),
+                     (102.0, 102.0, 102.0, 102.0),
+                     (103.0, 103.0, 103.0, 103.0),
+                     (110.01, 110.5, 109.5, 110.24)]
+    bk = S._bk_trades(breakout_bars, 3, cfg)[0]
+    assert (bk["signalIndex"], bk["entryIndex"]) == (3, 4)
+    assert bk["entry"] == 110.25 and bk["entry"] != breakout_bars[3][3]
+
+    # Mean reversion uses the same causal handoff. Its short entry rounds DOWN.
+    mr_bars = [(99.0, 99.0, 99.0, 99.0),
+               (100.0, 100.0, 100.0, 100.0),
+               (101.0, 101.0, 101.0, 101.0),
+               (103.0, 103.0, 103.0, 103.0),
+               (104.13, 104.5, 103.5, 104.13)]
+    mr = S._mr_trades(mr_bars, 3, cfg)[0]
+    assert mr["dir"] == "short" and (mr["signalIndex"], mr["entryIndex"]) == (3, 4)
+    assert mr["entry"] == 104.0 and mr["entry"] != mr_bars[3][3]
+
+    # Momentum/structure/regime/channel/context_a/context_b all share this walker. A stub
+    # direction isolates its fill timing from each engine's independent signal predicate.
+    consensus_bars = [(100.0, 100.0, 100.0, 100.0),
+                      (101.0, 101.0, 101.0, 101.0),
+                      (102.13, 102.5, 101.75, 102.13)]
+    co = S._consensus_engine_trades(
+        consensus_bars, 1, cfg, lambda closes, bars, lookback, config: "long")[0]
+    assert (co["signalIndex"], co["entryIndex"]) == (1, 2)
+    assert co["entry"] == 102.25 and co["entry"] != consensus_bars[1][3]
+
+    # A last-bar signal has no observable next open, so it is rejected rather than filled
+    # retrospectively at its close.
+    assert S._bk_trades(breakout_bars[:-1], 3, cfg) == []
+
+
+def test_gap_aware_brackets_fill_open_and_same_bar_ambiguity_stop_first():
+    # Long gap through stop: fill at the adverse-rounded open (-2R), not the impossible stop (-1R).
+    long_stop = [(100.0, 100.5, 99.5, 100.0), (98.0, 103.0, 97.0, 102.0)]
+    t = S._mr_simulate_ohlc(long_stop, 0, "long", 100.0, 99.0, 102.0, 10, 0.25)
+    assert t["exit"] == 98.0 and t["r"] == -2.0 and t["exitIndex"] == 1
+
+    # Long gap beyond target receives the real open improvement; it is not clipped to target.
+    long_target = [(100.0, 100.5, 99.5, 100.0), (103.0, 104.0, 102.5, 103.0)]
+    t = S._mr_simulate_ohlc(long_target, 0, "long", 100.0, 99.0, 102.0, 10, 0.25)
+    assert t["exit"] == 103.0 and t["r"] == 3.0
+
+    # Mirror the adverse gap rule for a short.
+    short_stop = [(100.0, 100.5, 99.5, 100.0), (102.0, 103.0, 97.0, 98.0)]
+    t = S._mr_simulate_ohlc(short_stop, 0, "short", 100.0, 101.0, 98.0, 10, 0.25)
+    assert t["exit"] == 102.0 and t["r"] == -2.0
+
+    # When the open is inside the bracket but H/L spans BOTH levels, OHLC has no touch order.
+    # The only fail-closed resolution is the stop.
+    ambiguous = [(100.0, 103.0, 98.0, 101.0)]
+    long = S._mr_simulate_ohlc(ambiguous, 0, "long", 100.0, 99.0, 102.0, 10, 0.25)
+    short = S._mr_simulate_ohlc(ambiguous, 0, "short", 100.0, 101.0, 98.0, 10, 0.25)
+    assert long["exit"] == 99.0 and long["r"] == -1.0
+    assert short["exit"] == 101.0 and short["r"] == -1.0
+
+
+def test_order_trigger_rounding_cannot_turn_a_stop_only_bar_into_a_target_win():
+    # Regression: treating stop/target levels as adverse EXIT fills moved a LONG 99.90 stop down
+    # to 99.75 and a 100.30 target down to 100.25. This bar then became a fabricated +1R target
+    # although the intended geometry touched only the stop. Legal LONG orders both round UP;
+    # realized fills are rounded separately.
+    long_bar = [(100.0, 100.25, 99.80, 100.0)]
+    long = S._bracket_trade(
+        long_bar, 0, "long", 100.0, 99.90, 100.30, 1, tick_size=0.25)
+    assert long is not None
+    assert long["stop"] == 100.0 and long["target"] == 100.5
+    assert long["exit"] == 100.0 and long["r"] == 0.0, \
+        "a stop-only bar must never become a positive-R target win"
+
+    # Exact SHORT symmetry: stop/target orders both round DOWN, while the realized SHORT exit
+    # continues to use adverse (upward) fill rounding.
+    short_bar = [(100.0, 100.20, 99.75, 100.0)]
+    short = S._bracket_trade(
+        short_bar, 0, "short", 100.0, 100.10, 99.70, 1, tick_size=0.25)
+    assert short is not None
+    assert short["stop"] == 100.0 and short["target"] == 99.5
+    assert short["exit"] == 100.0 and short["r"] == 0.0
+    assert S._round_order_level(99.90, "long", "stop", 0.25) == 100.0
+    assert S._round_order_level(100.30, "long", "target", 0.25) == 100.5
+    assert S._round_order_level(100.10, "short", "stop", 0.25) == 100.0
+    assert S._round_order_level(99.70, "short", "target", 0.25) == 99.5
+
+
+def test_breakout_max_hold_is_entry_inclusive_and_blocks_later_session_gap():
+    cfg = dict(S.CONFIG_DEFAULTS)
+    cfg.update({"lookback": 3, "bkMaxHold": 2})
+    bars = [(100.0, 100.0, 100.0, 100.0),
+            (101.0, 101.0, 101.0, 101.0),
+            (102.0, 102.0, 102.0, 102.0),
+            (103.0, 103.0, 103.0, 103.0),          # signal
+            (104.0, 104.25, 103.75, 104.0),        # entry bar (hold bar 1)
+            (104.0, 104.25, 103.75, 104.0),        # hold bar 2 -> forced close
+            (150.0, 151.0, 149.0, 150.0)]          # later gap must not improve trade 1
+    first = S._bk_trades(bars, 3, cfg)[0]
+    assert first["signalIndex"] == 3 and first["entryIndex"] == 4
+    assert first["exitIndex"] == 5 and first["held"] == 1
+    assert first["exit"] == 104.0, "maxHold=2 means entry bar + one later bar, then flat"
+
+    one_bar = dict(cfg, bkMaxHold=1)
+    first = S._bk_trades(bars, 3, one_bar)[0]
+    assert first["exitIndex"] == first["entryIndex"] and first["held"] == 0
+
+
+def test_es_research_tick_rounding_is_directionally_conservative_and_fail_closed():
+    assert S._round_fill(5000.01, "long", 0.25, is_entry=True) == 5000.25
+    assert S._round_fill(5000.01, "short", 0.25, is_entry=True) == 5000.0
+    assert S._round_fill(5000.01, "long", 0.25, is_entry=False) == 5000.0
+    assert S._round_fill(5000.01, "short", 0.25, is_entry=False) == 5000.25
+    assert S._round_fill(float("nan"), "long", 0.25, is_entry=True) is None
+    assert S._round_fill(5000.0, "long", 0.0, is_entry=True) is None
+
+    bars = [(100.0, 100.0, 100.0, 100.0),
+            (101.0, 101.0, 101.0, 101.0),
+            (102.0, 102.0, 102.0, 102.0),
+            (103.0, 103.0, 103.0, 103.0),
+            (104.01, 104.3, 103.9, 104.24)]
+    bad_tick = dict(S.CONFIG_DEFAULTS, lookback=3, researchTickSize=0.0)
+    bad_hold = dict(S.CONFIG_DEFAULTS, lookback=3, bkMaxHold=0)
+    assert S._bk_trades(bars, 3, bad_tick) == []
+    assert S._bk_trades(bars, 3, bad_hold) == []
+    corrupt = list(bars)
+    corrupt[2] = (102.0, float("nan"), 102.0, 102.0)
+    assert S._bk_trades(corrupt, 3, S.CONFIG_DEFAULTS) == []
 
 
 # ===========================================================================
@@ -246,14 +396,44 @@ def test_roster_registered_everywhere():
         assert e in S.PROVERS, f"{e} missing from PROVERS"
         assert e in S.ENGINE_TRADES, f"{e} missing from ENGINE_TRADES"
         assert e in S._KNOWN_ENGINES, f"{e} missing from _KNOWN_ENGINES"
-        assert e in S.CONFIG_DEFAULTS["engines"], f"{e} missing from default engines"
+    assert tuple(S.CONFIG_DEFAULTS["engines"]) == S.ACTIVE_ENGINE_FAMILY
+    assert set(S.FDR_ENGINE_FAMILY) == set(ROSTER)
 
 
 def test_capture_signal_dispatch_covers_roster():
     import bltd_capture as C
-    assert set(C.ENGINES) == set(ROSTER)
+    assert tuple(C.ENGINES) == S.ACTIVE_ENGINE_FAMILY
     for e in C.ENGINES:
         assert e in S.PROVERS
+
+
+def test_retired_duplicate_aliases_stay_in_fdr_but_not_live_config():
+    assert S.DUPLICATE_ENGINE_ALIASES == {"research": "breakout", "context_a": "momentum"}
+    clean = S._sanitize({"engines": ["research", "breakout", "context_a", "momentum"]})
+    assert clean["engines"] == ["breakout", "momentum"]
+    assert set(S.DUPLICATE_ENGINE_ALIASES).isdisjoint(S.ACTIVE_ENGINE_FAMILY)
+
+
+def test_retired_duplicate_aliases_cannot_run_current_backtest_surfaces():
+    import bltd_analytics as A
+
+    class _Store:
+        def config(self): return S.CONFIG_DEFAULTS
+        def ohlc_between(self, _symbol, _start=None, _end=None): return [(100.0,) * 4] * 80
+
+    for alias, canonical in S.DUPLICATE_ENGINE_ALIASES.items():
+        report = A.full_backtest(alias, [(100.0,) * 4] * 80)
+        assert report["ok"] is False and report["enoughBars"] is False
+        assert "retired duplicate" in report["reason"] and canonical in report["reason"]
+        lab = A.backtest_lab(_Store(), alias, "CM.ESU6")
+        assert lab["available"] is False
+        assert "retired duplicate" in lab["reason"] and canonical in lab["reason"]
+
+
+def test_persisted_config_cannot_disable_or_loosen_the_release_gate():
+    clean = S._sanitize({"edgeGate": False, "fdrQ": 0.99})
+    assert clean["edgeGate"] is True
+    assert clean["fdrQ"] == 0.10
 
 
 def test_capture_signal_produces_each_new_engine_direction():
@@ -1082,9 +1262,8 @@ def _bh(pvals, q):
 
 
 def test_edge_pvalue_caps_winr_no_datasnoop():
-    # A single lucky runner must NOT lower the breakeven and inflate significance. With a 2:1 target,
-    # a null-ish 50-trade list (17 wins) stays non-significant even if one win is a giant R=8 runner,
-    # because winR is capped at the intended target (2.0), not the realized max.
+    # A single lucky runner must not purchase significance. Positive returns are capped at the
+    # intended 2R target while every realized loss remains in the return sample.
     base = [{"r": 2.0, "dir": "long", "entry": 1.0, "exit": 1.0} for _ in range(17)]
     base += [{"r": -1.0, "dir": "long", "entry": 1.0, "exit": 1.0} for _ in range(33)]
     runner = list(base); runner[0] = {"r": 8.0, "dir": "long", "entry": 1.0, "exit": 1.0}
@@ -1092,6 +1271,105 @@ def test_edge_pvalue_caps_winr_no_datasnoop():
     p_uncapped_maxsnoop = S._binom_sf(17, 50, 1.0 / (1.0 + 8.0))   # what max()-snoop would have used
     assert p_capped > S.SIG_ALPHA, f"capped winR must keep a runner-laced null non-significant (p={p_capped})"
     assert p_uncapped_maxsnoop < S.SIG_ALPHA  # proves the snoop WOULD have fired without the cap
+
+
+def _return_trades(values):
+    return [{"r": value, "dir": "long", "entry": 100.0, "exit": 100.0 + value}
+            for value in values]
+
+
+def test_edge_return_test_rejects_time_exit_payoff_repro():
+    # Regression: one +2R target, fourteen tiny +0.01R time exits and fifteen -0.14R losses have
+    # raw expectancy +0.00133R. A fixed-2R Bernoulli model reports p≈.043 even though empirical
+    # payoff breakeven is ~49.5%; these are plainly not fixed-payoff Bernoulli trials.
+    values = [2.0] + [0.01] * 14 + [-0.14] * 15
+    trades = _return_trades(values)
+    expectancy = math.fsum(values) / len(values)
+    assert expectancy > 0.0
+    old_binary_p = S._binom_sf(15, 30, 1.0 / 3.0)
+    assert old_binary_p < S.SIG_ALPHA
+    p_value = S._edge_pvalue(
+        trades, 15, len(trades), expectancy, 30, target_r=2.0)
+    assert p_value > 0.25, p_value
+    assert S._edge_pvalue(
+        trades, 15, len(trades), expectancy, 30, target_r=None) == 1.0, \
+        "the variable-payoff path must robustly cap the lone runner too"
+    assert not S._edge_proven(
+        trades, 15, len(trades), expectancy, 30, target_r=2.0)
+    summary = S._summarize(trades, min_trades=30, target_r=2.0)
+    assert summary["expectancyR"] > 0.0 and summary["edgeProven"] is False
+    assert summary["pEdge"] > 0.25
+
+
+def test_edge_return_test_positive_and_negative_controls():
+    # A repeated, mixed-payoff positive edge clears the one-sided return test.
+    positive = [2.0, -1.0, 2.0, 2.0, -1.0] * 20
+    positive_trades = _return_trades(positive)
+    positive_p = S._edge_pvalue(
+        positive_trades, sum(value > 0 for value in positive), len(positive),
+        math.fsum(positive) / len(positive), 30, target_r=2.0)
+    assert 0.0 <= positive_p < S.SIG_ALPHA, positive_p
+
+    # A losing sample and a positive-expectancy but weak sample both fail closed.
+    negative = [0.5, -1.0] * 50
+    negative_trades = _return_trades(negative)
+    assert S._edge_pvalue(
+        negative_trades, 50, 100, math.fsum(negative) / 100, 30,
+        target_r=2.0) == 1.0
+    weak = [2.0] * 34 + [-1.0] * 66
+    weak_trades = _return_trades(weak)
+    weak_p = S._edge_pvalue(
+        weak_trades, 34, 100, math.fsum(weak) / 100, 30, target_r=2.0)
+    assert weak_p > S.SIG_ALPHA, weak_p
+
+
+def test_edge_return_test_penalizes_serial_clustering_and_is_deterministic():
+    # Identical marginal returns carry less evidence when wins and losses arrive in long clusters.
+    dispersed = [1.0, -0.5] * 40
+    clustered = [1.0] * 40 + [-0.5] * 40
+
+    def p_value(values):
+        trades = _return_trades(values)
+        return S._edge_pvalue(
+            trades, sum(value > 0 for value in values), len(values),
+            math.fsum(values) / len(values), 30, target_r=2.0)
+
+    dispersed_p = p_value(dispersed)
+    clustered_p = p_value(clustered)
+    assert clustered_p > dispersed_p, (dispersed_p, clustered_p)
+    assert dispersed_p < S.SIG_ALPHA < clustered_p, (dispersed_p, clustered_p)
+    assert [p_value(clustered) for _ in range(10)] == [clustered_p] * 10
+
+
+def test_edge_return_test_fail_closed_and_large_n_stable():
+    degenerate = _return_trades([0.5] * 30)
+    assert S._edge_pvalue(degenerate, 30, 30, 0.5, 30) == 1.0
+    nonfinite = _return_trades([2.0] * 30 + [-1.0] * 30)
+    nonfinite[4]["r"] = float("nan")
+    assert S._edge_pvalue(nonfinite, 30, 60, 0.5, 30, target_r=2.0) == 1.0
+    valid = _return_trades(([2.0, -1.0, 2.0, 2.0, -1.0] * 4000))
+    p_value = S._edge_pvalue(valid, 12000, 20000, 0.8, 30, target_r=2.0)
+    assert math.isfinite(p_value) and 0.0 <= p_value <= 1.0
+    assert p_value < S.SIG_ALPHA
+    assert S._edge_pvalue(valid, 11999, 20000, 0.8, 30, target_r=2.0) == 1.0
+    assert S._edge_pvalue(valid, 12000, 19999, 0.8, 30, target_r=2.0) == 1.0
+
+
+def test_binomial_survival_is_stable_for_high_turnover_optimizer_cells():
+    # Regression lock: the parameter farm reached n=1307/1311 and math.comb(...) overflowed while
+    # converting giant integers to float. Large samples must yield a bounded p, never crash.
+    for k, n, p in ((450, 1307, 1.0 / 3.0), (500, 1311, 1.0 / 3.0),
+                    (950, 2000, 0.5), (1, 100_000, 0.00001)):
+        value = S._binom_sf(k, n, p)
+        assert math.isfinite(value) and 0.0 <= value <= 1.0
+
+    # Preserve the previous exact-small-n behavior to numerical precision.
+    for n in (5, 20, 50):
+        for k in (1, n // 2, n):
+            p = 0.37
+            exact = sum(math.comb(n, i) * (p ** i) * ((1.0 - p) ** (n - i))
+                        for i in range(k, n + 1))
+            assert abs(S._binom_sf(k, n, p) - exact) < 1e-12
 
 
 def test_benjamini_hochberg_math():
@@ -1113,6 +1391,9 @@ def test_benjamini_hochberg_math():
     bh = _bh(p, 0.05)
     assert naive == {0, 1} and bh == {0}, (naive, bh)
     assert 1 in naive and 1 not in bh   # the marginal cell naive keeps, BH correctly drops
+    # Full historical engine family: one current p=.02 plus eight null/debt hypotheses is rejected
+    # at q=.10 (rank-1 threshold = .1/9). Retired aliases must never clone the .02 and rescue it.
+    assert _bh([0.02] + [1.0] * 8, 0.10) == set()
 
 
 def test_stats_honest_ratios():
@@ -1160,27 +1441,29 @@ def test_screen_fdr_suppresses_grid_inflation():
     pmap = {"STRONG": 0.0001, "MARGINAL0": 0.04, "MARGINAL1": 0.04, "MARGINAL2": 0.04}
     for i in range(96):
         pmap[f"NULL{i}"] = 0.8
-    bars = [(100.0 + i * 0.1, 100.0 + i * 0.1, 100.0 + i * 0.1, 100.0 + i * 0.1) for i in range(60)]
-    holder = {"p": 1.0}
-
     def prove(ohlc, cfg=None):
-        p = holder["p"]
+        p = float(ohlc[0][0])
         return {"ok": p < S.SIG_ALPHA, "pEdge": p, "winRate": 0.6, "netPts": 1.0,
                 "expectancyR": 0.2, "trades": 50, "reason": "OOS candidate"}
 
     class _StoreSeq:
         def config(self): return S.CONFIG_DEFAULTS
-        def ohlc(self, sym): holder["p"] = pmap[sym]; return bars   # thread p to the next prover call
+        def ohlc(self, sym):
+            p = pmap[sym]
+            return [(p, p, p, p)] * 60
 
     orig_provers = S.PROVERS
+    orig_family = S.FDR_ENGINE_FAMILY
     orig_scope = S.INSTRUMENT_SCOPE
     try:
         S.INSTRUMENT_SCOPE = "all"  # this test exercises FDR math, not the shipped Topstep scope
         S.PROVERS = {"fake": prove}
+        S.FDR_ENGINE_FAMILY = ("fake",)
         rows = A.screen(_StoreSeq(), list(pmap.keys()), ["fake"], S.CONFIG_DEFAULTS)
     finally:
         S.INSTRUMENT_SCOPE = orig_scope
         S.PROVERS = orig_provers
+        S.FDR_ENGINE_FAMILY = orig_family
 
     per_test_passers = {r["symbol"] for r in rows if r.get("pEdge", 1.0) < S.SIG_ALPHA}
     bh_survivors = {r["symbol"] for r in rows if r["edge"]}
@@ -1188,6 +1471,99 @@ def test_screen_fdr_suppresses_grid_inflation():
     assert bh_survivors == {"STRONG"}, f"BH must keep only the strong cell, got {bh_survivors}"
     demoted = [r for r in rows if r["symbol"].startswith("MARGINAL")]
     assert all(not r["edge"] and "FDR" in r["reason"] for r in demoted)
+
+
+def test_screen_request_subset_cannot_shrink_the_fdr_family():
+    """A caller requesting one engine must not buy a looser threshold than the immutable family."""
+    import bltd_analytics as A
+
+    family = ("requested", "null1", "null2", "null3", "null4", "null5", "null6", "null7", "null8")
+    calls = []
+
+    def make_prover(name):
+        def prove(_ohlc, _cfg=None):
+            calls.append(name)
+            p = 0.02 if name == "requested" else 1.0
+            return {"ok": p < S.SIG_ALPHA, "pEdge": p, "winRate": 0.6, "netPts": 1.0,
+                    "expectancyR": 0.2, "trades": (50 if name == "requested" else 0),
+                    "reason": "synthetic controlled verdict"}
+        return prove
+
+    class _OneSymbol:
+        def config(self): return S.CONFIG_DEFAULTS
+        def ohlc(self, _sym): return [(100.0, 100.0, 100.0, 100.0)] * 60
+        def symbols(self): return {"backtestable": ["ES"]}
+
+    orig_provers = S.PROVERS
+    orig_family = S.FDR_ENGINE_FAMILY
+    orig_scope = S.INSTRUMENT_SCOPE
+    try:
+        S.INSTRUMENT_SCOPE = "all"
+        S.FDR_ENGINE_FAMILY = family
+        S.PROVERS = {name: make_prover(name) for name in family}
+        rows = A.screen(_OneSymbol(), ["ES"], ["requested"], S.CONFIG_DEFAULTS)
+    finally:
+        S.INSTRUMENT_SCOPE = orig_scope
+        S.FDR_ENGINE_FAMILY = orig_family
+        S.PROVERS = orig_provers
+
+    assert len(rows) == 1 and rows[0]["engine"] == "requested"
+    assert rows[0]["pEdge"] == 0.02 and rows[0]["edge"] is False
+    assert "across 9 tests" in rows[0]["reason"]
+    assert sorted(calls) == sorted(family), "every historical family member must be evaluated"
+
+
+def test_screen_charges_retired_alias_debt_without_rows_or_duplicate_evidence():
+    """Retired aliases count as p=1 historical debt, never as cloned current evidence.
+
+    With the complete nine-hypothesis engine family, a lone canonical p=.02 must remain rejected at
+    q=.10. Cloning that p into its retired alias would incorrectly move both copies to rank 2 and
+    make them survive (2/9*.10=.0222).
+    """
+    import bltd_analytics as A
+
+    bars = [(100.0 + i * 0.1,) * 4 for i in range(80)]
+
+    class _Store:
+        def config(self): return S.CONFIG_DEFAULTS
+        def ohlc(self, _symbol): return bars
+        def symbols(self): return {"backtestable": ["ES"]}
+
+    original = S.PROVERS
+    calls = {engine: 0 for engine in S.ACTIVE_ENGINE_FAMILY}
+    patched = dict(original)
+
+    def controlled(name):
+        def run(_ohlc, _cfg=None):
+            calls[name] += 1
+            p = 0.02 if name == "breakout" else 1.0
+            return {"ok": p < S.SIG_ALPHA, "edgeProven": p < S.SIG_ALPHA,
+                    "pEdge": p, "winRate": 0.6, "netPts": 1.0,
+                    "expectancyR": 0.2, "trades": 50 if p < 1.0 else 0,
+                    "reason": "synthetic controlled verdict"}
+        return run
+
+    def duplicate_must_not_run(_ohlc, _cfg=None):
+        raise AssertionError("retired duplicate prover was recomputed")
+
+    for engine in S.ACTIVE_ENGINE_FAMILY:
+        patched[engine] = controlled(engine)
+    patched["research"] = duplicate_must_not_run
+    patched["context_a"] = duplicate_must_not_run
+    try:
+        S.PROVERS = patched
+        rows = A.screen(_Store(), ["ES"], list(S.FDR_ENGINE_FAMILY), S.CONFIG_DEFAULTS)
+    finally:
+        S.PROVERS = original
+
+    assert len(rows) == len(S.ACTIVE_ENGINE_FAMILY)
+    assert calls == {engine: 1 for engine in S.ACTIVE_ENGINE_FAMILY}
+    by_engine = {row["engine"]: row for row in rows}
+    assert set(by_engine) == set(S.ACTIVE_ENGINE_FAMILY)
+    assert set(S.DUPLICATE_ENGINE_ALIASES).isdisjoint(by_engine)
+    assert by_engine["breakout"]["pEdge"] == 0.02
+    assert by_engine["breakout"]["edge"] is False
+    assert "across 9 tests" in by_engine["breakout"]["reason"]
 
 
 # ===========================================================================
@@ -1216,6 +1592,8 @@ def test_summary_reports_wins_losses_and_drawdown():
 def test_prover_source_sha_is_16hex():
     sha = S.prover_source_sha()
     assert len(sha) == 16 and all(ch in "0123456789abcdef" for ch in sha), sha
+    full = S.prover_source_sha256()
+    assert len(full) == 64 and full.startswith(sha)
 
 
 class _RerunStore:
@@ -1239,7 +1617,7 @@ def test_gate_rerun_empty_store_is_honest_not_fabricated():
     assert len(rep["prover_sha"]) == 16 and rep["sigMinN"] == S.SIG_MIN_N
 
 
-def test_gate_rerun_runs_every_engine_and_stamps_prover_sha():
+def test_gate_rerun_reports_active_engines_and_charges_full_historical_fdr_family():
     import bltd_analytics as A
     orig_scope = S.INSTRUMENT_SCOPE
     try:
@@ -1250,7 +1628,12 @@ def test_gate_rerun_runs_every_engine_and_stamps_prover_sha():
         S.INSTRUMENT_SCOPE = orig_scope
     assert rep["available"] is True
     assert rep["prover_sha"] == S.prover_source_sha()
-    assert rep["engineCount"] == len(S.PROVERS)                       # no cherry-picking: all engines
+    assert rep["engineCount"] == len(S.ACTIVE_ENGINE_FAMILY)
+    assert rep["fdrHypothesisCount"] == len(S.FDR_ENGINE_FAMILY)
+    assert rep["fdrRetiredDebtCount"] == len(S.DUPLICATE_ENGINE_ALIASES)
+    assert set(S.DUPLICATE_ENGINE_ALIASES).isdisjoint(
+        e["engine"] for e in rep["engines"]
+    )
     assert rep["candidateCount"] + rep["noEdgeCount"] + rep["insufficientCount"] == rep["engineCount"]
     for e in rep["engines"]:
         assert e["status"] in ("candidate", "no_edge", "insufficient")
@@ -1258,6 +1641,59 @@ def test_gate_rerun_runs_every_engine_and_stamps_prover_sha():
             for k in ("trades", "wins", "losses", "maxDrawdownR", "pEdge", "reason"):
                 assert k in c
             assert c["wins"] + c["losses"] == c["trades"]            # honest W/L split
+
+
+def test_gate_rerun_retired_alias_debt_cannot_rescue_canonical_p02():
+    import bltd_analytics as A
+
+    patched = dict(S.PROVERS)
+    calls = {engine: 0 for engine in S.ACTIVE_ENGINE_FAMILY}
+
+    def controlled(engine):
+        def run(_ohlc, _cfg=None):
+            calls[engine] += 1
+            p = 0.02 if engine == "breakout" else 1.0
+            return {
+                "ok": p < S.SIG_ALPHA, "edgeProven": p < S.SIG_ALPHA,
+                "pEdge": p, "trades": 50 if p < 1.0 else 0,
+                "wins": 30 if p < 1.0 else 0, "losses": 20 if p < 1.0 else 0,
+                "winRate": 0.6 if p < 1.0 else 0.0,
+                "netPts": 1.0 if p < 1.0 else 0.0,
+                "expectancyR": 0.2 if p < 1.0 else 0.0,
+                "maxDrawdownR": 1.0 if p < 1.0 else 0.0,
+                "reason": "synthetic controlled verdict",
+            }
+        return run
+
+    def alias_must_not_run(_ohlc, _cfg=None):
+        raise AssertionError("retired alias prover was executed")
+
+    for engine in S.ACTIVE_ENGINE_FAMILY:
+        patched[engine] = controlled(engine)
+    for alias in S.DUPLICATE_ENGINE_ALIASES:
+        patched[alias] = alias_must_not_run
+
+    orig_scope = S.INSTRUMENT_SCOPE
+    original = S.PROVERS
+    try:
+        S.INSTRUMENT_SCOPE = "all"
+        S.PROVERS = patched
+        series = {"CM.ESU6": [(100.0,) * 4] * 80}
+        rep = A.gate_rerun(_RerunStore(series), ["CM.ESU6"], list(S.FDR_ENGINE_FAMILY))
+    finally:
+        S.PROVERS = original
+        S.INSTRUMENT_SCOPE = orig_scope
+
+    assert calls == {engine: 1 for engine in S.ACTIVE_ENGINE_FAMILY}
+    assert rep["fdrHypothesisCount"] == len(S.FDR_ENGINE_FAMILY) == 9
+    assert rep["fdrRetiredDebtCount"] == len(S.DUPLICATE_ENGINE_ALIASES) == 2
+    assert rep["candidateCount"] == 0
+    by_engine = {row["engine"]: row for row in rep["engines"]}
+    assert set(by_engine) == set(S.ACTIVE_ENGINE_FAMILY)
+    breakout = by_engine["breakout"]["contracts"][0]
+    assert breakout["pEdge"] == 0.02 and breakout["proven"] is False
+    assert breakout["fdrRejected"] is True
+    assert "across 9 tests" in breakout["reason"]
 
 
 def test_gate_rerun_labels_thin_sample_insufficient():
@@ -1522,6 +1958,410 @@ def test_on_candle_routes_non_es_instrument_identically_no_repaint_es_unchanged(
     # instrument-agnostic; non-ES bars route through on_candle identically, with no repaint.
     assert mnq_closed == es_closed, "non-ES (MNQ) routes through on_candle identically to ES"
     assert spy_closed == es_closed, "non-ES (SPY ETF) routes through on_candle identically to ES"
+
+
+def test_live_ohlc_window_uses_newest_bars_and_analysis_uses_full_history():
+    # Regression lock (2026-07-23): once a store exceeded 5,000 rows, ohlc() used the OLDEST
+    # 5,000 bars forever. The live evaluator therefore froze on a historical endpoint and could
+    # re-emit the same signal on every daemon restart. Live math must use the newest bounded window;
+    # explicit analysis/backtest reads must see the complete bounded research history.
+    store, path, cfg = _temp_store()
+    try:
+        rows = [(1_700_000_000 + i, float(i), float(i), float(i), float(i))
+                for i in range(6_001)]
+        assert store.record_bars("CM.MNQU6", rows) == len(rows)
+        live = store.ohlc("CM.MNQU6")
+        research = store.ohlc_between("CM.MNQU6")
+        assert len(live) == 5_000
+        assert live[0][3] == 1_001.0 and live[-1][3] == 6_000.0, \
+            "live window must be the newest 5,000 bars, returned oldest->newest"
+        assert len(research) == 6_001
+        assert research[0][3] == 0.0 and research[-1][3] == 6_000.0, \
+            "research/backtest path must not silently inherit the 5,000-live-bar cap"
+    finally:
+        for p in (path, cfg):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
+def test_capture_restart_does_not_duplicate_persisted_signal_state():
+    # A daemon restart clears in-memory dictionaries. Signal transition state is therefore durable
+    # in SQLite: reconstructing Capture over an unchanged closed-bar endpoint must not create a
+    # second fire for the same still-active signal.
+    import bltd_capture as C
+    store, path, cfg = _temp_store()
+    try:
+        now = int(time.time())
+        rows = [(now - (80 - i) * 15, 100.0 + i * 0.9, 100.0 + i * 0.9,
+                 100.0 + i * 0.9, 100.0 + i * 0.9) for i in range(80)]
+        assert store.record_bars("CM.ESU6", rows) == 80
+        first = C.Capture(store, bar_seconds=15, lookback=20, edge_gate=False)
+        first.evaluate_all()
+        n1 = len(store.fires(500)["fires"])
+        assert n1 > 0
+        restarted = C.Capture(store, bar_seconds=15, lookback=20, edge_gate=False)
+        restarted.evaluate_all()
+        assert len(store.fires(500)["fires"]) == n1, \
+            "a fresh Capture process must reuse durable signal state instead of re-firing"
+    finally:
+        for p in (path, cfg):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
+def test_capture_skips_expensive_family_gate_until_a_new_closed_bar_exists():
+    import bltd_analytics as A
+    import bltd_capture as C
+
+    store, path, cfg = _temp_store()
+    original_screen = A.screen
+    try:
+        now = int(time.time())
+        rows = [(now - (80 - i) * 15, 100.0 + i, 100.0 + i, 100.0 + i, 100.0 + i)
+                for i in range(80)]
+        assert store.record_bars("CM.ESU6", rows) == 80
+        calls = []
+
+        def rejected_screen(_store, symbols, engines, _cfg):
+            calls.append((tuple(symbols), tuple(engines)))
+            return [{"engine": engine, "symbol": "CM.ESU6", "edge": False,
+                     "reason": "controlled FDR rejection"}
+                    for engine in engines]
+
+        A.screen = rejected_screen
+        cap = C.Capture(store, bar_seconds=15, lookback=20, edge_gate=True)
+        cap.evaluate_all()
+        cap.evaluate_all()
+        assert len(calls) == 1, "unchanged closed-bar endpoint must not rerun the full family gate"
+
+        next_ts = rows[-1][0] + 15
+        assert store.record_bars(
+            "CM.ESU6", [(next_ts, 181.0, 181.0, 181.0, 181.0)]) == 1
+        cap.evaluate_all()
+        assert len(calls) == 2, "one newly closed bar must trigger exactly one fresh family gate"
+    finally:
+        A.screen = original_screen
+        for p in (path, cfg):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
+def test_capture_live_gate_honors_grid_fdr_verdict_not_single_cell_ok():
+    # A per-test p<alpha is NOT enough when the engine×symbol family fails BH-FDR. The live capture
+    # path must consume the already-corrected grid row, otherwise it can fire a strategy the research
+    # surface correctly labels "FDR-rejected".
+    import bltd_capture as C
+    store, path, cfg = _temp_store()
+    try:
+        now = int(time.time())
+        rows = [(now - (80 - i) * 15, 100.0 + i, 100.0 + i, 100.0 + i, 100.0 + i)
+                for i in range(80)]
+        assert store.record_bars("CM.ESU6", rows) == 80
+        cap = C.Capture(store, bar_seconds=15, lookback=20, edge_gate=True)
+        cap.engines = ("regime",)
+        cap._signal = lambda engine, ohlc, entry_open=None: {
+            "direction": "long", "stop": ohlc[-1][3] - 1, "target": ohlc[-1][3] + 2,
+            "entry": entry_open, "rationale": "test signal",
+        }
+        rejected = {("regime", "CM.ESU6"): {
+            "engine": "regime", "symbol": "CM.ESU6", "edge": False, "warming": False,
+            "reason": "per-test significant but rejected by grid-wide FDR control",
+        }}
+        cap._evaluate("CM.ESU6", gate_rows=rejected)
+        assert store.latest_fire()["fire"] is None, \
+            "live capture must not bypass the family-wide FDR rejection"
+    finally:
+        for p in (path, cfg):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
+def test_new_signal_fires_are_bar_deduped_and_graded_from_later_closed_bars():
+    store, path, cfg = _temp_store()
+    try:
+        t0 = int(time.time()) - 60
+        assert store.record_bars("CM.ESU6", [(t0, 100.0, 100.0, 100.0, 100.0)]) == 1
+        assert store.record_fire("regime", "long", 100.0, symbol="CM.ESU6",
+                                 stop=99.0, target=102.0, bar_ts=t0) == 1
+        assert store.record_fire("regime", "long", 100.0, symbol="CM.ESU6",
+                                 stop=99.0, target=102.0, bar_ts=t0) == 0, \
+            "same engine/symbol/direction/bar must be idempotent"
+        assert store.record_bars("CM.ESU6", [(t0 + 15, 100.0, 102.5, 99.5, 102.0)]) == 1
+        result = store.grade_open_fires("CM.ESU6")
+        assert result == {"graded": 1, "wins": 1, "losses": 0}
+        fire = store.latest_fire()["fire"]
+        assert fire["outcome"] == "win" and fire["pnl"] == 2.0
+    finally:
+        for p in (path, cfg):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
+def test_live_capture_waits_for_next_open_and_matches_breakout_prover_geometry():
+    import bltd_capture as C
+
+    store, path, cfg_path = _temp_store()
+    try:
+        cfg = store.set_config({
+            "lookback": 3, "bkTargetR": 2.0, "bkMaxHold": 80,
+            "researchTickSize": 0.25,
+        })
+        t0 = int(time.time()) - 120
+        signal_only = [
+            (t0, 100.0, 100.0, 100.0, 100.0),
+            (t0 + 15, 101.0, 101.0, 101.0, 101.0),
+            (t0 + 30, 102.0, 102.0, 102.0, 102.0),
+            (t0 + 45, 103.0, 103.0, 103.0, 103.0),  # breakout known at this close
+        ]
+        assert store.record_bars("CM.ESU6", signal_only) == 4
+        cap = C.Capture(store, lookback=3, edge_gate=False)
+        cap.engines = ("breakout",)
+        cap._evaluate("CM.ESU6")
+        assert store.latest_fire()["fire"] is None, \
+            "a last-bar signal has no observable next open and must remain pending"
+
+        entry_bar = (t0 + 60, 110.0, 110.25, 109.75, 110.0)
+        # The read loop witnessed this bucket transition, so the first tick is the honest open.
+        # The fire becomes visible on the evaluator's next pass; it does not wait for this forming
+        # bar to close and does not use a mid-bar tick after a daemon restart as a fake open.
+        cap.next_bar_open["CM.ESU6"] = (t0 + 45, entry_bar[1])
+        cap._evaluate("CM.ESU6")
+        fire = store.latest_fire()["fire"]
+        assert fire is not None
+
+        assert store.record_bars("CM.ESU6", [entry_bar]) == 1
+        ohlc = [row[1:5] for row in signal_only + [entry_bar]]
+        canonical = S._bk_trades(ohlc, 3, cfg)[0]
+        assert fire["entry"] == canonical["entry"] == 110.0
+        assert fire["stop"] == canonical["stop"] == 100.0
+        assert fire["target"] == canonical["target"] == 130.0
+        stored = store._q(
+            "SELECT bar_ts,max_hold,tick_size FROM fires WHERE id=?", (fire["id"],))[0]
+        assert stored == (t0 + 45, 80, 0.25)
+
+        # The entry bar opened far above the old signal close. The old journal geometry used
+        # entry=103/target=109 and falsely graded this as a gap win. Causal 110/130 geometry stays
+        # honestly pending until a target, stop, or the full hold window is observable.
+        assert store.grade_open_fires("CM.ESU6") == {
+            "graded": 0, "wins": 0, "losses": 0,
+        }
+        assert store.latest_fire()["fire"]["outcome"] is None
+    finally:
+        for p in (path, cfg_path):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
+def test_breakout_live_grader_time_exits_at_bar_80_before_bar_81_target():
+    store, path, cfg = _temp_store()
+    try:
+        t0 = int(time.time()) - 2000
+        assert store.record_fire(
+            "breakout", "long", 100.0, symbol="CM.ESU6",
+            stop=90.0, target=110.0, bar_ts=t0, max_hold=80, tick_size=0.25) == 1
+        held = [
+            (t0 + i * 15, 100.0, 100.25, 99.75, 99.75)
+            for i in range(1, 81)
+        ]
+        late_target = (t0 + 81 * 15, 100.0, 111.0, 99.0, 110.0)
+        assert store.record_bars("CM.ESU6", held + [late_target]) == 81
+        assert store.grade_open_fires("CM.ESU6") == {
+            "graded": 1, "wins": 0, "losses": 1,
+        }
+        fire = store.latest_fire()["fire"]
+        assert fire["outcome"] == "loss" and fire["pnl"] == -0.25, \
+            "bar 80 close is the causal exit; a bar 81 target cannot rewrite it as a win"
+    finally:
+        for p in (path, cfg):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
+def test_persistent_rising_breakout_reenters_after_prior_live_fire_closes():
+    import bltd_capture as C
+
+    store, path, cfg_path = _temp_store()
+    try:
+        cfg = store.set_config({
+            "lookback": 3, "bkTargetR": 2.0, "bkMaxHold": 1,
+            "researchTickSize": 0.25,
+        })
+        t0 = int(time.time()) - 180
+        signal_bars = [
+            (t0, 100.0, 100.0, 100.0, 100.0),
+            (t0 + 15, 101.0, 101.0, 101.0, 101.0),
+            (t0 + 30, 102.0, 102.0, 102.0, 102.0),
+            (t0 + 45, 103.0, 103.0, 103.0, 103.0),
+        ]
+        entry4 = (t0 + 60, 104.0, 104.25, 103.75, 104.0)
+        entry5 = (t0 + 75, 105.0, 105.25, 104.75, 105.0)
+        assert store.record_bars("CM.ESU6", signal_bars) == 4
+        cap = C.Capture(store, lookback=3, edge_gate=False)
+        cap.engines = ("breakout",)
+
+        cap.next_bar_open["CM.ESU6"] = (t0 + 45, entry4[1])
+        cap._evaluate("CM.ESU6")
+        assert len(store.fires(10, engine="breakout")["fires"]) == 1
+        assert store.record_bars("CM.ESU6", [entry4]) == 1
+        assert store.grade_open_fires("CM.ESU6")["graded"] == 1
+
+        # The signal remains LONG on bar 4. Once trade 1 is durably closed, the canonical walk
+        # evaluates bar 4 and enters again at bar 5's open; direction sameness is not a lifetime
+        # dedupe key.
+        cap.next_bar_open["CM.ESU6"] = (t0 + 60, entry5[1])
+        cap._evaluate("CM.ESU6")
+        fires = list(reversed(store.fires(10, engine="breakout")["fires"]))
+        assert [(f["direction"], f["entry"]) for f in fires] == [
+            ("long", 104.0), ("long", 105.0),
+        ]
+        durable = store._q(
+            "SELECT bar_ts,outcome FROM fires WHERE engine='breakout' ORDER BY id")
+        assert durable == [(t0 + 45, "loss"), (t0 + 60, None)]
+
+        canonical = S._bk_trades(
+            [row[1:5] for row in signal_bars + [entry4, entry5]], 3, cfg)
+        assert [(t["signalIndex"], t["entryIndex"], t["entry"]) for t in canonical[:2]] == [
+            (3, 4, 104.0), (4, 5, 105.0),
+        ]
+    finally:
+        for p in (path, cfg_path):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
+def test_live_signal_lifecycle_blocks_overlap_including_direction_flip():
+    store, path, cfg = _temp_store()
+    try:
+        t0 = int(time.time()) - 120
+        common = {"max_hold": 80, "tick_size": 0.25}
+        assert store.record_signal_evaluation(
+            "regime", "CM.ESU6", "long", True, t0,
+            entry=100.0, stop=99.0, target=102.0, **common) == 1
+        # A later SHORT must update durable signal state but cannot overlap the open LONG.
+        assert store.record_signal_evaluation(
+            "regime", "CM.ESU6", "short", True, t0 + 15,
+            entry=100.0, stop=101.0, target=98.0, **common) == 0
+        assert store._q(
+            "SELECT direction,bar_ts FROM signal_state "
+            "WHERE engine='regime' AND symbol='CM.ESU6'") == [("short", t0 + 15)]
+        assert store._q(
+            "SELECT count(*) FROM fires WHERE engine='regime' AND symbol='CM.ESU6' "
+            "AND outcome IS NULL") == [(1,)]
+
+        # Close the LONG, then a strictly later SHORT signal may open exactly one new position.
+        store.record_bars(
+            "CM.ESU6", [(t0 + 15, 100.0, 102.5, 99.5, 102.0)])
+        assert store.grade_open_fires("CM.ESU6")["graded"] == 1
+        assert store.record_signal_evaluation(
+            "regime", "CM.ESU6", "short", True, t0 + 30,
+            entry=102.0, stop=103.0, target=100.0, **common) == 1
+        assert store._q(
+            "SELECT count(*) FROM fires WHERE engine='regime' AND symbol='CM.ESU6' "
+            "AND outcome IS NULL") == [(1,)]
+    finally:
+        for p in (path, cfg):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
+def test_signal_lifecycle_same_bar_restart_dedupe_and_legacy_state_recovery():
+    store, path, cfg = _temp_store()
+    try:
+        t0 = int(time.time()) - 60
+        # Simulate the old state-only sequence: it consumed a transition without creating a fire.
+        assert store.observe_signal("breakout", "CM.ESU6", "long", True, t0) is True
+        assert store.latest_fire()["fire"] is None
+        kwargs = {
+            "entry": 101.0, "stop": 100.0, "target": 103.0,
+            "max_hold": 1, "tick_size": 0.25,
+        }
+        assert store.record_signal_evaluation(
+            "breakout", "CM.ESU6", "long", True, t0, **kwargs) == 0, \
+            "the same immutable bar remains restart-idempotent"
+        assert store.record_signal_evaluation(
+            "breakout", "CM.ESU6", "long", True, t0 + 15, **kwargs) == 1, \
+            "a missing legacy fire must not suppress unchanged direction forever"
+        assert store.record_signal_evaluation(
+            "breakout", "CM.ESU6", "long", True, t0 + 15, **kwargs) == 0
+        assert len(store.fires(10, engine="breakout")["fires"]) == 1
+    finally:
+        for p in (path, cfg):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
+def test_signal_grader_resolves_same_bar_stop_and_target_conservatively_as_loss():
+    store, path, cfg = _temp_store()
+    try:
+        t0 = int(time.time()) - 60
+        store.record_bars("CM.ESU6", [(t0, 100.0, 100.0, 100.0, 100.0)])
+        store.record_fire("regime", "long", 100.0, symbol="CM.ESU6",
+                          stop=99.0, target=102.0, bar_ts=t0)
+        # With only OHLC we cannot know touch order. The fail-closed resolution is stop-first.
+        store.record_bars("CM.ESU6", [(t0 + 15, 100.0, 103.0, 98.0, 101.0)])
+        assert store.grade_open_fires("CM.ESU6") == {"graded": 1, "wins": 0, "losses": 1}
+        fire = store.latest_fire()["fire"]
+        assert fire["outcome"] == "loss" and fire["pnl"] == -1.0
+    finally:
+        for p in (path, cfg):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
+def test_live_signal_geometry_uses_current_config_and_breakouts_have_targets():
+    import bltd_capture as C
+    store, path, cfg = _temp_store()
+    try:
+        store.set_config({
+            "lookback": 3, "mrZ": 1.0, "mrStopMult": 2.0,
+            "mrTgtFrac": 0.5, "bkTargetR": 3.0,
+        })
+        cap = C.Capture(store, lookback=3, edge_gate=False)
+        breakout = cap._signal("breakout", [(1.0, 1.0, 1.0, 1.0),
+                                             (2.0, 2.0, 2.0, 2.0),
+                                             (3.0, 3.0, 3.0, 3.0),
+                                             (4.0, 4.0, 4.0, 4.0)])
+        assert breakout["direction"] == "long"
+        assert breakout["stop"] == 1.0 and breakout["target"] == 13.0, \
+            "live breakout must carry the configured fixed-R target used by its prover"
+
+        meanrev = cap._signal("meanrev", [(99.0, 99.0, 99.0, 99.0),
+                                          (100.0, 100.0, 100.0, 100.0),
+                                          (101.0, 101.0, 101.0, 101.0),
+                                          (103.0, 103.0, 103.0, 103.0)])
+        sd = (2.0 / 3.0) ** 0.5
+        assert meanrev["direction"] == "short"
+        assert abs(meanrev["stop"] - (103.0 + 2.0 * sd)) < 1e-9
+        assert meanrev["target"] == 101.5, \
+            "live mean-reversion target must honor the buyer's current target fraction"
+    finally:
+        for p in (path, cfg):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":

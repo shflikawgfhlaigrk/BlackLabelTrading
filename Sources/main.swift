@@ -4,7 +4,6 @@ import AppKit
 enum Section: String, CaseIterable, Identifiable {
     case feeds = "Connect"
     case signals = "Signals", chart = "Chart", grid = "Grid", watchlists = "Watchlists", screener = "Screener", alerts = "Alerts"
-    case execution = "Execution"
     case backtest = "Backtest", builder = "Strategy Builder", patterns = "Patterns", replay = "Replay", paper = "Paper Trade"
     case journal = "Journal", analytics = "Analytics"
     case calculators = "Calculators", firms = "Prop Firms", settings = "Settings"
@@ -17,7 +16,6 @@ enum Section: String, CaseIterable, Identifiable {
         case .watchlists:  return "star.fill"
         case .screener:    return "line.3.horizontal.decrease.circle.fill"
         case .alerts:      return "bell.badge.fill"
-        case .execution:   return "bolt.shield.fill"
         case .backtest:    return "clock.arrow.circlepath"
         case .builder:     return "wand.and.stars"
         case .patterns:    return "waveform.path.ecg.rectangle.fill"
@@ -34,7 +32,7 @@ enum Section: String, CaseIterable, Identifiable {
     // Sidebar grouping for a cleaner information architecture.
     var group: String {
         switch self {
-        case .feeds, .signals, .chart, .grid, .watchlists, .screener, .alerts, .execution:  return "Markets"
+        case .feeds, .signals, .chart, .grid, .watchlists, .screener, .alerts:  return "Markets"
         case .backtest, .builder, .patterns, .replay, .paper, .journal, .analytics: return "Research"
         case .calculators, .firms, .settings:                   return "Tools"
         }
@@ -143,7 +141,6 @@ struct MainView: View {
                     case .watchlists:  WatchlistsScreen()
                     case .screener:    ScreenerScreen()
                     case .alerts:      AlertsScreen()
-                    case .execution:   ExecutionScreen()
                     case .backtest:    BacktestScreen()
                     case .builder:     StrategyBuilderScreen()
                     case .patterns:    PatternsScreen()
@@ -299,7 +296,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Installed-app proof for the human feed-connection path. Starts the product-owned localhost
     /// backend, signs into that local API, prints observed capture/store state, and exits. It never
-    /// opens broker execution or sends broker credentials.
+    /// opens a broker order route or sends broker credentials.
     @MainActor
     private func runFeedSmoke() async {
         let feed = FeedClient()

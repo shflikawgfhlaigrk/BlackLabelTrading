@@ -9,9 +9,10 @@ settings:
     CODE_SIGN_STYLE: Automatic
     ENABLE_HARDENED_RUNTIME: YES
     MARKETING_VERSION: "1.0"
-    CURRENT_PROJECT_VERSION: "11"
+    CURRENT_PROJECT_VERSION: "27"
     PRODUCT_NAME: "Black Label Trading"
     ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
 targets:
   BlackLabelTrading:
     type: application
@@ -26,26 +27,224 @@ targets:
         script: |
           set -euo pipefail
           BACKEND="$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/backend"
-          [ -d "$BACKEND" ] || exit 0
+          RUNTIME_SRC="$SRCROOT/vendor/python-runtime"
+          [ -d "$BACKEND" ] || { echo "FAIL: Xcode artifact has no bundled backend" >&2; exit 1; }
+          if [ ! -x "$RUNTIME_SRC/bin/python3.11" ] && [ ! -x "$RUNTIME_SRC/bin/python3" ]; then
+            echo "FAIL: source-controlled Python runtime is missing: $RUNTIME_SRC" >&2
+            exit 1
+          fi
           find "$BACKEND" -type d \( -name __pycache__ -o -name .pytest_cache \) -prune -exec rm -rf {} +
           find "$BACKEND" -type f \( -name 'test_*.py' -o -name 'run-tests.sh' \) -delete
-          chmod +x "$BACKEND/launch-backend.sh"
+          for module in "$BACKEND"/bltd_*.py; do
+            [ -f "$module" ] || continue
+            case "$(basename "$module")" in
+              bltd_alerts.py|bltd_analytics.py|bltd_api.py|bltd_browser.py|bltd_capture.py|\
+              bltd_feeds.py|bltd_optimizer.py|bltd_optimizer_cli.py|bltd_parsers.py|\
+              bltd_paths.py|bltd_store.py|bltd_topstep_bridge.py)
+                ;;
+              *) rm -f "$module" ;;
+            esac
+          done
+          rm -rf "$BACKEND/python-runtime"
+          cp -Rf "$RUNTIME_SRC" "$BACKEND/python-runtime"
+          find "$BACKEND/python-runtime" -type d \( -name __pycache__ -o -name .pytest_cache \) -prune -exec rm -rf {} +
+          find "$BACKEND/python-runtime" -type f -name '*.pyc' -delete
+          cat > "$BACKEND/python3" <<'PYSH'
+          #!/bin/bash
+          set -euo pipefail
+          umask 077
+
+          DIR="$(cd "$(dirname "$0")" && pwd -P)"
+          RUNTIME_HOME="${HOME:-/var/empty}"
+          case "$RUNTIME_HOME" in
+            /*) ;;
+            *) RUNTIME_HOME="/var/empty" ;;
+          esac
+          CACHE_INPUT="${PYTHONPYCACHEPREFIX:-${BLTD_PYCACHE_ROOT:-$RUNTIME_HOME/Library/Caches/Black Label Trading/python}}"
+
+          unset PYTHONHOME PYTHONPATH PYTHONSTARTUP PYTHONINSPECT PYTHONUSERBASE
+          unset BASH_ENV ENV
+          unset DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH DYLD_FRAMEWORK_PATH
+          unset DYLD_FALLBACK_LIBRARY_PATH DYLD_FALLBACK_FRAMEWORK_PATH
+
+          canonicalize_cache_path() {
+            local probe="${1%/}" suffix="" component
+            [ -n "$probe" ] || probe="/"
+            while [ ! -e "$probe" ]; do
+              [ "$probe" != "/" ] || return 1
+              component="${probe##*/}"
+              probe="${probe%/*}"
+              [ -n "$probe" ] || probe="/"
+              suffix="/$component$suffix"
+            done
+            [ -d "$probe" ] || return 1
+            probe="$(cd "$probe" && pwd -P)" || return 1
+            while [ -n "$suffix" ]; do
+              suffix="${suffix#/}"
+              component="${suffix%%/*}"
+              if [ "$suffix" = "$component" ]; then
+                suffix=""
+              else
+                suffix="${suffix#*/}"
+              fi
+              case "$component" in
+                ""|.) ;;
+                ..)
+                  if [ "$probe" != "/" ]; then
+                    probe="${probe%/*}"
+                    [ -n "$probe" ] || probe="/"
+                  fi
+                  ;;
+                *)
+                  if [ "$probe" = "/" ]; then
+                    probe="/$component"
+                  else
+                    probe="$probe/$component"
+                  fi
+                  ;;
+              esac
+            done
+            printf '%s\n' "$probe"
+          }
+
+          case "$CACHE_INPUT" in
+            /*) ;;
+            *)
+              echo "Black Label Trading: PYTHONPYCACHEPREFIX must be an absolute path." >&2
+              exit 78
+              ;;
+          esac
+          PYTHON_CACHE="$(canonicalize_cache_path "$CACHE_INPUT")" || {
+            echo "Black Label Trading: invalid PYTHONPYCACHEPREFIX." >&2
+            exit 78
+          }
+          case "$PYTHON_CACHE" in
+            "$DIR"|"$DIR"/*)
+              echo "Black Label Trading: Python cache must be outside the bundled backend." >&2
+              exit 78
+              ;;
+          esac
+          /bin/mkdir -p "$PYTHON_CACHE"
+          PYTHON_CACHE="$(cd "$PYTHON_CACHE" && pwd -P)"
+          case "$PYTHON_CACHE" in
+            "$DIR"|"$DIR"/*)
+              echo "Black Label Trading: Python cache resolved inside the bundled backend." >&2
+              exit 78
+              ;;
+          esac
+
+          if [ -x "$DIR/python-runtime/bin/python3.11" ]; then
+            PYTHON_BIN="$DIR/python-runtime/bin/python3.11"
+          elif [ -x "$DIR/python-runtime/bin/python3" ]; then
+            PYTHON_BIN="$DIR/python-runtime/bin/python3"
+          else
+            echo "Black Label Trading: bundled Python runtime is missing." >&2
+            exit 127
+          fi
+
+          RUNTIME_ENV=(
+            "HOME=$RUNTIME_HOME"
+            "PATH=/usr/bin:/bin:/usr/sbin:/sbin"
+            "LANG=C"
+            "LC_ALL=C"
+            "PYTHONPATH=$DIR"
+            "PYTHONUNBUFFERED=1"
+            "PYTHONDONTWRITEBYTECODE=1"
+            "PYTHONNOUSERSITE=1"
+            "PYTHONPYCACHEPREFIX=$PYTHON_CACHE"
+          )
+          BLTD_ALLOWLIST=(
+            BLTD_SUPPORT_DIR
+            BLTD_STORE
+            BLTD_CONFIG
+            BLTD_PORT
+            BLTD_SCOPE
+            BLTD_BUILD
+            BLTD_RUNTIME_CONTRACT
+            BLTD_TOKEN_FILE
+            BLTD_WEBHOOK_URL
+            BLTD_CAPTURE_BROWSER
+            BLTD_AUTO_BROWSER
+            BLTD_CAPTURE_ENGINES
+            BLTD_CDP_PORT
+            BLTD_BAR_SECONDS
+            BLTD_LOOKBACK
+            BLTD_EDGE_GATE
+            BLTD_STALL_SECONDS
+            BLTD_TOPSTEP_OPEN_DEBOUNCE_SECONDS
+          )
+          for name in "${BLTD_ALLOWLIST[@]}"; do
+            if [ "${!name+x}" = "x" ]; then
+              RUNTIME_ENV+=("$name=${!name}")
+            fi
+          done
+
+          exec /usr/bin/env -i "${RUNTIME_ENV[@]}" "$PYTHON_BIN" "$@"
+          PYSH
+          chmod +x "$BACKEND/launch-backend.sh" "$BACKEND/python3"
+          for backend_item in "$BACKEND"/*; do
+            [ -e "$backend_item" ] || continue
+            case "$(basename "$backend_item")" in
+              bltd_alerts.py|bltd_analytics.py|bltd_api.py|bltd_browser.py|bltd_capture.py|\
+              bltd_feeds.py|bltd_optimizer.py|bltd_optimizer_cli.py|bltd_parsers.py|\
+              bltd_paths.py|bltd_store.py|bltd_topstep_bridge.py|launch-backend.sh|\
+              reference_oos.json|python3|python-runtime)
+                ;;
+              *) rm -rf "$backend_item" ;;
+            esac
+          done
+          SMOKE="$TARGET_TEMP_DIR/bltd-runtime-smoke"
+          rm -rf "$SMOKE"
+          mkdir -p "$SMOKE"
+          BLTD_SUPPORT_DIR="$SMOKE/support" BLTD_PYCACHE_ROOT="$SMOKE/pycache" \
+            PYTHONPATH="$BACKEND" "$BACKEND/python3" - <<'PY'
+          import importlib
+          import secrets
+          import sqlite3
+          import ssl
+          import sys
+
+          assert sys.version_info[:2] >= (3, 9)
+          for name in (
+              "bltd_alerts", "bltd_analytics", "bltd_api", "bltd_browser",
+              "bltd_capture", "bltd_feeds", "bltd_optimizer", "bltd_optimizer_cli",
+              "bltd_parsers", "bltd_paths", "bltd_store", "bltd_topstep_bridge",
+          ):
+              importlib.import_module(name)
+          PY
+          rm -rf "$SMOKE"
+          if [ "${CODE_SIGNING_ALLOWED:-NO}" = "YES" ] && [ -n "${EXPANDED_CODE_SIGN_IDENTITY:-}" ]; then
+            find "$BACKEND/python-runtime" -type f \( -name '*.so' -o -name '*.dylib' -o -name 'python3*' \) -print0 |
+              while IFS= read -r -d '' runtime_file; do
+                if /usr/bin/file "$runtime_file" | /usr/bin/grep -q 'Mach-O'; then
+                  /usr/bin/codesign --force --options runtime --timestamp=none \
+                    --entitlements "$SRCROOT/Sources/app-developerid.entitlements" \
+                    --sign "$EXPANDED_CODE_SIGN_IDENTITY" "$runtime_file"
+                fi
+              done
+          fi
           STRAY="$(find "$BACKEND" -type f \( -name '*.sqlite3' -o -name '*.db' -o -name '*.sqlite' -o -name 'bars_log.csv' -o -name 'fires*.json' \) 2>/dev/null || true)"
           if [ -n "$STRAY" ]; then
             echo "FAIL: data files in bundled backend (must ship EMPTY):" >&2
             echo "$STRAY" >&2
             exit 1
           fi
+          if grep -R -F '/api/exec/' "$BACKEND/bltd_api.py" "$BACKEND/bltd_capture.py" >/dev/null 2>&1; then
+            echo "FAIL: execution control plane entered the signals-only bundle" >&2
+            exit 1
+          fi
+          /bin/bash "$SRCROOT/Tests/signals-only-release-contract.sh" \
+            "$TARGET_BUILD_DIR/$WRAPPER_NAME"
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.blacklabel.trading
-        CODE_SIGN_ENTITLEMENTS: Sources/app.entitlements
+        CODE_SIGN_ENTITLEMENTS: Sources/app-developerid.entitlements
     info:
       path: Sources/Info.plist
       properties:
         CFBundleDisplayName: "Black Label Trading"
         CFBundleShortVersionString: "1.0"
-        CFBundleVersion: "25"
+        CFBundleVersion: "27"
         LSMinimumSystemVersion: "13.0"
         ITSAppUsesNonExemptEncryption: false
         LSApplicationCategoryType: public.app-category.finance

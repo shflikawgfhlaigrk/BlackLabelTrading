@@ -496,8 +496,11 @@ def test_store_written_bars_are_evaluated_cross_process():
     assert len(store.ohlc("ESU5")) >= 21          # enough closed bars for _evaluate
     # READER: a DIFFERENT Capture instance (the evaluator process) on the SAME store path.
     reader = C.Capture(store, edge_gate=False)
-    reader._signal = lambda eng, ohlc: {"direction": "long", "stop": None,
-                                        "target": None, "rationale": "bridge-test"}
+    reader._signal = lambda eng, ohlc, entry_open=None: {
+        "direction": "long", "entry": entry_open,
+        "stop": entry_open - 1.0, "target": entry_open + 2.0,
+        "rationale": "bridge-test",
+    }
     reader.evaluate_all()
     assert len(store.fires(10).get("fires", [])) >= 1   # evaluator saw the writer's bars and fired
 

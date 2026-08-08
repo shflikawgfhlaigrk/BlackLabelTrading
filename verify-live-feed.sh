@@ -4,7 +4,7 @@
 # It reports the honest truth: PROVEN LIVE (with evidence) / idle / auth_error / not connected.
 # It never simulates anything — it only reads what the running backend + local store actually hold.
 set -u
-PORT="${BLTD_PORT:-8787}"
+PORT="${BLTD_PORT:-8793}"
 SUPPORT="$HOME/Library/Application Support/Black Label Trading"
 STORE="${BLTD_STORE:-$SUPPORT/trading.sqlite3}"
 PROOF_DIR="$SUPPORT/proofs"; mkdir -p "$PROOF_DIR"

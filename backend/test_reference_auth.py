@@ -2,7 +2,7 @@
 """REGRESSION LOCK (trading-engineer, 2026-07-23) — GET /api/reference must fail CLOSED.
 
 Bug this locks: bltd_api.do_GET once served /api/reference BEFORE the Bearer-auth gate, rationalized
-as "public research". That let a cold, UNAUTHENTICATED GET on :8787 scrape a signed edge-gate
+as "public research". That let a cold, UNAUTHENTICATED GET on the local Trading port scrape a signed edge-gate
 verdict (the "OOS candidate (cleared significance)" / "no edge" reference artifact) the server cannot
 attribute to a buyer session — a fail-open flagged by trading-analyst. Every other /api/* read
 requires the per-launch token; the reference artifact must too.
@@ -30,7 +30,10 @@ os.environ["BLTD_TOKEN"] = "test-token-ref"          # deterministic Bearer for 
 
 import bltd_api as A            # noqa: E402 — env must be set before import binds TOKEN/STORE
 
-TOK = "test-token-ref"
+# This file can run alone or inside the combined pytest process, where another test may already have
+# imported bltd_api with its own deterministic token. Use the token bound by the production module so
+# the positive control proves the route, not pytest import order.
+TOK = A.TOKEN
 
 
 def _start_server():

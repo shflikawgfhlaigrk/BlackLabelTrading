@@ -1,0 +1,14 @@
+8d3f33be9eb810f23c102f08475af2854e50484b8e4e06275e937be61ce3d2fb
+# Integrity pin for the embeddable CPython runtime bundled by build-windows.ps1.
+#
+# The FIRST non-comment, non-blank line above is the lowercase SHA-256 of
+#   python-3.12.8-embed-amd64.zip
+# Provenance (no hash fabricated, §5.1):
+#   * downloaded from https://www.python.org/ftp/python/3.12.8/python-3.12.8-embed-amd64.zip
+#   * GPG-verified "Good signature" against the python.org .asc, signed by
+#     Steve Dower (Python Release Signing) <steve.dower@microsoft.com>,
+#     key 7ED1 0B65 31D7 C8E1 BC29 6021 FC62 4643 4870 34E5 (CPython Windows release manager).
+#
+# If $PythonVersion changes in build-windows.ps1, re-pin with the matching python.org hash and
+# GPG-verify the .asc first. A __PENDING__ sentinel or any non-64-hex first line makes
+# build-windows.ps1 FAIL CLOSED — the runtime is never shipped unverified.

@@ -12,8 +12,7 @@ HARD BINDINGS (CHARTER §5.1/§5.2/§5.6/§5.7):
     usable price is dropped (never invented). Unknown edge / no data -> honest empty/error state.
   - SHIP NO DATA: this module bundles NO credentials and NO bars. Webhook ingestion uses a local
     receiver URL/token; no prop-firm API key is requested or accepted by FeedManager.
-  - These FEED adapters are read-only market data — none places an order. Order entry lives in the
-    separate bltd_exec engine, which is OFF by default (paper-first, heavily gated).
+  - These FEED adapters are read-only market data. The shipping product has no order route.
   - Instrument scope is enforced downstream by the store (release default "es"): webhook ingestion
     accepts the shipped Topstep ES-family feed and drops stale/non-ES rows.
 

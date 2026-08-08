@@ -4,17 +4,21 @@
 # Runs the maintained suites through their own entrypoints and prints one combined
 # pass/fail total (fleet convention, matches BlackLabelLeads/Tests/run-tests.command):
 #
-#   1. Swift pure-logic engine tests    — Tests/run-tests.sh           (headless swiftc, no Xcode)
-#   2. Backend engine + edge-gate tests — backend/run-tests.sh         (pytest if present, else stdlib)
-#   3. Offline submission contract      — Tests/submission-contract.sh (macOS AppIcon/CFBundleIconName guard)
-#   4. Built bundle Reference contract  — Tests/built-bundle-reference-contract.sh (when build app exists)
+#   1. Swift pure-logic engine tests      — Tests/run-tests.sh           (headless swiftc, no Xcode)
+#   2. Updater release-integrity contract — Tests/updater-release-integrity-contract.sh
+#   3. Signals-only source/artifact gate  — Tests/signals-only-release-contract.sh
+#   4. Backend engine + edge-gate tests   — backend/run-tests.sh         (pytest if present, else stdlib)
+#   5. Production install guard contract  — Tests/production-install-guard-contract.sh
+#   6. Windows W1 read-only verifier      — windows/verify-windows-lane.sh
+#   7. Offline submission contracts       — Tests/submission-contract.sh + entitlements
+#   8. Built bundle Reference contract    — Tests/built-bundle-reference-contract.sh (when build app exists)
 #
 # Each sub-runner stays the source of truth for its own suite; this script only orchestrates
 # them and aggregates the result. The real gate is the sub-runners' EXIT CODES — the printed
 # counts are best-effort reporting parsed from whichever summary line the runner emits
 # ("N passed, M failed" from Swift/stdlib, or pytest's "N passed in Xs").
 #
-# Usage:  ./Tests/run-all.sh        (exit 0 iff BOTH suites pass)
+# Usage:  ./Tests/run-all.sh        (exit 0 iff every maintained suite passes)
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -66,8 +70,42 @@ run_suite() {
 
 echo "==> Black Label Trading :: combined test gate"
 
+SIGNALS_ONLY_ARGS=()
+if [ -d "$ROOT/build/Black Label Trading.app" ]; then
+  SIGNALS_ONLY_ARGS=("$ROOT/build/Black Label Trading.app")
+fi
+
 run_suite "swift-logic"    bash "$ROOT/Tests/run-tests.sh"
+run_suite "updater-integrity" bash "$ROOT/Tests/updater-release-integrity-contract.sh"
+run_suite "signals-only" bash "$ROOT/Tests/signals-only-release-contract.sh" \
+  ${SIGNALS_ONLY_ARGS[@]+"${SIGNALS_ONLY_ARGS[@]}"}
 run_suite "backend-engine" bash "$ROOT/backend/run-tests.sh"
+
+# These are safe offline contracts: the install guard mocks codesign and is confined to this run's
+# temp tree; the Windows verifier compiles/parses sources, runs tests, and calls supervisor --plan
+# (no spawn). Disable Python/pytest caches so invoking it here remains read-only to the repository.
+# Wrap their PASS-only output so the combined counter can account for them.
+production_install_guard_suite() {
+  local fixture_root="$WORK/production-install-guard"
+  mkdir -p "$fixture_root"
+  if TMPDIR="$fixture_root" bash "$ROOT/Tests/production-install-guard-contract.sh"; then
+    echo "1 passed, 0 failed"
+  else
+    echo "0 passed, 1 failed"
+    return 1
+  fi
+}
+windows_lane_suite() {
+  if PYTHONDONTWRITEBYTECODE=1 PYTEST_ADDOPTS="-p no:cacheprovider" \
+    bash "$ROOT/windows/verify-windows-lane.sh"; then
+    echo "1 passed, 0 failed"
+  else
+    echo "0 passed, 1 failed"
+    return 1
+  fi
+}
+run_suite "production-install-guard" production_install_guard_suite
+run_suite "windows-lane" windows_lane_suite
 run_suite "submission-contract" bash "$ROOT/Tests/submission-contract.sh"
 run_suite "devid-entitlements" bash "$ROOT/Tests/devid-entitlements-contract.sh"
 

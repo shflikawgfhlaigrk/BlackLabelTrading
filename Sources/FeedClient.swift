@@ -1,21 +1,71 @@
 // Black Label Trading — live feed client (SwiftUI @MainActor ObservableObject).
 //
 // HONEST FRAMING: this talks ONLY to the product's OWN self-contained backend (bltd_api.py,
-// default http://127.0.0.1:8787). That backend serves ONLY what the buyer's own webhook sender
+// default http://127.0.0.1:8793). That backend serves ONLY what the buyer's own webhook sender
 // pushed into the buyer's own local store. NOTHING is fetched from Black Label / Utah /
 // any third party here. The shipped Topstep setup is ES-family only; non-ES symbols are filtered so
 // stale local rows cannot populate the picker. Signals fire only where the edge-gate proves an edge.
 // When the backend is down, or no webhook data has arrived, the
 // client reports an honest FeedState (.offline / .loggedOut / .idle) and shows NO bars — it never
-// fabricates prices. This client reads bars/ticks/fires and relays the user's OWN execution
-// commands to the backend's /api/exec/* control plane; it never places an order on its own and
-// execution is OFF by default (a live order needs arm+live+own-creds+firm-ToS+risk+edge+kill-clear).
+// fabricates prices. This client reads bars/ticks/fires from the local signals-only backend.
+// It never sends an order or broker credential.
 //
 // The backend URL is buyer-configurable (Settings) so a buyer can run the backend on another
 // host/port on their own machine. The decode contract lives in FeedTypes.swift (test-locked).
 import Foundation
+#if !BLTD_ENVIRONMENT_HELPER_ONLY
 import Combine
+#endif
+import CoreFoundation
 
+/// Fixed environment for the bundled backend boundary. Constructing this dictionary from scratch is
+/// deliberate: the app may itself have been launched by a shell or developer tool containing secrets
+/// and interpreter/shell injection variables that must never reach bash, Python, or their supervisors.
+enum BundledBackendEnvironment {
+    static let allowedKeys: Set<String> = [
+        "PATH", "HOME", "LC_ALL", "LANG", "BLTD_PORT", "BLTD_BUILD"
+    ]
+    private static let safePath = "/usr/bin:/bin:/usr/sbin:/sbin"
+
+    /// The release pipeline and updater both use a canonical positive-integer CFBundleVersion.
+    /// Preserve it byte-for-byte; do not trim or reinterpret attacker-shaped plist values.
+    static func validatedBuild(from raw: Any?) -> String? {
+        let build: String
+        if let string = raw as? String {
+            build = string
+        } else if let number = raw as? NSNumber,
+                  CFGetTypeID(number) != CFBooleanGetTypeID() {
+            build = number.stringValue
+        } else {
+            return nil
+        }
+        guard let numericBuild = Int(build),
+              numericBuild > 0,
+              String(numericBuild) == build else {
+            return nil
+        }
+        return build
+    }
+
+    static func make(port: Int, build: String, homeDirectory: String) -> [String: String]? {
+        guard (1...65_535).contains(port),
+              validatedBuild(from: build) == build,
+              homeDirectory.hasPrefix("/"),
+              !homeDirectory.unicodeScalars.contains(where: { $0.value == 0 }) else {
+            return nil
+        }
+        return [
+            "PATH": safePath,
+            "HOME": homeDirectory,
+            "LC_ALL": "C",
+            "LANG": "C",
+            "BLTD_PORT": String(port),
+            "BLTD_BUILD": build
+        ]
+    }
+}
+
+#if !BLTD_ENVIRONMENT_HELPER_ONLY
 @MainActor
 final class FeedClient: ObservableObject {
     // Observed, honest state — every field reflects a real backend response.
@@ -38,11 +88,44 @@ final class FeedClient: ObservableObject {
     // Public read of the session state for view gating (the token itself stays private).
     var isSignedIn: Bool { signedIn }
 
-    private static let urlKey = "com.blacklabel.trading.feedURL"
-    static let defaultURL = "http://127.0.0.1:8787"
+    static let urlKey = "com.blacklabel.trading.feedURL"
+    static let legacyDefaultURL = "http://127.0.0.1:8787"
+    static let defaultURL = "http://127.0.0.1:8793"
+
+    static func configuredBaseURL(defaults: UserDefaults = .standard) -> String {
+        let stored = defaults.string(forKey: urlKey)
+        return stored == legacyDefaultURL ? defaultURL : (stored ?? defaultURL)
+    }
+
+    /// Returns a port only when this exact endpoint is eligible to run the bundled localhost
+    /// backend. Updater recovery shares this predicate so custom ports are acknowledged correctly
+    /// and buyer-selected remote endpoints are never mistaken for the bundled daemon.
+    static func bundledBackendPort(for rawBaseURL: String) -> Int? {
+        let raw = rawBaseURL.trimmingCharacters(in: .whitespaces)
+        guard let endpoint = URLComponents(string: raw),
+              endpoint.scheme?.lowercased() == "http",
+              endpoint.user == nil,
+              endpoint.password == nil,
+              endpoint.query == nil,
+              endpoint.fragment == nil,
+              endpoint.path.isEmpty,
+              let host = endpoint.host?.lowercased(),
+              host == "127.0.0.1" || host == "localhost",
+              let port = endpoint.port,
+              (1...65_535).contains(port) else {
+            return nil
+        }
+        return port
+    }
 
     init() {
-        baseURL = UserDefaults.standard.string(forKey: Self.urlKey) ?? Self.defaultURL
+        let stored = UserDefaults.standard.string(forKey: Self.urlKey)
+        // :8787 is now the canonical Capstone MCP listener. Migrate only the exact former default;
+        // any buyer-selected custom endpoint remains untouched.
+        baseURL = Self.configuredBaseURL()
+        if stored == Self.legacyDefaultURL {
+            UserDefaults.standard.set(Self.defaultURL, forKey: Self.urlKey)
+        }
     }
 
     private var session: URLSession {
@@ -164,35 +247,6 @@ final class FeedClient: ObservableObject {
         return ReferenceReport.decode(obj)
     }
 
-    // MARK: - Execution control plane (default OFF). Thin pass-through to the backend's dedicated,
-    // auth-gated /api/exec/* routes. A live order is impossible unless armed+live+own-creds+firm-ToS
-    // +risk+edge+kill-clear all hold in the backend engine — the UI cannot bypass that.
-    @Published var exec = ExecStatus()
-
-    func refreshExec() async {
-        if let o = await getJSON("/api/exec/status") { exec = ExecStatus.decode(o) }
-    }
-
-    func execOrders() async -> [[String: Any]]? {
-        guard let o = await getJSON("/api/exec/orders") else { return nil }
-        return o["orders"] as? [[String: Any]]
-    }
-
-    @discardableResult
-    func execCommand(_ cmd: String, _ body: [String: Any] = [:]) async -> Bool {
-        guard let req0 = authed("/api/exec/\(cmd)") else { return false }
-        var req = req0; req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
-        defer { Task { await refreshExec() } }
-        do {
-            let (data, resp) = try await session.data(for: req)
-            guard (resp as? HTTPURLResponse)?.statusCode == 200 else { return false }
-            let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
-            return (obj?["ok"] as? Bool) ?? true
-        } catch { lastError = friendly(error); return false }
-    }
-
     // MARK: - Self-contained backend bootstrap. The product SHIPS its own data backend inside the
     // app bundle (Contents/Resources/backend/launch-backend.sh, stdlib-only Python). When the local
     // backend on the default URL isn't reachable, the app starts the BUNDLED one so the buyer gets
@@ -203,7 +257,9 @@ final class FeedClient: ObservableObject {
     func ensureBackendRunning() async -> Bool {
         // Only for the default localhost backend; a custom baseURL is the buyer's own choice.
         let u = baseURL.trimmingCharacters(in: .whitespaces)
-        guard u == Self.defaultURL || u.hasPrefix("http://127.0.0.1") || u.hasPrefix("http://localhost") else { return false }
+        guard let port = Self.bundledBackendPort(for: u) else {
+            return false
+        }
         if await healthOK() { return true }
         guard !triedBootstrap else { return await healthOK() }
         triedBootstrap = true
@@ -212,6 +268,16 @@ final class FeedClient: ObservableObject {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/bash")
         proc.arguments = [script.path, "--bg"]
+        guard let build = BundledBackendEnvironment.validatedBuild(
+                from: Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion")),
+              let env = BundledBackendEnvironment.make(
+                port: port,
+                build: build,
+                homeDirectory: FileManager.default.homeDirectoryForCurrentUser.path) else {
+            lastError = "Couldn't validate bundled backend"
+            return false
+        }
+        proc.environment = env
         do { try proc.run() } catch { lastError = "Couldn't start bundled backend"; return false }
         // Poll briefly for the backend to come up (it binds fast; SQLite store is created empty).
         for _ in 0..<20 {
@@ -231,11 +297,46 @@ final class FeedClient: ObservableObject {
         return nil
     }
     private func healthOK() async -> Bool {
-        guard let u = url("/health") else { return false }
+        guard let u = url("/health"),
+              let launcher = Bundle.main.url(forResource: "launch-backend",
+                                             withExtension: "sh",
+                                             subdirectory: "backend")
+                ?? bundledBackendScript(),
+              let expectedBuild = BundledBackendEnvironment.validatedBuild(
+                from: Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion")) else {
+            return false
+        }
+        let expectedScript = launcher.deletingLastPathComponent()
+            .appendingPathComponent("bltd_api.py")
+            .resolvingSymlinksInPath()
+            .standardizedFileURL.path
         do {
-            let (_, resp) = try await session.data(from: u)
-            return (resp as? HTTPURLResponse)?.statusCode == 200
+            let (data, resp) = try await session.data(from: u)
+            guard (resp as? HTTPURLResponse)?.statusCode == 200,
+                  let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let capabilities = obj["capabilities"] as? [String: Any],
+                  let actualScript = obj["backendScript"] as? String else {
+                return false
+            }
+            let canonicalActualScript = URL(fileURLWithPath: actualScript)
+                .resolvingSymlinksInPath()
+                .standardizedFileURL.path
+            return exactJSONBoolean(obj["ok"]) == true
+                && obj["service"] as? String == "black-label-trading"
+                && obj["build"] as? String == expectedBuild
+                && obj["runtimeContract"] as? String == "bltd-signals-only-runtime-v1"
+                && canonicalActualScript == expectedScript
+                && exactJSONBoolean(capabilities["signals"]) == true
+                && exactJSONBoolean(capabilities["execution"]) == false
+                && exactJSONBoolean(capabilities["optimizerCompute"]) == false
         } catch { return false }
+    }
+    private func exactJSONBoolean(_ value: Any?) -> Bool? {
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) == CFBooleanGetTypeID() else {
+            return nil
+        }
+        return number.boolValue
     }
 
     // MARK: - Capture status + symbol catalogue (the honest feed banner).
@@ -440,3 +541,4 @@ final class FeedClient: ObservableObject {
         return ns.localizedDescription
     }
 }
+#endif

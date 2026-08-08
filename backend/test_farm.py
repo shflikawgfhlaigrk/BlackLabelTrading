@@ -5,9 +5,9 @@ this Mac's cores. These tests hold its three honesty invariants:
 
   1. OVER-FIT TRANSPARENCY — best-of-N search inflates significance, so every surfaced p is
      Benjamini–Hochberg FDR-corrected across ALL cells tried and a raw best-cell p is NEVER exposed.
-     On a driftless random walk the farm must NOT manufacture a proven edge from grid size alone.
+     On a driftless random walk the farm must NOT manufacture a screening hit from grid size alone.
   2. INSUFFICIENT-HONEST — a cell / slice with < SIG_MIN_N OOS trades is 'insufficient', never a
-     fabricated p; a too-thin store yields an honest empty verdict, not a candidate.
+     fabricated p; a too-thin store yields an honest empty verdict, not a screening hit.
   3. NO AGGREGATE FIGURE + SERIAL==POOL — the rendered payload carries no aggregate win-rate/$ claim
      shape, and the parallel (process-pool) result is identical to the serial result (determinism).
 
@@ -64,10 +64,10 @@ def test_farm_reports_cells_tried_and_never_a_raw_best_cell_p():
 
 def test_farm_does_not_manufacture_an_edge_on_a_random_walk():
     # Sweeping many parameter sets over pure noise WILL produce per-test-significant cells by chance.
-    # The BH-FDR correction across the whole grid must strip them: 0 proven cells, honest no_edge.
+    # The BH-FDR correction across the whole grid must strip them: 0 selection hits, honest no_edge.
     store = _FakeStore(_random_walk(900, seed=11))
     r = A.backtest_farm(store, "meanrev", "ES", workers=1)
-    assert r["provenCells"] == 0, "grid size alone must not manufacture a proven edge (over-fit guard)"
+    assert r["selectionHits"] == 0, "grid size alone must not manufacture a screening hit"
     assert r["status"] in ("no_edge", "insufficient")
     if r["status"] == "no_edge":
         assert "beat the family-wide FDR correction" in r["reason"]
@@ -87,7 +87,7 @@ def test_bh_adjusted_pvalues_are_monotone_and_bounded_and_dominate_raw():
 
 
 # ── 2. INSUFFICIENT-HONEST ───────────────────────────────────────────────────
-def test_farm_thin_store_is_insufficient_never_a_candidate():
+def test_farm_thin_store_is_insufficient_never_a_screening_hit():
     store = _FakeStore(_random_walk(15))          # below the prover arming floor (lookback+2)
     r = A.backtest_farm(store, "meanrev", "ES", workers=1)
     assert r["available"] is False
@@ -95,12 +95,12 @@ def test_farm_thin_store_is_insufficient_never_a_candidate():
     assert r.get("best") is None
 
 
-def test_farm_cells_below_sig_min_n_are_insufficient_not_proven():
+def test_farm_cells_below_sig_min_n_are_insufficient_not_selected():
     store = _FakeStore(_random_walk(300, seed=3))
     r = A.backtest_farm(store, "meanrev", "ES", workers=1)
     for c in r["cells"]:
         if c["trades"] < S.SIG_MIN_N:
-            assert c["insufficient"] is True and c["proven"] is False
+            assert c["insufficient"] is True and c["selectionHit"] is False
             assert "insufficient sample" in c["reason"]
 
 
@@ -132,10 +132,10 @@ def test_farm_pool_matches_serial_exactly():
     assert pool["compute"].startswith("process-pool") or pool["compute"].startswith("serial")
 
     def _index(rep):
-        return {tuple(sorted(c["params"].items())): (c["pEdgeAdj"], c["trades"], c["proven"])
+        return {tuple(sorted(c["params"].items())): (c["pEdgeAdj"], c["trades"], c["selectionHit"])
                 for c in rep["cells"]}
     assert _index(serial) == _index(pool), "parallel farm result must equal the serial result"
-    assert serial["provenCells"] == pool["provenCells"]
+    assert serial["selectionHits"] == pool["selectionHits"]
     assert serial["status"] == pool["status"]
 
 
@@ -145,6 +145,36 @@ def test_farm_grid_is_bounded_by_the_cell_cap():
         cells, full = A._farm_grid(eng, dict(S.CONFIG_DEFAULTS))
         assert len(cells) <= A._FARM_MAX_CELLS
         assert full >= len(cells)
+
+
+def test_farm_grid_has_only_effective_predeclared_cells_and_includes_defaults():
+    meanrev, mr_full = A._farm_grid("meanrev", dict(S.CONFIG_DEFAULTS))
+    assert mr_full == len(meanrev) == 54
+    assert {"lookback": 20, "mrStopMult": 8.0, "mrTgtFrac": 0.6, "mrZ": 2.0} in meanrev
+    consensus, con_full = A._farm_grid("regime", dict(S.CONFIG_DEFAULTS))
+    assert con_full == len(consensus) == 4
+    assert all("oosFrac" not in cell for cell in meanrev + consensus)
+
+
+def test_farm_retired_duplicate_aliases_fail_closed_to_canonical_engine():
+    store = _FakeStore(_random_walk(400))
+    for alias, canonical in S.DUPLICATE_ENGINE_ALIASES.items():
+        r = A.backtest_farm(store, alias, "ES", workers=1)
+        assert r["available"] is False
+        assert "retired duplicate" in r["reason"]
+        assert canonical in r["reason"]
+
+
+def test_farm_output_is_selection_only_and_never_claims_adoption():
+    store = _FakeStore(_random_walk(800))
+    r = A.backtest_farm(store, "meanrev", "ES", workers=1)
+    assert "selectionHits" in r and "provenCells" not in r
+    assert r.get("status") in ("screening_hit", "no_edge", "insufficient")
+    for cell in r["cells"]:
+        assert "selectionHit" in cell and "proven" not in cell
+    rendered = A.render_farm_payload(r).lower()
+    assert "candidate" not in rendered and "proven" not in rendered
+    assert "not adopted" in rendered or r["status"] != "screening_hit"
 
 
 if __name__ == "__main__":
