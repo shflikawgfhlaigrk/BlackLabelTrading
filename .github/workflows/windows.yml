@@ -1,0 +1,65 @@
+name: Windows Tests
+
+# Windows CI lane for the BlackLabel Windows port (additive; does not touch tests.yml).
+#
+# Scope: the Python backend suite only. The other two suites in Tests/run-all.sh
+# (Swift pure-logic via `xcrun --sdk macosx swiftc`, and the macOS submission
+# contract) require Xcode/CLT and cannot run on windows-latest.
+#
+# Scoped to the port branches so this lane cannot go red on `mobile` pushes.
+on:
+  push:
+    branches: ['claude/windows-full-build-*']
+  workflow_dispatch:
+
+concurrency:
+  group: windows-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend-tests:
+    name: Backend engine tests (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        # Deliberately no line-ending config: the runner image's Git defaults to
+        # core.autocrlf=true and the repo has no .gitattributes, so sources check
+        # out with CRLF working-tree endings. That is the realistic condition for
+        # the Windows port — CRLF-handling bugs in the code should surface here,
+        # not be masked by forcing an LF checkout.
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          # Mirrors the interpreter tests.yml pins on the macOS runner
+          # (/usr/bin/python3 = 3.9.6).
+          python-version: '3.9'
+
+      - name: Install pytest
+        # The macOS runner has pytest; without it backend/run-tests.sh silently
+        # degrades to the 5-check stdlib fallback instead of the real suite
+        # (see the pin rationale documented in tests.yml). Install it so the
+        # honest suite runs.
+        run: python -m pip install pytest
+
+      - name: Toolchain versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -VV
+          python -c 'import pytest; print("pytest", pytest.__version__)'
+
+      - name: Backend engine tests
+        shell: bash
+        working-directory: backend
+        # Same test command as backend/run-tests.sh's pytest branch. The script
+        # itself is not invoked because it hardcodes `python3`, which on Windows
+        # runners can resolve to the image's pre-installed interpreter rather
+        # than the setup-python one above — the same interpreter-drift hazard
+        # tests.yml documents for Homebrew python on the macOS host.
+        run: |
+          set -euo pipefail
+          python -m pytest test_engines.py test_feeds.py test_api.py test_exec.py test_topstep_bridge.py test_store_scope.py -q
