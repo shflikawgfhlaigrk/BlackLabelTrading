@@ -60,6 +60,19 @@ jobs:
         # runners can resolve to the image's pre-installed interpreter rather
         # than the setup-python one above — the same interpreter-drift hazard
         # tests.yml documents for Homebrew python on the macOS host.
+        env:
+          # test_connect_opens_no_api_browser_capture_tabs stubs discover/open/
+          # cdp on bltd_capture but _connect() consults the REAL chrome_present(),
+          # whose _CHROME_CANDIDATES are macOS /Applications paths — so on
+          # windows-latest it returned False and _connect bailed ok:False before
+          # reaching the stubs (run 31295824699). resolve_chrome() honors this
+          # env override (os.path.isdir check); the runner image really does ship
+          # Google Chrome at this path, so chrome_present() is honestly True.
+          # NOTE: BLTD_CDP_PORT is deliberately NOT set here — backend/conftest.py
+          # arms a win32-only fast-refusal listener and needs the variable unset
+          # to do so (an explicit value would disable it and reintroduce the ~2s
+          # closed-port SYN-retry stall per CDP probe that timed out /api/capture).
+          BLTD_CHROME_APP: 'C:\Program Files\Google\Chrome\Application'
         run: |
           set -euo pipefail
           python -m pytest test_engines.py test_feeds.py test_api.py test_exec.py test_topstep_bridge.py test_store_scope.py -q
