@@ -74,6 +74,23 @@ if ($Actual -ne $Expected) {
 }
 Expand-Archive -Path $ZipPath -DestinationPath (Join-Path $Stage "python") -Force
 
+# --- 3b. path bootstrap for the embeddable runtime ------------------------
+# The embeddable CPython ships python3*._pth, which forces ISOLATED path mode: sys.path is
+# exactly the ._pth entries — PYTHONPATH, registry, AND the script-directory prepend are all
+# ignored (isolated implies safe_path on 3.11+). So the PYTHONPATH set for the smoke check
+# below, and the PYTHONPATH supervise.py hands its spawned children, are both no-ops: the
+# runtime could not import bltd_* (run 31240166514: ModuleNotFoundError: No module named
+# 'bltd_api') and a buyer install would crash identically. ._pth entries resolve relative to
+# python.exe's directory, so one appended line makes ..\backend importable for EVERY
+# invocation of this runtime — build-box smoke gate and buyer children alike.
+$PthFile = Get-ChildItem (Join-Path $Stage "python") -Filter "python3*._pth" |
+           Select-Object -First 1
+if (-not $PthFile) { Fail "embeddable runtime has no python3*._pth — layout changed, refusing to guess" }
+$PthText = [System.IO.File]::ReadAllText($PthFile.FullName)
+if (-not $PthText.EndsWith("`n")) { [System.IO.File]::AppendAllText($PthFile.FullName, "`r`n") }
+[System.IO.File]::AppendAllText($PthFile.FullName, "..\backend`r`n")
+Write-Host "build-windows: appended ..\backend to $($PthFile.Name) (embeddable path bootstrap)"
+
 # --- 4. backend runtime (buyer path only) ---------------------------------
 $BackendDst = Join-Path $Stage "backend"
 New-Item -ItemType Directory -Force -Path $BackendDst | Out-Null
