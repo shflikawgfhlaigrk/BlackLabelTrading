@@ -176,7 +176,12 @@ command -v makeappx >/dev/null 2>&1 || {
   exit 1
 }
 mkdir -p "$DIST"
-MSYS_NO_PATHCONV=1 makeappx pack /d "$LAYOUT" /p "$OUT" /overwrite
+# Native makeappx cannot resolve Git-Bash POSIX paths (/d/a/...), and letting MSYS path
+# conversion loose would mangle the /d /p option FLAGS instead. So: convert the path
+# VALUES explicitly with cygpath, keep automatic conversion off so the flags survive.
+LAYOUT_NATIVE="$(cygpath -w "$LAYOUT" 2>/dev/null || printf '%s' "$LAYOUT")"
+OUT_NATIVE="$(cygpath -w "$OUT" 2>/dev/null || printf '%s' "$OUT")"
+MSYS_NO_PATHCONV=1 makeappx pack /d "$LAYOUT_NATIVE" /p "$OUT_NATIVE" /overwrite
 echo "   packed (UNSIGNED): $OUT"
 echo
 echo "   This package is UNSIGNED. It is for Partner Center upload only — the Store signs it."

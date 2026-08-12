@@ -110,12 +110,15 @@ jobs:
           $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
           if (-not (Test-Path $csc)) { Write-Error "csc.exe not found at $csc"; exit 1 }
           New-Item -ItemType Directory -Force -Path windows/dist | Out-Null
-          & $csc /nologo /target:winexe /platform:x64 `
-            /out:windows/dist/BlackLabelTrading.exe `
-            windows/msix/launcher/Launcher.cs
+          # Native csc.exe parses forward slashes in its arguments as option delimiters —
+          # run 31646505202 failed CS1504 hunting for Launcher.cs at the repo root. Hand
+          # the native tool absolute backslash paths; PowerShell cmdlets are unaffected.
+          $src = Join-Path $PWD 'windows\msix\launcher\Launcher.cs'
+          $out = Join-Path $PWD 'windows\dist\BlackLabelTrading.exe'
+          & $csc /nologo /target:winexe /platform:x64 "/out:$out" "$src"
           if ($LASTEXITCODE -ne 0) { Write-Error "launcher compile failed"; exit 1 }
           # Prove it is a real PE, not a text file with an .exe name.
-          $bytes = [System.IO.File]::ReadAllBytes('windows/dist/BlackLabelTrading.exe')
+          $bytes = [System.IO.File]::ReadAllBytes($out)
           if ($bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) { Write-Error "launcher is not a PE (no MZ header)"; exit 1 }
           Write-Host "launcher OK: $($bytes.Length) bytes, MZ header present"
 
