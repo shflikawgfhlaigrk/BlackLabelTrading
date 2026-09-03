@@ -613,11 +613,13 @@ if __name__ == "__main__":
              if name.startswith("test_") and callable(value)]
     failed = 0
     for test in tests:
+        started = time.monotonic()
         try:
             test()
-            print(f"ok {test.__name__}")
+            print(f"ok {test.__name__} ({time.monotonic() - started:.1f}s)")
         except Exception as exc:  # noqa: BLE001
             failed += 1
-            print(f"FAIL {test.__name__}: {type(exc).__name__}: {exc}")
+            print(f"FAIL {test.__name__}: {type(exc).__name__}: {exc} "
+                  f"({time.monotonic() - started:.1f}s)")
     print(f"\n{len(tests) - failed} passed, {failed} failed")
     sys.exit(1 if failed else 0)
