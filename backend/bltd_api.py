@@ -48,6 +48,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import socketserver
 import sys
 import threading
 import time
@@ -659,6 +660,19 @@ class Server(ThreadingHTTPServer):
     # let a fresh backend re-bind the port immediately after a restart (no TIME_WAIT stall)
     allow_reuse_address = True
     daemon_threads = True
+
+    def server_bind(self):
+        # http.server.HTTPServer.server_bind() fills server_name via socket.getfqdn(host): a reverse-DNS
+        # lookup of the bind address that leaves the socket bound-but-not-listening until the host's
+        # resolver answers. On a host whose resolver drops PTR queries (observed on GitHub's hosted
+        # macos-15 VMs: tens of seconds per lookup) every launcher readiness deadline expires before
+        # listen() ever runs and the buyer sees "backend failed readiness". This API is pinned to
+        # 127.0.0.1 and never reads server_name, so record the literal bind address instead: startup
+        # must never wait on DNS.
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = str(host)
+        self.server_port = port
 
 
 class H(BaseHTTPRequestHandler):

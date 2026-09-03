@@ -261,6 +261,17 @@ valid_pid() {
   [[ "${1:-}" =~ ^[1-9][0-9]*$ ]]
 }
 
+process_has_exited() {
+  # True once the PID is gone, or once it has exited and only awaits its parent's wait() (a zombie:
+  # ps state Z). kill -0 still succeeds on a zombie, yet it runs no code and owns no socket, so
+  # spending the stop grace period on it is dead time — e.g. when whatever spawned the old runtime
+  # is still alive and has not reaped it yet.
+  local PID="$1" STAT
+  kill -0 "$PID" 2>/dev/null || return 0
+  STAT="$(ps -p "$PID" -o stat= 2>/dev/null | tr -d '[:space:]')"
+  [[ "$STAT" == Z* ]]
+}
+
 write_pidfile_atomic() {
   local PIDFILE="$1" PID="$2" TMP
   valid_pid "$PID" || return 1
@@ -380,16 +391,16 @@ stop_owned_pidfile() {
   [ "$(cat "$PIDFILE" 2>/dev/null || true)" = "$PID" ] || return 0
   kill -TERM "$PID" 2>/dev/null || true
   for _ in {1..20}; do
-    kill -0 "$PID" 2>/dev/null || break
+    process_has_exited "$PID" && break
     sleep 0.1
   done
-  if kill -0 "$PID" 2>/dev/null; then
+  if ! process_has_exited "$PID"; then
     CURRENT="$(ps -ww -p "$PID" -o command= 2>/dev/null || true)"
     if [ "$(cat "$PIDFILE" 2>/dev/null || true)" = "$PID" ] &&
        owned_process_command "$KIND" "$NAME" "$SCRIPT" "$CURRENT"; then
       kill -KILL "$PID" 2>/dev/null || true
       for _ in {1..10}; do
-        kill -0 "$PID" 2>/dev/null || break
+        process_has_exited "$PID" && break
         sleep 0.1
       done
     fi
