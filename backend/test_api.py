@@ -97,8 +97,13 @@ def test_heartbeat_fresh_helper():
 
 
 def test_capture_heartbeat_path():
-    p = C.evaluator_heartbeat_path("/a/b/trading.sqlite3")
-    assert p.endswith("evaluator.heartbeat") and p.startswith(os.path.join("/a", "b"))
+    # The heartbeat lives BESIDE the store and its consumers (open() in bltd_capture, os.path.getmtime
+    # in bltd_api) take an OS-native path, so compare with os.path instead of a literal "/a/b" prefix:
+    # under ntpath os.path.join("/a", "b") is "/a\\b" while dirname("/a/b/…") keeps the input separator.
+    store = os.path.join("/a", "b", "trading.sqlite3")
+    p = C.evaluator_heartbeat_path(store)
+    assert os.path.basename(p) == "evaluator.heartbeat"
+    assert os.path.dirname(p) == os.path.dirname(store)
 
 
 # --- Host-header gate (DNS-rebinding defense) ------------------------------

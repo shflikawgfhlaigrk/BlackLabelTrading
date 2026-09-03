@@ -6,9 +6,12 @@ name: Windows Tests
 # (Swift pure-logic via `xcrun --sdk macosx swiftc`, and the macOS submission
 # contract) require Xcode/CLT and cannot run on windows-latest.
 #
-# Scoped to the port branches so this lane cannot go red on `mobile` pushes.
+# Scoped to the port branches (pushes, and PRs targeting them) so this lane
+# cannot go red on `mobile` pushes.
 on:
   push:
+    branches: ['claude/windows-full-build-*']
+  pull_request:
     branches: ['claude/windows-full-build-*']
   workflow_dispatch:
 
