@@ -8,12 +8,26 @@
 #
 #   ./build-signed.command                 # auto-pick Apple Development identity (local run/test)
 #   IDENTITY="Apple Distribution: ... (745ZPGFRA5)" ./build-signed.command   # store/distribution
-#   ./build-signed.command --install       # also install to /Applications (so YOU can test Apple sign-in)
+# The provisioned Apple Development/Distribution build stays in ./build. It is never
+# allowed to replace the canonical Developer-ID production app in /Applications.
 #
 # Notarization (Developer ID path) is handled by the separate Developer-ID flow; this script
 # targets the development/distribution-signed bundle that honors the restricted entitlement.
 set -euo pipefail
 cd "$(dirname "$0")"
+if [[ $# -gt 0 ]]; then
+  case "$1" in
+    --install)
+      echo "ABORT: provisioned Apple Development/Distribution builds cannot replace the canonical production app; use the Developer-ID release lane." >&2
+      exit 64
+      ;;
+    --help|-h)
+      echo "Usage: $0  # writes a provisioned test bundle under ./build only"
+      exit 0
+      ;;
+    *) echo "ABORT: unknown argument: $1" >&2; exit 2 ;;
+  esac
+fi
 ROOT="$(pwd)"
 SRC="$ROOT/Sources"
 BUILD="$ROOT/build"
@@ -126,16 +140,6 @@ if codesign -d --entitlements :- "$APP" 2>/dev/null | grep -q "com.apple.develop
 else
   echo "FAIL: Apple Sign-In entitlement missing from the signed binary." >&2
   exit 1
-fi
-
-if [ "${1:-}" == "--install" ]; then
-  DEST="/Applications/$APPNAME.app"
-  echo "==> Installing PROVISIONED build to $DEST"
-  rm -rf "$DEST"; cp -Rf "$APP" "$DEST"
-  # Re-sign in place to settle the bundle identity.
-  cp -f "$PROFILE" "$DEST/Contents/embedded.provisionprofile"
-  codesign --force --options runtime --entitlements "$ENTS" --sign "$IDENTITY" "$DEST"
-  echo "==> Installed (signed, Apple Sign-In enabled): $DEST"
 fi
 
 echo "==> DONE — provisioned bundle: $APP"

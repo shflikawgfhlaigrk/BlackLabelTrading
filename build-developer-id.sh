@@ -19,6 +19,8 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 ROOT="$(pwd)"
+# shellcheck source=scripts/production-install-guard.sh
+source "$ROOT/scripts/production-install-guard.sh"
 SRC="$ROOT/Sources"
 BUILD="$ROOT/build"
 APPNAME="Black Label Trading"
@@ -232,6 +234,7 @@ echo "==> spctl -a -t exec assessment:"
 spctl -a -t exec -vv "$APP" 2>&1 | sed 's/^/    /' || true
 
 if [ "$INSTALL" = "1" ]; then
+  production_install_guard "$INSTALL" "$APP"
   DEST="/Applications/$APPNAME.app"
   echo "==> Installing to $DEST"
   rm -rf "$DEST"; cp -Rf "$APP" "$DEST"
