@@ -15,7 +15,7 @@
 #   ./build-developer-id.sh --launch-test   # build, sign, launch, prove backend up, then quit
 #
 # Signals-only runtime. Ships NO data, broker-order adapter, or credentials — the SQLite
-# store is created empty at runtime; broker creds live in the buyer's Keychain only.
+# store is created empty at runtime; optional reference credentials live in owner-only app storage.
 set -euo pipefail
 cd "$(dirname "$0")"
 ROOT="$(pwd)"
@@ -31,12 +31,36 @@ BUNDLE_ID="com.blacklabel.trading"
 TEAM="745ZPGFRA5"
 ENTS="$SRC/app-developerid.entitlements"
 NOTARY_PROFILE="${NOTARY_PROFILE:-BL_NOTARY}"
-BUILD_NUMBER="${BUILD_NUMBER:-27}"
+BUILD_NUMBER="${BUILD_NUMBER:-28}"
 PY_RUNTIME_SRC="$ROOT/vendor/python-runtime"
 SUBMIT="${SUBMIT:-0}"
 INSTALL=0
 LAUNCH_TEST=0
 STAPLED_VERIFIED=0
+BACKEND_RUNTIME=(
+  bltd_alerts.py bltd_analytics.py bltd_api.py bltd_browser.py bltd_capture.py
+  bltd_feeds.py bltd_optimizer.py bltd_optimizer_cli.py bltd_parsers.py
+  bltd_paths.py bltd_store.py bltd_topstep_bridge.py
+)
+
+# Hash every byte that can enter the canonical app bundle. A dirty worktree is allowed because this
+# repo is actively developed, but the resulting artifact carries this exact input fingerprint in its
+# Info.plist and the script fails if any input changes between compilation and packaging.
+release_input_fingerprint() {
+  (
+    cd "$ROOT"
+    {
+      find Sources -type f -print
+      for module in "${BACKEND_RUNTIME[@]}"; do printf '%s\n' "backend/$module"; done
+      printf '%s\n' backend/launch-backend.sh
+      [ ! -f backend/reference_oos.json ] || printf '%s\n' backend/reference_oos.json
+      find vendor/python-runtime -type f -print
+      printf '%s\n' build-developer-id.sh
+    } | LC_ALL=C sort | while IFS= read -r file; do
+      shasum -a 256 "$file"
+    done
+  ) | shasum -a 256 | awk '{print $1}'
+}
 
 for arg in "$@"; do
   case "$arg" in
@@ -66,6 +90,16 @@ fi
 
 echo "==> Signals-only release contract (source preflight)"
 bash "$ROOT/Tests/signals-only-release-contract.sh"
+
+SOURCE_COMMIT="$(git rev-parse HEAD 2>/dev/null || printf 'unavailable')"
+if [ -n "$(git status --porcelain --untracked-files=all -- Sources backend vendor build-developer-id.sh 2>/dev/null || true)" ]; then
+  SOURCE_STATE="dirty"
+else
+  SOURCE_STATE="clean"
+fi
+SOURCE_FINGERPRINT="$(release_input_fingerprint)"
+BUILD_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+echo "==> Source binding: commit=$SOURCE_COMMIT state=$SOURCE_STATE fingerprint=$SOURCE_FINGERPRINT"
 
 # --- resolve a signing identity: prefer a real Developer ID Application cert ---------------------
 # Developer ID is the correct identity for out-of-store distribution + notarization. If none is in
@@ -134,6 +168,10 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>1.0</string>
   <key>CFBundleVersion</key><string>$BUILD_NUMBER</string>
+  <key>BLTDSourceCommit</key><string>$SOURCE_COMMIT</string>
+  <key>BLTDSourceState</key><string>$SOURCE_STATE</string>
+  <key>BLTDSourceFingerprint</key><string>$SOURCE_FINGERPRINT</string>
+  <key>BLTDBuildUTC</key><string>$BUILD_UTC</string>
   <key>ITSAppUsesNonExemptEncryption</key><false/>
   <key>LSApplicationCategoryType</key><string>public.app-category.finance</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
@@ -164,11 +202,6 @@ xcrun actool "$ASSET_CATALOG" \
 # --- bundle the SELF-CONTAINED backend (code only, ships NO data) ---
 echo "==> Bundling self-contained backend (code only, no data)"
 mkdir -p "$APP/Contents/Resources/backend"
-BACKEND_RUNTIME=(
-  bltd_alerts.py bltd_analytics.py bltd_api.py bltd_browser.py bltd_capture.py
-  bltd_feeds.py bltd_optimizer.py bltd_optimizer_cli.py bltd_parsers.py
-  bltd_paths.py bltd_store.py bltd_topstep_bridge.py
-)
 for module in "${BACKEND_RUNTIME[@]}"; do
   [ -f "$ROOT/backend/$module" ] || { echo "FAIL: missing backend runtime module $module" >&2; exit 1; }
   cp -f "$ROOT/backend/$module" "$APP/Contents/Resources/backend/"
@@ -389,6 +422,12 @@ echo "==> Entitlements on the signed bundle:"
 codesign -d --entitlements - "$APP" 2>/dev/null | sed 's/^/    /' || true
 
 echo "==> Packaging Developer-ID zip for notary submission"
+FINAL_SOURCE_FINGERPRINT="$(release_input_fingerprint)"
+if [ "$FINAL_SOURCE_FINGERPRINT" != "$SOURCE_FINGERPRINT" ]; then
+  echo "FAIL: release inputs changed during the build; refusing an unbound artifact" >&2
+  echo "      compiled=$SOURCE_FINGERPRINT current=$FINAL_SOURCE_FINGERPRINT" >&2
+  exit 1
+fi
 ditto -c -k --keepParent "$APP" "$ZIP"
 echo "==> Notary submission zip: $ZIP"
 

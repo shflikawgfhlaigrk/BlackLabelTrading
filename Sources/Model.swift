@@ -227,6 +227,8 @@ enum FirmData {
 }
 
 // MARK: - Persistence (real backend — Codable JSON in the sandbox container)
+// Disk rules shared with every local store live in StoreDisk.swift: a corrupt file is
+// quarantined (never silently overwritten) and every save reports success via lastSaveOK.
 final class AppModel: ObservableObject {
     @Published var trades: [Trade] = [] { didSet { save() } }
     @Published var signals: [SignalLog] = [] { didSet { save() } }
@@ -250,9 +252,19 @@ final class AppModel: ObservableObject {
         load()
     }
 
+    // True while the last save() reached disk; UI confirmations ("Saved.") must consult this
+    // instead of asserting success unconditionally.
+    private(set) var lastSaveOK = true
+
     private func load() {
+        guard FileManager.default.fileExists(atPath: url.path) else { return }   // fresh install
         guard let data = try? Data(contentsOf: url),
-              let box = try? JSONDecoder().decode(Box.self, from: data) else { return }
+              let box = try? JSONDecoder().decode(Box.self, from: data) else {
+            // Corrupt/unreadable journal: move it aside so the next save() can never
+            // atomically destroy the only recoverable copy.
+            StoreDisk.quarantine(url)
+            return
+        }
         trades = box.trades
         signals = box.signals ?? []
         profiles = box.profiles ?? []
@@ -260,7 +272,9 @@ final class AppModel: ObservableObject {
     }
     private func save() {
         let box = Box(trades: trades, signals: signals, profiles: profiles, activeProfileID: activeProfileID)
-        if let data = try? JSONEncoder().encode(box) { try? data.write(to: url, options: .atomic) }
+        guard let data = try? JSONEncoder().encode(box) else { lastSaveOK = false; return }
+        do { try data.write(to: url, options: .atomic); lastSaveOK = true }
+        catch { lastSaveOK = false }
     }
 
     // Prop-firm rule profiles CRUD. `activeProfile` is the one gating displayed signals.
@@ -309,10 +323,11 @@ final class AppModel: ObservableObject {
 
     // Vault-backed daily logs: write the GRADED session ledger, grouped by day with per-day totals,
     // to a CSV in the app's own local vault dir. Real data only (your graded signals); modeled P&L
-    // is labeled as such. Returns the file path, or nil when there is nothing graded to log.
-    func exportDailyLogs() -> String? {
+    // is labeled as such. Every outcome is distinguishable so the UI never renders a silent no-op.
+    enum DailyLogExport { case saved(path: String), nothingToExport, failed(reason: String) }
+    func exportDailyLogs() -> DailyLogExport {
         let graded = signals.filter { $0.grade == "win" || $0.grade == "loss" }
-        guard !graded.isEmpty else { return nil }
+        guard !graded.isEmpty else { return .nothingToExport }
         let df = DateFormatter(); df.locale = Locale(identifier: "en_US_POSIX"); df.dateFormat = "yyyy-MM-dd"
         let entries = graded.sorted { $0.created < $1.created }.map {   // oldest-first daily log
             SessionLedger.Entry(day: df.string(from: $0.created), symbol: $0.symbol,
@@ -323,7 +338,8 @@ final class AppModel: ObservableObject {
             .appendingPathComponent("Black Label Trading/logs", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let url = dir.appendingPathComponent("session-daily-log.csv")
-        do { try csv.write(to: url, atomically: true, encoding: .utf8); return url.path } catch { return nil }
+        do { try csv.write(to: url, atomically: true, encoding: .utf8); return .saved(path: url.path) }
+        catch { return .failed(reason: error.localizedDescription) }
     }
     // Grade a committed signal: a win banks the reward AT THE PLANNED TARGET, a loss the 1R risk,
     // pending resets. This is a MODELED outcome (target/stop), not a broker-realized fill — every
@@ -404,12 +420,47 @@ enum AccountStore {
         guard let h = a[e] else { return .failure(.noAccount) }
         return h == hash(e, pw) ? .success(()) : .failure(.wrongPw)
     }
+    static func exists(_ email: String) -> Bool {
+        load()[email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()] != nil
+    }
     static func delete(_ email: String) { var a = load(); a[email.trimmingCharacters(in: .whitespaces).lowercased()] = nil; save(a) }
 }
 
 final class Session: ObservableObject {
-    @Published var signedIn = false
-    @Published var email = ""
+    @Published private(set) var signedIn = false
+    @Published private(set) var email = ""
+    @Published private(set) var kind: AppSessionKind? = nil
+    private let persistence: AppSessionStore
+
+    init(persistence: AppSessionStore = AppSessionStore()) {
+        self.persistence = persistence
+        if let identity = persistence.restore(localAccountExists: AccountStore.exists) {
+            signedIn = true
+            email = identity.email
+            kind = identity.kind
+        }
+    }
+
+    func begin(email: String, kind: AppSessionKind) {
+        let identity = AppSessionIdentity(email: email, kind: kind)
+        persistence.save(identity)
+        guard let restored = persistence.restore(localAccountExists: AccountStore.exists) else {
+            signedIn = false; self.email = ""; self.kind = nil
+            return
+        }
+        self.email = restored.email
+        self.kind = restored.kind
+        signedIn = true
+    }
+
+    /// Sign-out forgets only the app session. Local accounts, trading data, browser profiles, and
+    /// preserved legacy Keychain records remain available.
+    func signOut() {
+        persistence.clear()
+        signedIn = false
+        email = ""
+        kind = nil
+    }
 }
 
 // MARK: - Local app settings (Google client ID) — on-device only.
@@ -438,8 +489,8 @@ enum AppSettingsStore {
 // MARK: - Local platform account reference (on-device only — signals-only, manual execution)
 // HONEST FRAMING: This stores the buyer's OWN platform account reference on THIS Mac.
 // It is NOT a live broker feed and it does NOT auto-trade or move money. The username and
-// connection note live in UserDefaults; the password (if entered) lives in the macOS
-// Keychain — never in plaintext, never bundled, never sent anywhere by this app.
+// connection note live in UserDefaults; the optional reference password lives in an atomic,
+// owner-only local file — never bundled or sent anywhere by this app.
 struct WealthChartsAccount: Codable, Equatable {
     var username: String = ""
     var note: String = ""          // optional free-text label (e.g. "Topstep 50K eval feed")
@@ -448,11 +499,12 @@ struct WealthChartsAccount: Codable, Equatable {
     var isConfigured: Bool { !username.trimmingCharacters(in: .whitespaces).isEmpty }
 }
 
-// Keychain helper — generic password item scoped to this app + the saved username.
+// Active private-file credential helper scoped to this app + the saved username. The old Keychain
+// service remains addressable only for the explicit foreground recovery action.
 enum WCKeychain {
     private static let service = "com.blacklabel.trading.wealthcharts"
 
-    // Base query (class + service + account) — TradingKeychain adds storage-location/return keys.
+    // Stable identity shared by the active private file and explicit legacy Keychain recovery.
     private static func base(_ acct: String) -> [String: Any] {
         [
             kSecClass as String: kSecClassGenericPassword,
@@ -462,25 +514,29 @@ enum WCKeychain {
     }
     static func setSecret(_ secret: String, account: String) {
         let acct = account.isEmpty ? "_default" : account
-        delete(account: acct)
         guard !secret.isEmpty else { return }
         TradingKeychain.set(base(acct), data: Data(secret.utf8))
     }
     static func hasSecret(account: String) -> Bool {
         let acct = account.isEmpty ? "_default" : account
-        return TradingKeychain.copy(base(acct)) != nil
+        return TradingKeychain.contains(base(acct))
     }
     static func delete(account: String) {
         let acct = account.isEmpty ? "_default" : account
         TradingKeychain.delete(base(acct))
     }
+    static func recoverExistingKeychainSecret(account: String) -> Bool {
+        let acct = account.isEmpty ? "_default" : account
+        return TradingKeychain.recoverExistingKeychainItem(base(acct))
+    }
 }
 
 // Observable store for the local platform account reference. Username/note in UserDefaults,
-// password in Keychain. No network calls — purely local persistence.
+// optional password in owner-only app storage. No network calls — purely local persistence.
 final class WealthChartsStore: ObservableObject {
     @Published var account: WealthChartsAccount { didSet { persist() } }
     @Published private(set) var hasSecret: Bool = false
+    @Published private(set) var recoveryMessage: String = ""
 
     private static let key = "com.blacklabel.trading.wealthcharts.account"
 
@@ -500,8 +556,8 @@ final class WealthChartsStore: ObservableObject {
         }
     }
 
-    /// Save the connection locally. Username/note persist to UserDefaults; the password,
-    /// if provided, goes to the Keychain (this device only). Stamps connectedAt.
+    /// Save the connection locally. Username/note persist to UserDefaults; the password, if
+    /// provided, goes to atomic owner-only app storage on this device. Stamps connectedAt.
     func save(username: String, password: String, note: String) {
         let u = username.trimmingCharacters(in: .whitespacesAndNewlines)
         account.username = u
@@ -509,14 +565,25 @@ final class WealthChartsStore: ObservableObject {
         account.connectedAt = Date()
         if !password.isEmpty { WCKeychain.setSecret(password, account: u) }
         hasSecret = WCKeychain.hasSecret(account: u)
+        recoveryMessage = ""
     }
 
-    /// Forget the connection entirely — wipes UserDefaults entry and Keychain secret.
+    /// Forget the active connection. Preserved legacy Keychain data is deliberately untouched.
     func disconnect() {
         WCKeychain.delete(account: account.username)
         account = WealthChartsAccount()
         UserDefaults.standard.removeObject(forKey: Self.key)
         hasSecret = false
+        recoveryMessage = ""
+    }
+
+    /// Called only by the foreground recovery confirmation in Settings. A macOS prompt may appear.
+    func recoverPreviousPassword() {
+        let recovered = WCKeychain.recoverExistingKeychainSecret(account: account.username)
+        hasSecret = WCKeychain.hasSecret(account: account.username)
+        recoveryMessage = recovered
+            ? "Previous password recovered into private app storage. The Keychain copy was preserved."
+            : "No recoverable previous Keychain password was found. Nothing was changed."
     }
 }
 

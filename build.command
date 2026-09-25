@@ -129,7 +129,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleName</key><string>Black Label Trading</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>1.0</string>
-  <key>CFBundleVersion</key><string>27</string>
+  <key>CFBundleVersion</key><string>28</string>
   <key>GoogleClientID</key><string></string>
   <key>ITSAppUsesNonExemptEncryption</key><false/>
   <key>LSApplicationCategoryType</key><string>public.app-category.finance</string>
@@ -353,6 +353,11 @@ bash "$ROOT/Tests/signals-only-release-contract.sh" "$APP"
 # The Apple button is runtime-gated on the entitlement, so this build hides it. For a notarizable,
 # distributable bundle use ./build-developer-id.sh (hardened runtime + Developer ID + spctl/notary).
 echo "==> Signing ($([ "$DEVID" = "1" ] && echo "Developer-ID + hardened runtime + non-sandbox (app-developerid.entitlements)" || echo "adhoc with Developer-ID entitlements"))"
+if [ "$DEVID" = "1" ]; then
+  # --deep does not discover arbitrary Mach-O files copied into Resources. The
+  # embedded Python interpreter and modules must be signed before the app seal.
+  python3 "$ROOT/scripts/sign-nested-runtime.py" "$APP" "$DEVID_IDENTITY"
+fi
 sign_bundle "$APP"
 codesign --verify --deep --strict "$APP"
 

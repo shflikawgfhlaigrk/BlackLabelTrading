@@ -19,6 +19,7 @@ SOURCES=(
   "$ROOT/Sources/HoloTheme.swift"
   "$ROOT/Sources/Updater.swift"
   "$ROOT/Sources/TradeMath.swift"
+  "$ROOT/Sources/StoreDisk.swift"
   "$ROOT/Sources/SignalCore.swift"
   "$ROOT/Sources/RuleProfile.swift"
   "$ROOT/Sources/Analytics.swift"
@@ -61,3 +62,6 @@ echo "==> Running"
   BLTD_STORE="/tmp/bltd-regression.sqlite3" \
   BLTD_TOKEN="regression-backend-token" \
   "$OUT"
+
+echo "==> Running focused credential/session persistence tests"
+bash "$ROOT/Tests/run-trading-persistence-tests.sh"

@@ -9,7 +9,7 @@ settings:
     CODE_SIGN_STYLE: Automatic
     ENABLE_HARDENED_RUNTIME: YES
     MARKETING_VERSION: "1.0"
-    CURRENT_PROJECT_VERSION: "27"
+    CURRENT_PROJECT_VERSION: "28"
     PRODUCT_NAME: "Black Label Trading"
     ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
     ENABLE_USER_SCRIPT_SANDBOXING: NO
@@ -244,7 +244,7 @@ targets:
       properties:
         CFBundleDisplayName: "Black Label Trading"
         CFBundleShortVersionString: "1.0"
-        CFBundleVersion: "27"
+        CFBundleVersion: "28"
         LSMinimumSystemVersion: "13.0"
         ITSAppUsesNonExemptEncryption: false
         LSApplicationCategoryType: public.app-category.finance

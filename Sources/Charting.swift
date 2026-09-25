@@ -442,12 +442,21 @@ final class DrawingStore: ObservableObject {
     func remove(_ d: Drawing, from symbol: String) { bySymbol[key(symbol)]?.removeAll { $0.id == d.id } }
     func clear(_ symbol: String) { bySymbol[key(symbol)] = nil }
 
+    // True while the last save() reached disk (see StoreDisk invariants).
+    private(set) var lastSaveOK = true
+
     private func load() {
+        guard FileManager.default.fileExists(atPath: url.path) else { return }   // fresh install
         guard let data = try? Data(contentsOf: url),
-              let box = try? JSONDecoder().decode([String: [Drawing]].self, from: data) else { return }
+              let box = try? JSONDecoder().decode([String: [Drawing]].self, from: data) else {
+            StoreDisk.quarantine(url)   // corrupt drawings store — keep it recoverable, never save over it
+            return
+        }
         bySymbol = box
     }
     private func save() {
-        if let data = try? JSONEncoder().encode(bySymbol) { try? data.write(to: url, options: .atomic) }
+        guard let data = try? JSONEncoder().encode(bySymbol) else { lastSaveOK = false; return }
+        do { try data.write(to: url, options: .atomic); lastSaveOK = true }
+        catch { lastSaveOK = false }
     }
 }

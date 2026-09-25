@@ -159,14 +159,14 @@ struct WebhookInfo: Equatable {
     }
 }
 
-// MARK: - Per-source local state - macOS Keychain ONLY (this device).
-// Webhook ingestion does not need prop-firm credentials. This store remains for migration/legacy
-// cleanup and for remembering the non-secret last-selected source key so the picker opens where the buyer left it.
+// MARK: - Per-source local state — prompt-free owner-only app storage (this device).
+// Webhook ingestion does not need prop-firm credentials. Existing Keychain records remain untouched
+// and are reachable only through an explicit foreground recovery operation.
 enum FeedCredStore {
     private static let service = "com.blacklabel.trading.feedcreds"
     static let lastSourceKey = "com.blacklabel.trading.feed.lastSource"
 
-    // Base query (class + service + account) — TradingKeychain adds storage-location/return keys.
+    // Stable identity shared by the active private file and explicit legacy Keychain recovery.
     private static func base(_ source: String) -> [String: Any] {
         [
             kSecClass as String: kSecClassGenericPassword,
@@ -176,7 +176,6 @@ enum FeedCredStore {
     }
 
     static func save(source: String, creds: [String: String]) {
-        delete(source: source)
         guard let data = try? JSONSerialization.data(withJSONObject: creds) else { return }
         TradingKeychain.set(base(source), data: data)
         UserDefaults.standard.set(source, forKey: lastSourceKey)
@@ -188,7 +187,11 @@ enum FeedCredStore {
         return obj
     }
 
-    static func hasCreds(source: String) -> Bool { !load(source: source).isEmpty }
+    static func hasCreds(source: String) -> Bool { TradingKeychain.contains(base(source)) }
+
+    static func recoverExistingKeychainCredentials(source: String) -> Bool {
+        TradingKeychain.recoverExistingKeychainItem(base(source))
+    }
 
     static func delete(source: String) {
         TradingKeychain.delete(base(source))
@@ -218,6 +221,8 @@ struct ConnectFeedScreen: View {
     @State private var busy = false
     @State private var loaded = false
     @State private var showAdvanced = false   // hides the developer webhook URL/token/curl by default
+    @State private var confirmCredentialRecovery = false
+    @State private var credentialRecoveryNote = ""
 
     private var current: FeedSourceInfo? { sources.first { $0.key == selected } }
 
@@ -279,6 +284,12 @@ struct ConnectFeedScreen: View {
         }
         .frame(maxWidth: .infinity, alignment: .center)
         .task { await initialLoad() }
+        .confirmationDialog("Recover previous source credentials?", isPresented: $confirmCredentialRecovery) {
+            Button("Recover now") { recoverSelectedSourceCredentials() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This foreground action may show one macOS Keychain prompt. It copies an existing item into prompt-free private app storage and leaves the Keychain item untouched.")
+        }
     }
 
     // Source chips exposed by the backend catalogue.
@@ -291,7 +302,7 @@ struct ConnectFeedScreen: View {
                     SourceChip(info: s, selected: selected == s.key,
                                hasCreds: FeedCredStore.hasCreds(source: s.key)) {
                         selected = s.key
-                        inputs = mergedInputs(for: s)
+                        inputs = defaultInputs(for: s)
                         Task { await refresh() }
                     }
                 }
@@ -350,6 +361,14 @@ struct ConnectFeedScreen: View {
                     webhookLine("Webhook URL", webhook.url)
                     webhookLine("Token", webhook.token.isEmpty ? "local backend has not reported a token yet" : webhook.token)
                     GhostButton(label: "Copy curl", icon: "doc.on.doc") { Task { if let w = await feed.webhookInfo() { copy(w.curl) } } }
+                    GhostButton(label: "Recover prior saved source fields", icon: "key.fill") {
+                        confirmCredentialRecovery = true
+                    }
+                    if !credentialRecoveryNote.isEmpty {
+                        Text(credentialRecoveryNote)
+                            .font(.system(size: 10.5, weight: .semibold, design: .rounded))
+                            .foregroundColor(BLTheme.sub).fixedSize(horizontal: false, vertical: true)
+                    }
                 }
             } else if src.isBrowser {
                 Text("Opens \(src.label) in its own window. Sign in the way you always do, and Black Label reads the same live prices feeding your charts. No broker key, and your password is never stored.")
@@ -365,6 +384,14 @@ struct ConnectFeedScreen: View {
                 Text("This build uses webhook ingestion only.")
                     .font(.system(size: 11.5, design: .rounded)).foregroundColor(BLTheme.sub)
                     .fixedSize(horizontal: false, vertical: true)
+                GhostButton(label: "Recover prior saved source fields", icon: "key.fill") {
+                    confirmCredentialRecovery = true
+                }
+                if !credentialRecoveryNote.isEmpty {
+                    Text(credentialRecoveryNote)
+                        .font(.system(size: 10.5, weight: .semibold, design: .rounded))
+                        .foregroundColor(BLTheme.sub).fixedSize(horizontal: false, vertical: true)
+                }
             }
         }
     }
@@ -449,7 +476,7 @@ struct ConnectFeedScreen: View {
                 sources = loadedSources
                 webhook = await feed.webhookInfo() ?? WebhookInfo()
                 if !sources.contains(where: { $0.key == selected }) { selected = sources.first?.key ?? selected }
-                if let src = current { inputs = mergedInputs(for: src) }
+                if let src = current { inputs = defaultInputs(for: src) }
                 return
             }
             let delay = UInt64(300_000_000 * (attempt + 1))
@@ -457,11 +484,13 @@ struct ConnectFeedScreen: View {
         }
         webhook = await feed.webhookInfo() ?? webhook
         if !sources.contains(where: { $0.key == selected }) { selected = sources.first?.key ?? selected }
-        if let src = current { inputs = mergedInputs(for: src) }
+        if let src = current { inputs = defaultInputs(for: src) }
     }
 
-    private func mergedInputs(for src: FeedSourceInfo) -> [String: String] {
-        var merged = FeedCredStore.load(source: src.key)
+    /// Cold launch uses schema defaults only. Reading active credential bytes requires an explicit
+    /// foreground action; browser sources persist their own cookies in the unchanged Chrome profile.
+    private func defaultInputs(for src: FeedSourceInfo) -> [String: String] {
+        var merged: [String: String] = [:]
         for f in src.credFields where (merged[f.name] ?? "").isEmpty && !f.defaultValue.isEmpty {
             merged[f.name] = f.defaultValue
         }
@@ -479,7 +508,7 @@ struct ConnectFeedScreen: View {
             await feed.refreshStatus()
             return
         }
-        // Webhook/other: persist to Keychain first (so a later backend restart can re-authenticate).
+        // Webhook/other: persist to prompt-free private app storage first.
         let creds = inputs.filter { !$0.value.isEmpty }
         FeedCredStore.save(source: src.key, creds: creds)
         if let st = await feed.connectFeed(source: src.key, creds: creds) { status = st }
@@ -496,6 +525,17 @@ struct ConnectFeedScreen: View {
 
     private func refresh() async {
         if let st = await feed.feedStatus() { status = st }
+    }
+
+    /// Explicit foreground legacy recovery. No launch/background path calls this method.
+    private func recoverSelectedSourceCredentials() {
+        let recovered = FeedCredStore.recoverExistingKeychainCredentials(source: selected)
+        if recovered {
+            inputs = FeedCredStore.load(source: selected)
+            credentialRecoveryNote = "Previous source fields recovered. The Keychain copy was preserved."
+        } else {
+            credentialRecoveryNote = "No recoverable previous Keychain item was found. Nothing was changed."
+        }
     }
 
     private func copy(_ text: String) {

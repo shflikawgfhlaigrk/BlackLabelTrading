@@ -102,6 +102,7 @@ struct SignalsScreen: View {
     @State private var gateContracts = "1"                 // contract size the buyer wants the prop-firm gate to check
     @State private var rerunning = false
     @State private var dailyLogPath: String? = nil   // path shown after "Export daily logs"
+    @State private var dailyLogError: String? = nil  // shown when the CSV write fails — never a silent no-op
     @State private var tAccount = "50000"             // order-ticket sizing inputs (your own values)
     @State private var tRiskPct = "1"
     @State private var ticketCopied = false
@@ -130,7 +131,10 @@ struct SignalsScreen: View {
                 HStack(alignment: .top) {
                     ScreenTitle(title: "Signals", subtitle: "Live factor scoring from your own captured bars · 16 modules · 13 risk gates · 2-of-8 multi-TF consensus · direction lock · 6-tier trailing-stop plan. Instrument-specific modules (Session, SMT) apply to ES only and stay absent on other instruments.", icon: "dot.radiowaves.left.and.right")
                     Spacer()
-                    StatusPill(text: live.hasData ? "Live" : "Awaiting feed", tint: live.hasData ? BLTheme.green : BLTheme.gold)
+                    // "Live" only while bars are actually printing (recency-gated); bars that stopped
+                    // render as an explicit stale state — an hours-old close is never labeled live.
+                    StatusPill(text: live.isLive ? "Live" : (live.hasData ? staleSinceText : "Awaiting feed"),
+                               tint: live.isLive ? BLTheme.green : (live.hasData ? BLTheme.red : BLTheme.gold))
                 }
 
                 // FIRST-CLASS "NO EDGE TODAY" verdict — the buyer's live gate result on THEIR OWN
@@ -171,11 +175,11 @@ struct SignalsScreen: View {
                 // live factor inputs, so it renders ONLY when real captured data exists — otherwise a
                 // cold-start buyer would see a fabricated default plan (ES @ 5000, $50/pt). Honest
                 // empty state until the buyer's own feed produces bars.
-                if live.hasData && cockpit.muteSignals {
+                if live.isLive && cockpit.muteSignals {
                     // AUTO-MUTE: the buyer breached a hard cap they set — hide the trade plan for the
                     // session. Their own rule profile enforcing itself; never places or blocks an order.
                     signalsMutedCard
-                } else if live.hasData {
+                } else if live.isLive {
                     signalCard
 
                     // Prop-firm rule gate — annotates THIS trade plan against the buyer's active
@@ -204,6 +208,15 @@ struct SignalsScreen: View {
                             VStack(spacing: 6) { ForEach(gates) { gateRow($0) } }
                         }.frame(maxWidth: .infinity)
                     }
+                } else if live.hasData {
+                    // Bars exist but stopped printing: the signal display pauses rather than
+                    // presenting an old close as a current plan (§5.1).
+                    Panel(title: "Signal", icon: "dot.radiowaves.left.and.right", accent: BLTheme.red) {
+                        EmptyState(icon: "clock.badge.exclamationmark",
+                                   title: staleSinceText,
+                                   hint: "Your capture feed stopped printing bars, so the signal, consensus, and risk gates are paused — the last stored close is not a live price. Reconnect your feed to resume.")
+                        GoldButton(label: "Check my feed", icon: "globe") { nav.section = .feeds }
+                    }
                 } else {
                     Panel(title: "Signal", icon: "dot.radiowaves.left.and.right", accent: BLTheme.gold) {
                         EmptyState(icon: "antenna.radiowaves.left.and.right",
@@ -216,12 +229,21 @@ struct SignalsScreen: View {
                 // Two-column: factor controls | factor breakdown.
                 HStack(alignment: .top, spacing: 16) {
                     Panel(title: "Live factors", icon: "antenna.radiowaves.left.and.right",
-                          accent: live.hasData ? BLTheme.green : BLTheme.gold) {
+                          accent: live.isLive ? BLTheme.green : BLTheme.gold) {
                         if live.hasData {
                             HStack(spacing: 10) {
                                 Stat(label: "Symbol", value: TradingSymbolScope.displaySymbol(inp.symbol))
                                 Stat(label: "Price", value: TradeMath.num(live.price ?? 0))
                                 Stat(label: "ATR", value: TradeMath.num(live.atr ?? 0))
+                                // The bar timestamp behind the shown price — always visible, so the
+                                // price is never mistaken for fresher than it is.
+                                Stat(label: "As of", value: live.asOf.map { $0.formatted(date: .omitted, time: .shortened) } ?? "—",
+                                     tint: live.isStale ? BLTheme.red : BLTheme.text)
+                            }
+                            if live.isStale {
+                                Text(staleSinceText + " — these values come from your last captured bars, not a current price.")
+                                    .font(.system(size: 11, weight: .semibold, design: .rounded)).foregroundColor(BLTheme.red)
+                                    .fixedSize(horizontal: false, vertical: true)
                             }
                             Text("Auto-computed from your captured bars · \(live.available.count)/\(SignalFactor.allCases.count) factors have a live source")
                                 .font(.system(size: 10.5, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
@@ -239,9 +261,9 @@ struct SignalsScreen: View {
                     VStack(spacing: 16) {
                         // Factor breakdown + Trade plan are computed from `inp`/`result`, which on a
                         // cold start are the SignalInputs() ES defaults (price 5000, $50/pt). Render
-                        // them ONLY with real captured data, else an honest await state — never a
-                        // fabricated default ES plan.
-                        if live.hasData {
+                        // them ONLY with real, RECENT captured data, else an honest await/stale state —
+                        // never a fabricated default ES plan and never a plan priced off stopped bars.
+                        if live.isLive {
                             Panel(title: "Factor breakdown", icon: "list.bullet.indent") {
                                 ForEach(SignalFactor.allCases) { f in factorRow(f) }
                                 Divider().background(BLTheme.stroke).padding(.vertical, 2)
@@ -290,8 +312,11 @@ struct SignalsScreen: View {
                             }
                         } else {
                             Panel(title: "Trade plan", icon: "scope") {
-                                EmptyState(icon: "scope", title: "Awaiting your live feed",
-                                           hint: "The factor breakdown and trade plan compute from your own captured bars. Connect your feed and let bars accumulate — nothing is shown until it's real.")
+                                EmptyState(icon: "scope",
+                                           title: live.hasData ? "Feed stale — plan paused" : "Awaiting your live feed",
+                                           hint: live.hasData
+                                               ? "Bars stopped printing (\(staleSinceText.lowercased())). A trade plan is never computed from a price that isn't current — reconnect your feed to resume."
+                                               : "The factor breakdown and trade plan compute from your own captured bars. Connect your feed and let bars accumulate — nothing is shown until it's real.")
                                 GhostButton(label: "Connect my feed", icon: "globe") { nav.section = .feeds }
                             }
                         }
@@ -322,11 +347,18 @@ struct SignalsScreen: View {
                         if !model.gradedSignals.isEmpty {
                             HStack(spacing: 8) {
                                 GhostButton(label: "Export daily logs", icon: "square.and.arrow.down") {
-                                    dailyLogPath = model.exportDailyLogs()
+                                    switch model.exportDailyLogs() {
+                                    case .saved(let path):     dailyLogPath = path; dailyLogError = nil
+                                    case .nothingToExport:     dailyLogPath = nil;  dailyLogError = "Nothing graded to export yet."
+                                    case .failed(let reason):  dailyLogPath = nil;  dailyLogError = "Export failed — \(reason)"
+                                    }
                                 }
                                 if let p = dailyLogPath {
                                     Text("Saved to vault: \(p)").font(.system(size: 10, design: .rounded))
                                         .foregroundColor(BLTheme.green).lineLimit(1).truncationMode(.middle)
+                                } else if let e = dailyLogError {
+                                    Text(e).font(.system(size: 10, weight: .semibold, design: .rounded))
+                                        .foregroundColor(BLTheme.red).lineLimit(2)
                                 }
                             }.padding(.top, 4)
                         }
@@ -972,6 +1004,13 @@ struct SignalsScreen: View {
         }
     }
 
+    // Stale-feed wording carries the last bar's timestamp so the buyer sees exactly how old
+    // the stored data is — never a bare "stale" with the age hidden.
+    private var staleSinceText: String {
+        guard let t = live.asOf else { return "Feed stale" }
+        return "Feed stale since \(t.formatted(date: .omitted, time: .shortened))"
+    }
+
     // Live factor loading — pulls the buyer's own recent ES bars and auto-computes every factor
     // that has a real source. Read-only by design; the buyer never edits these. Honest empties on
     // a cold store (no bars → nothing shown, never fabricated).
@@ -1257,6 +1296,9 @@ struct TradeEditor: View {
     @State private var size = ""; @State private var pnl = ""
     @State private var exit = ""; @State private var mae = ""; @State private var mfe = ""
     @State private var tagsText = ""; @State private var hasClose = false
+    @State private var confirmDelete = false
+    // Delete only offers on a trade that is actually in the journal — never on a fresh "Log trade".
+    private var isExisting: Bool { model.trades.contains { $0.id == trade.id } }
     var body: some View {
         ScrollView {
         VStack(alignment: .leading, spacing: 16) {
@@ -1313,7 +1355,13 @@ struct TradeEditor: View {
                     .scrollContentBackground(.hidden).padding(8).frame(height: 60).background(BLTheme.bg2).clipShape(RoundedRectangle(cornerRadius: 10))
                 Text("Tip: #hashtags in notes also count as tags in Analytics.").font(.system(size: 10, design: .rounded)).foregroundColor(BLTheme.sub)
             }
-            HStack { Spacer()
+            HStack {
+                // Visible delete for an existing trade — the row context menu stays as a shortcut,
+                // but removal must never be discoverable only by right-click.
+                if isExisting {
+                    GhostButton(label: "Delete", icon: "trash", tint: BLTheme.red) { confirmDelete = true }
+                }
+                Spacer()
                 GhostButton(label: "Cancel") { dismiss() }
                 GoldButton(label: "Save trade", icon: "checkmark") {
                     var t = computed()
@@ -1324,6 +1372,12 @@ struct TradeEditor: View {
                     model.upsert(t)
                     dismiss()
                 }
+            }
+            .confirmationDialog("Delete this trade from your journal?", isPresented: $confirmDelete) {
+                Button("Delete trade", role: .destructive) { model.delete(trade); dismiss() }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("This removes the trade and its stats from the journal on this Mac.")
             }
         }
         .padding(24).frame(width: 540)
@@ -1536,6 +1590,7 @@ struct ProfileEditorCard: View {
     @State private var pointValue: String
     @State private var source: String
     @State private var saved = false
+    @State private var saveFailed = false
 
     init(profile: RuleProfile) {
         self.profile = profile
@@ -1587,10 +1642,17 @@ struct ProfileEditorCard: View {
                     p.pointValue = max(0, Double(pointValue) ?? 0)
                     p.sourceURL = source.trimmingCharacters(in: .whitespacesAndNewlines)
                     model.upsertProfile(p)
-                    withAnimation { saved = true }
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { withAnimation { saved = false } }
+                    // "Saved." only when the write actually reached disk — never an asserted success.
+                    withAnimation { saved = model.lastSaveOK; saveFailed = !model.lastSaveOK }
+                    if model.lastSaveOK {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { withAnimation { saved = false } }
+                    }
                 }
                 if saved { Text("Saved.").font(.system(size: 11, weight: .semibold, design: .rounded)).foregroundColor(BLTheme.green) }
+                if saveFailed {
+                    Text("Couldn't save — writing to disk failed (check free space and permissions).")
+                        .font(.system(size: 11, weight: .semibold, design: .rounded)).foregroundColor(BLTheme.red)
+                }
                 Spacer()
             }
         }
@@ -1795,7 +1857,7 @@ struct SettingsScreen: View {
             Panel(title: "Account", icon: "person.crop.circle") {
                 Stat(label: "Signed in as", value: session.email.isEmpty ? "guest" : session.email)
                 HStack {
-                    GhostButton(label: "Sign out", icon: "rectangle.portrait.and.arrow.right") { withAnimation { session.signedIn = false } }
+                    GhostButton(label: "Sign out", icon: "rectangle.portrait.and.arrow.right") { withAnimation { session.signOut() } }
                     if session.email != "guest" && !session.email.isEmpty {
                         GhostButton(label: "Delete account", icon: "trash", tint: BLTheme.red) { confirmDelete = true }
                     }
@@ -1908,7 +1970,11 @@ struct SettingsScreen: View {
         }.padding(24) }
         .alert("Delete your account?", isPresented: $confirmDelete) {
             Button("Cancel", role: .cancel) {}
-            Button("Delete", role: .destructive) { AccountStore.delete(session.email); withAnimation { session.signedIn = false; session.email = "" } }
+            Button("Delete", role: .destructive) {
+                let email = session.email
+                AccountStore.delete(email)
+                withAnimation { session.signOut() }
+            }
         } message: { Text("This permanently removes your account credentials from this Mac. Your saved trades and signals remain in the app's local store.") }
     }
     private var feedStatusColor: Color {
@@ -1948,6 +2014,7 @@ struct EdgeGateAlertsPanel: View {
     @State private var pushToken = ""
     @State private var pushUser = ""
     @State private var saved = false
+    @State private var saveFailed = false   // sticky until the next attempt — a failed save is never silent
     @State private var sendMsg: String? = nil
     @State private var sendOK = false
     @State private var busy = false
@@ -1974,15 +2041,15 @@ struct EdgeGateAlertsPanel: View {
             }
             HStack(spacing: 8) {
                 GoldButton(label: "Save", icon: "checkmark") {
-                    busy = true
+                    busy = true; saveFailed = false
                     Task {
                         let ok = await feed.saveAlertConfig(enabled: enabled, endpoint: endpoint,
                                                             provider: provider, pushoverToken: pushToken,
                                                             pushoverUser: pushUser)
                         status = await feed.alertStatus()
                         busy = false
-                        withAnimation { saved = ok }
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { withAnimation { saved = false } }
+                        withAnimation { saved = ok; saveFailed = !ok }
+                        if ok { DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { withAnimation { saved = false } } }
                     }
                 }
                 GhostButton(label: "Send test", icon: "paperplane") {
@@ -1997,6 +2064,10 @@ struct EdgeGateAlertsPanel: View {
                     }
                 }
                 if saved { Text("Saved.").font(.system(size: 11, weight: .semibold, design: .rounded)).foregroundColor(BLTheme.green) }
+                if saveFailed {
+                    Text("Couldn't save — backend unreachable. Nothing was configured; try again.")
+                        .font(.system(size: 11, weight: .semibold, design: .rounded)).foregroundColor(BLTheme.red)
+                }
                 if busy { Text("…").font(.system(size: 12, design: .rounded)).foregroundColor(BLTheme.sub) }
             }
             if let m = sendMsg {
@@ -2050,10 +2121,11 @@ struct FeedCostPanel: View {
 // MARK: - Platform account reference panel (reusable - shown in Settings)
 // HONEST FRAMING: stores the buyer's own platform account reference on THIS Mac only.
 // Not a login flow; does not auto-trade or move money. Username + note -> UserDefaults,
-// password -> macOS Keychain. The UI states plainly what is and isn't connected.
+// optional password -> private app storage. The UI states plainly what is and isn't connected.
 struct WealthChartsPanel: View {
     @EnvironmentObject var wc: WealthChartsStore
     @State private var showConnect = false
+    @State private var confirmRecovery = false
 
     var body: some View {
         Panel(title: "Platform account reference", icon: "link", accent: wc.account.isConfigured ? BLTheme.green : BLTheme.gold) {
@@ -2079,7 +2151,7 @@ struct WealthChartsPanel: View {
                 Divider().background(BLTheme.stroke).padding(.vertical, 2)
                 Stat(label: "Username", value: wc.account.username)
                 if !wc.account.note.isEmpty { Stat(label: "Label", value: wc.account.note) }
-                Stat(label: "Password", value: wc.hasSecret ? "Saved in Keychain" : "Not saved")
+                Stat(label: "Password", value: wc.hasSecret ? "Saved privately on this Mac" : "Not saved")
                 if let when = wc.account.connectedAt {
                     Stat(label: "Saved", value: when.formatted(date: .abbreviated, time: .shortened))
                 }
@@ -2090,14 +2162,30 @@ struct WealthChartsPanel: View {
                            icon: wc.account.isConfigured ? "pencil" : "link") { showConnect = true }
                 if wc.account.isConfigured {
                     GhostButton(label: "Disconnect", icon: "xmark.circle", tint: BLTheme.red) { wc.disconnect() }
+                    GhostButton(label: "Recover prior Keychain password", icon: "key.fill") {
+                        confirmRecovery = true
+                    }
                 }
             }.padding(.top, 2)
 
-            Text("These details stay on this Mac (username and label saved locally, password saved in the macOS Keychain). This panel does not log in for you. The app opens your trading platform in the capture browser and reads the live data feeding your charts. No platform login or broker key is stored in the app.")
+            if !wc.recoveryMessage.isEmpty {
+                Text(wc.recoveryMessage)
+                    .font(.system(size: 11, weight: .semibold, design: .rounded))
+                    .foregroundColor(wc.hasSecret ? BLTheme.green : BLTheme.sub)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Text("These details stay on this Mac (username and label in local preferences; optional reference password in an owner-only private app file). This panel does not log in for you. Platform sign-in stays in the app-owned capture browser profile. Existing Keychain records are never read in the background or deleted.")
                 .font(.system(size: 11, design: .rounded)).foregroundColor(BLTheme.sub)
                 .fixedSize(horizontal: false, vertical: true).padding(.top, 2)
         }
         .sheet(isPresented: $showConnect) { ConnectWealthChartsSheet().environmentObject(wc).sheetCloseBar() }
+        .confirmationDialog("Recover a previous Keychain password?", isPresented: $confirmRecovery) {
+            Button("Recover now") { wc.recoverPreviousPassword() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This foreground action may show one macOS Keychain prompt. It copies a prior password into prompt-free private app storage and leaves the original Keychain item untouched.")
+        }
     }
 }
 
@@ -2117,7 +2205,7 @@ struct ConnectWealthChartsSheet: View {
                         .frame(width: 30, height: 30).background(BLTheme.goldGrad).clipShape(RoundedRectangle(cornerRadius: 9))
                 Text("Save platform account").font(.system(size: 18, weight: .heavy, design: .rounded)).foregroundColor(BLTheme.text)
                 }
-                Text("Saved on this Mac only. This panel stores your account label; it does not place trades or move money. The password is stored in the macOS Keychain. Orders remain manual on your platform.")
+                Text("Saved on this Mac only. This panel stores your account label; it does not place trades or move money. An optional reference password is stored in owner-only private app storage. Orders remain manual on your platform.")
                     .font(.system(size: 12, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
                     .fixedSize(horizontal: false, vertical: true)
 
@@ -2129,7 +2217,7 @@ struct ConnectWealthChartsSheet: View {
                         .padding(.vertical, 10).padding(.horizontal, 12)
                         .background(BLTheme.bg2).clipShape(RoundedRectangle(cornerRadius: 10))
                         .overlay(RoundedRectangle(cornerRadius: 10).stroke(BLTheme.stroke, lineWidth: 1))
-                    Text("Stored in the macOS Keychain on this device. Leave blank to keep any previously saved password.")
+                    Text("Stored in an atomic owner-only file on this device. Leave blank to keep any active saved password. Prior Keychain data is recoverable only from the explicit Settings action.")
                         .font(.system(size: 10.5, design: .rounded)).foregroundColor(BLTheme.sub)
                 }
                 Field(title: "Label (optional)", text: $note, prompt: "e.g. WealthCharts main / Topstep 50K eval")

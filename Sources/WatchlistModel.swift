@@ -60,14 +60,23 @@ final class WatchlistStore: ObservableObject {
         load()
     }
 
+    // True while the last save() reached disk (see StoreDisk invariants).
+    private(set) var lastSaveOK = true
+
     private func load() {
+        guard FileManager.default.fileExists(atPath: url.path) else { return }   // fresh install
         guard let data = try? Data(contentsOf: url),
-              let decoded = try? JSONDecoder().decode([Watchlist].self, from: data) else { return }
+              let decoded = try? JSONDecoder().decode([Watchlist].self, from: data) else {
+            StoreDisk.quarantine(url)   // corrupt watchlists — keep them recoverable, never save over them
+            return
+        }
         lists = decoded
         selectedID = decoded.first?.id
     }
     private func save() {
-        if let data = try? JSONEncoder().encode(lists) { try? data.write(to: url, options: .atomic) }
+        guard let data = try? JSONEncoder().encode(lists) else { lastSaveOK = false; return }
+        do { try data.write(to: url, options: .atomic); lastSaveOK = true }
+        catch { lastSaveOK = false }
     }
 
     var selected: Watchlist? { lists.first { $0.id == selectedID } }

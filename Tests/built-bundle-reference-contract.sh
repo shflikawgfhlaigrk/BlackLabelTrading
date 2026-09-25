@@ -23,7 +23,7 @@ cleanup() {
     BLTD_SUPPORT_DIR="$SUPPORT" \
     BLTD_PYTHON="$PY" \
     BLTD_PORT="${PORT:-8793}" \
-    BLTD_BUILD="27" \
+    BLTD_BUILD="28" \
       /bin/bash "$LAUNCH" --stop-owned >/dev/null 2>&1 || true
   fi
   [ -n "${OCCUPIER_PID:-}" ] && kill "$OCCUPIER_PID" 2>/dev/null || true
@@ -43,9 +43,9 @@ INFO="$APP/Contents/Info.plist"
 [ -x "$LAUNCH" ] || fail "missing executable bundled backend launcher at $LAUNCH"
 [ -x "$PY" ] || fail "missing executable bundled python wrapper at $PY"
 BUILD_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$INFO" 2>/dev/null || true)"
-[ "$BUILD_VERSION" = "27" ] || fail "built bundle is build '$BUILD_VERSION', expected b27"
+[ "$BUILD_VERSION" = "28" ] || fail "built bundle is build '$BUILD_VERSION', expected b28"
 bash "$ROOT/Tests/signals-only-release-contract.sh" "$APP" ||
-  fail "built bundle violates the b27 signals-only boundary"
+  fail "built bundle violates the signals-only boundary introduced in b27"
 codesign --verify --deep --strict "$APP" || fail "built bundle signature is invalid before launch"
 if find "$APP/Contents/Resources/backend" \( -type d -name __pycache__ -o -type f -name '*.pyc' \) | grep -q .; then
   fail "built bundle contains mutable Python caches before launch"

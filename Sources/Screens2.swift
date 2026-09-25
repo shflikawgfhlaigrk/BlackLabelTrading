@@ -139,6 +139,7 @@ struct WatchlistsScreen: View {
     @State private var newListName = ""
     @State private var showNewList = false
     @State private var editing: WatchSymbol?
+    @State private var deletingList: Watchlist? = nil   // pending list delete awaiting confirm
 
     private var list: Watchlist? { watch.selected }
 
@@ -193,25 +194,52 @@ struct WatchlistsScreen: View {
             Button("Cancel", role: .cancel) { newListName = "" }
             Button("Create") { watch.addList(newListName); newListName = "" }
         }
+        // Deleting a whole list drops every symbol in it — always confirmed, from both the
+        // visible trash affordance and the context-menu shortcut.
+        .confirmationDialog(
+            "Delete “\(deletingList?.name ?? "")”?",
+            isPresented: Binding(get: { deletingList != nil }, set: { if !$0 { deletingList = nil } })
+        ) {
+            Button("Delete list", role: .destructive) {
+                if let l = deletingList { watch.deleteList(l.id) }
+                deletingList = nil
+            }
+            Button("Cancel", role: .cancel) { deletingList = nil }
+        } message: {
+            Text("Removes “\(deletingList?.name ?? "")” and its \(deletingList?.symbols.count ?? 0) symbol(s) from this Mac.")
+        }
     }
 
     @ViewBuilder private func listChip(_ l: Watchlist) -> some View {
         let on = l.id == watch.selectedID
-        Button { watch.selectedID = l.id } label: {
-            HStack(spacing: 6) {
-                Image(systemName: "star.fill").font(.system(size: 10, weight: .bold))
-                Text(l.name).font(.system(size: 12.5, weight: .bold, design: .rounded))
-                Text("\(l.symbols.count)").font(.system(size: 10, weight: .heavy, design: .rounded))
-                    .padding(.horizontal, 5).padding(.vertical, 1)
-                    .background(on ? Color.black.opacity(0.2) : BLTheme.bg2).clipShape(Capsule())
+        HStack(spacing: 4) {
+            Button { watch.selectedID = l.id } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "star.fill").font(.system(size: 10, weight: .bold))
+                    Text(l.name).font(.system(size: 12.5, weight: .bold, design: .rounded))
+                    Text("\(l.symbols.count)").font(.system(size: 10, weight: .heavy, design: .rounded))
+                        .padding(.horizontal, 5).padding(.vertical, 1)
+                        .background(on ? Color.black.opacity(0.2) : BLTheme.bg2).clipShape(Capsule())
+                }
+                .foregroundColor(on ? Color(hex: 0x1A1305) : BLTheme.sub)
+                .padding(.vertical, 7).padding(.horizontal, 12)
+                .background(on ? AnyShapeStyle(BLTheme.goldGrad) : AnyShapeStyle(BLTheme.panel)).clipShape(Capsule())
+                .overlay(Capsule().stroke(on ? Color.clear : BLTheme.stroke, lineWidth: 1))
+            }.buttonStyle(.plain)
+            // Visible delete on the selected chip — list removal must never be discoverable
+            // only by right-click. The context menu below stays as a shortcut.
+            if on {
+                Button { deletingList = l } label: {
+                    Image(systemName: "trash").font(.system(size: 10, weight: .bold)).foregroundColor(BLTheme.red)
+                        .frame(width: 24, height: 24).background(BLTheme.panel).clipShape(Circle())
+                        .overlay(Circle().stroke(BLTheme.stroke, lineWidth: 1))
+                }
+                .buttonStyle(.plain)
+                .help("Delete this watchlist")
             }
-            .foregroundColor(on ? Color(hex: 0x1A1305) : BLTheme.sub)
-            .padding(.vertical, 7).padding(.horizontal, 12)
-            .background(on ? AnyShapeStyle(BLTheme.goldGrad) : AnyShapeStyle(BLTheme.panel)).clipShape(Capsule())
-            .overlay(Capsule().stroke(on ? Color.clear : BLTheme.stroke, lineWidth: 1))
-        }.buttonStyle(.plain)
+        }
         .contextMenu {
-            Button("Delete list", role: .destructive) { watch.deleteList(l.id) }
+            Button("Delete list", role: .destructive) { deletingList = l }
         }
     }
 
@@ -851,7 +879,14 @@ struct BacktestScreen: View {
             }
         }
         .task { await loadLabSymbols() }
-        .onChange(of: labSymbol) { _ in Task { await refreshLabBounds() } }
+        // A verdict is only valid for the exact engine/instrument/folds/range it ran on — any
+        // picker change clears the old report so a stale PASS can never read as the new setup's.
+        .onChange(of: labSymbol) { _ in labReport = nil; Task { await refreshLabBounds() } }
+        .onChange(of: labEngine) { _ in labReport = nil }
+        .onChange(of: labFolds) { _ in labReport = nil }
+        .onChange(of: labUseRange) { _ in labReport = nil }
+        .onChange(of: labStart) { _ in labReport = nil }
+        .onChange(of: labEnd) { _ in labReport = nil }
     }
 
     @ViewBuilder private func labResults(_ r: BacktestLabReport) -> some View {
@@ -878,7 +913,8 @@ struct BacktestScreen: View {
                 Text("PER FOLD").font(.system(size: 9.5, weight: .bold, design: .rounded)).foregroundColor(BLTheme.sub).tracking(0.6)
                 VStack(spacing: 8) { ForEach(r.folds) { labFoldRow($0, minTrades: r.minTrades, headline: false) } }
             }
-            Text("Reproducible: \(r.proverLine)" + (r.generatedUTC.isEmpty ? "" : " · ran \(r.generatedUTC)") + " · instrument \(r.symbol)")
+            Text("Reproducible: \(r.proverLine)" + (r.generatedUTC.isEmpty ? "" : " · ran \(r.generatedUTC)")
+                 + " · engine \(r.engine.isEmpty ? "—" : EngineRoster.label(for: r.engine)) · instrument \(r.symbol)")
                 .font(.system(size: 9, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub).fixedSize(horizontal: false, vertical: true)
         }
     }

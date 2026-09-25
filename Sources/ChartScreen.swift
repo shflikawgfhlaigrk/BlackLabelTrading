@@ -617,21 +617,35 @@ struct ChartScreen: View {
         let ds = drawings.drawings(for: effectiveSymbol)
         if !ds.isEmpty {
             Panel(title: "Drawings · \(effectiveSymbol)", icon: "pencil.and.ruler", accent: BLTheme.gold) {
-                ForEach(ds) { d in
-                    HStack(spacing: 10) {
-                        Image(systemName: d.kind.icon).font(.system(size: 11, weight: .bold)).foregroundColor(Color(hex: 0x1A1305))
-                            .frame(width: 24, height: 24).background(BLTheme.goldGrad).clipShape(RoundedRectangle(cornerRadius: 7))
-                        Text(d.kind.label).font(.system(size: 12.5, weight: .semibold, design: .rounded)).foregroundColor(BLTheme.text)
-                        Text("price \(TradeMath.num(d.y1))\(d.kind == .horizontal ? "" : " → \(TradeMath.num(d.y2))")")
-                            .font(.system(size: 11, design: .rounded)).foregroundColor(BLTheme.sub)
-                        Spacer()
-                        Button { drawings.remove(d, from: effectiveSymbol) } label: {
-                            Image(systemName: "trash").font(.system(size: 11)).foregroundColor(BLTheme.red)
-                        }.buttonStyle(.plain)
-                    }.padding(.vertical, 7).padding(.horizontal, 11).background(BLTheme.bg2).clipShape(RoundedRectangle(cornerRadius: 9))
+                // The chart column has no outer scroll, so a long drawings list must never grow the
+                // panel unbounded — that squeezes the chart canvas toward zero and clips the bottom
+                // rows (and their only trash buttons) past the window. Past a handful of rows the
+                // list scrolls inside a fixed-height region; the chart keeps its space and every
+                // row stays reachable.
+                if ds.count > 5 {
+                    ScrollView(.vertical, showsIndicators: true) {
+                        VStack(spacing: 6) { ForEach(ds) { drawingRow($0) } }
+                    }
+                    .frame(height: 230)
+                } else {
+                    ForEach(ds) { drawingRow($0) }
                 }
             }
         }
+    }
+
+    private func drawingRow(_ d: Drawing) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: d.kind.icon).font(.system(size: 11, weight: .bold)).foregroundColor(Color(hex: 0x1A1305))
+                .frame(width: 24, height: 24).background(BLTheme.goldGrad).clipShape(RoundedRectangle(cornerRadius: 7))
+            Text(d.kind.label).font(.system(size: 12.5, weight: .semibold, design: .rounded)).foregroundColor(BLTheme.text)
+            Text("price \(TradeMath.num(d.y1))\(d.kind == .horizontal ? "" : " → \(TradeMath.num(d.y2))")")
+                .font(.system(size: 11, design: .rounded)).foregroundColor(BLTheme.sub)
+            Spacer()
+            Button { drawings.remove(d, from: effectiveSymbol) } label: {
+                Image(systemName: "trash").font(.system(size: 11)).foregroundColor(BLTheme.red)
+            }.buttonStyle(.plain)
+        }.padding(.vertical, 7).padding(.horizontal, 11).background(BLTheme.bg2).clipShape(RoundedRectangle(cornerRadius: 9))
     }
 
     // MARK: Small controls

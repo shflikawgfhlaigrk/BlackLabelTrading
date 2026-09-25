@@ -258,9 +258,20 @@ final class StrategyStore: ObservableObject {
     func add(_ s: VisualStrategy) { strategies.insert(s, at: 0) }
     func update(_ s: VisualStrategy) { if let i = strategies.firstIndex(where: { $0.id == s.id }) { strategies[i] = s } }
     func delete(_ id: UUID) { strategies.removeAll { $0.id == id } }
+    // True while the last save() reached disk (see StoreDisk invariants).
+    private(set) var lastSaveOK = true
+
     private func load() {
-        guard let d = try? Data(contentsOf: url), let box = try? JSONDecoder().decode([VisualStrategy].self, from: d) else { return }
+        guard FileManager.default.fileExists(atPath: url.path) else { return }   // fresh install
+        guard let d = try? Data(contentsOf: url), let box = try? JSONDecoder().decode([VisualStrategy].self, from: d) else {
+            StoreDisk.quarantine(url)   // corrupt strategy store — keep it recoverable, never save over it
+            return
+        }
         strategies = box
     }
-    private func save() { if let d = try? JSONEncoder().encode(strategies) { try? d.write(to: url, options: .atomic) } }
+    private func save() {
+        guard let d = try? JSONEncoder().encode(strategies) else { lastSaveOK = false; return }
+        do { try d.write(to: url, options: .atomic); lastSaveOK = true }
+        catch { lastSaveOK = false }
+    }
 }

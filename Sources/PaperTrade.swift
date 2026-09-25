@@ -105,15 +105,24 @@ final class PaperBook: ObservableObject {
         }
     }
 
+    // True while the last save() reached disk (see StoreDisk invariants).
+    private(set) var lastSaveOK = true
+
     private func load() {
+        guard FileManager.default.fileExists(atPath: url.path) else { return }   // fresh install
         guard let d = try? Data(contentsOf: url),
-              let box = try? JSONDecoder().decode(Box.self, from: d) else { return }
+              let box = try? JSONDecoder().decode(Box.self, from: d) else {
+            StoreDisk.quarantine(url)   // corrupt paper ledger — keep it recoverable, never save over it
+            return
+        }
         positions = box.positions; startingBalance = box.startingBalance
     }
     private func save() {
-        if let d = try? JSONEncoder().encode(Box(positions: positions, startingBalance: startingBalance)) {
-            try? d.write(to: url, options: .atomic)
+        guard let d = try? JSONEncoder().encode(Box(positions: positions, startingBalance: startingBalance)) else {
+            lastSaveOK = false; return
         }
+        do { try d.write(to: url, options: .atomic); lastSaveOK = true }
+        catch { lastSaveOK = false }
     }
     private struct Box: Codable { var positions: [PaperPosition]; var startingBalance: Double }
 }

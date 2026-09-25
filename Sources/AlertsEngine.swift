@@ -113,13 +113,22 @@ final class AlertStore: ObservableObject {
         url = base.appendingPathComponent(filename)
         load()
     }
+    // True while the last save() reached disk (see StoreDisk invariants).
+    private(set) var lastSaveOK = true
+
     private func load() {
+        guard FileManager.default.fileExists(atPath: url.path) else { return }   // fresh install
         guard let data = try? Data(contentsOf: url),
-              let decoded = try? JSONDecoder().decode([TradeAlert].self, from: data) else { return }
+              let decoded = try? JSONDecoder().decode([TradeAlert].self, from: data) else {
+            StoreDisk.quarantine(url)   // corrupt alerts store — keep it recoverable, never save over it
+            return
+        }
         alerts = decoded
     }
     private func save() {
-        if let data = try? JSONEncoder().encode(alerts) { try? data.write(to: url, options: .atomic) }
+        guard let data = try? JSONEncoder().encode(alerts) else { lastSaveOK = false; return }
+        do { try data.write(to: url, options: .atomic); lastSaveOK = true }
+        catch { lastSaveOK = false }
     }
 
     func add(_ a: TradeAlert) { alerts.insert(a, at: 0) }

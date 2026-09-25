@@ -269,6 +269,27 @@ func testWatchlistStore() {
     eqi(store.lists[0].symbols.count, 1, "symbol removed")
 }
 
+// ===== Store disk safety: a corrupt store is quarantined, never silently overwritten =====
+func testCorruptStoreQuarantinedNotOverwritten() {
+    let dir = tmpBase.appendingPathComponent("corrupt-\(UUID().uuidString)", isDirectory: true)
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    let file = dir.appendingPathComponent("wl.json")
+    let junk = "{not json"
+    try? junk.write(to: file, atomically: true, encoding: .utf8)
+
+    let store = WatchlistStore(filename: "wl.json", baseDir: dir)
+    ok(store.lists.isEmpty, "corrupt store loads empty (no fabricated data)")
+    ok(!FileManager.default.fileExists(atPath: file.path),
+       "corrupt file moved aside so a later save can't overwrite it")
+    let baks = (try? FileManager.default.contentsOfDirectory(atPath: dir.path))?.filter { $0.contains(".bak") } ?? []
+    eqi(baks.count, 1, "exactly one .bak sidecar preserved")
+    // The recoverable copy survives a subsequent save, and the save reports its outcome.
+    store.addList("Futures")
+    let preserved = baks.first.flatMap { try? String(contentsOf: dir.appendingPathComponent($0), encoding: .utf8) } ?? ""
+    ok(preserved == junk, "original bytes intact in the .bak after a new save")
+    ok(store.lastSaveOK, "good save reports lastSaveOK true")
+}
+
 // ===== Alerts engine =====
 func testAlertLevelAndCross() {
     // level: last is above 100
@@ -675,6 +696,29 @@ func testLiveFactorHonestAbsenceAndDirection() {
     // Every present factor value is finite and in [-1,1] (no NaN/inf/out-of-range fabrication).
     for (k, v) in up.factors { ok(v.isFinite && v >= -1.0001 && v <= 1.0001, "factor \(k) in [-1,1] & finite") }
     _ = (kl, st)   // keyLevels/structure are pivot-gated; covered by honest-absence on thin data above
+}
+
+func testLiveFactorStaleness() {
+    // LOCK the recency gate: bars whose newest timestamp is outside the staleness window carry
+    // isStale=true and isLive=false, so no surface may present a stored close as a live price.
+    func bars(endingAt end: Date, _ n: Int) -> [Bar] {
+        (0..<n).map { i in
+            let c = 5000 + Double(i) * 0.5
+            return Bar(date: end.addingTimeInterval(-Double(n - 1 - i) * 15),
+                       open: c, high: c + 0.5, low: c - 0.5, close: c)
+        }
+    }
+    let now = Date()
+    let fresh = LiveFactorEngine.compute(bars: bars(endingAt: now, 60), nqBars: [], fires: [], now: now)
+    ok(fresh.hasData && !fresh.isStale && fresh.isLive, "fresh bars -> live")
+    let stale = LiveFactorEngine.compute(bars: bars(endingAt: now.addingTimeInterval(-3600), 60),
+                                         nqBars: [], fires: [], now: now)
+    ok(stale.hasData, "hour-old bars still count as data")
+    ok(stale.isStale && !stale.isLive, "hour-old bars -> stale, never live")
+    ok(stale.asOf != nil, "asOf carries the last bar timestamp for display")
+    let edge = LiveFactorEngine.compute(bars: bars(endingAt: now.addingTimeInterval(-LiveFactorEngine.staleAfter + 1), 60),
+                                        nqBars: [], fires: [], now: now)
+    ok(!edge.isStale, "inside the staleness window -> still live")
 }
 
 func testOrderTicketSignalsOnly() {
@@ -1196,6 +1240,7 @@ testCSVParse()
 testScreenerFilters()
 testScreenerPresets()
 testWatchlistStore()
+testCorruptStoreQuarantinedNotOverwritten()
 testAlertLevelAndCross()
 testAlertMultiCondition()
 testAlertStoreOneShotAndRepeat()
@@ -1232,6 +1277,7 @@ testCorrelationMatrixGatesFewSharedDays()
 testSignalFactorRosterAndWeights()
 testTrailTiersGeometry()
 testLiveFactorHonestAbsenceAndDirection()
+testLiveFactorStaleness()
 testOrderTicketSignalsOnly()
 testSessionDailyLogCSV()
 testChartScalePriceAtYInvertsYPixel()
@@ -2820,31 +2866,31 @@ func testWindowLaunchOrderingContract() {
 }
 
 func testBuildNumberContract() {
-    let expectedBuild = "<key>CFBundleVersion</key><string>27</string>"
+    let expectedBuild = "<key>CFBundleVersion</key><string>28</string>"
     for file in ["build.command", "build-signed.command"] {
         guard let src = try? String(contentsOfFile: file, encoding: .utf8) else {
             ok(false, "[source] \(file) readable for build-number contract"); continue
         }
-        ok(src.contains(expectedBuild), "[source] \(file) stamps Trading build 27")
+        ok(src.contains(expectedBuild), "[source] \(file) stamps Trading build 28")
         ok(src.contains("universal2") && src.contains("build_trd_arch arm64") &&
            src.contains("build_trd_arch x86_64") && src.contains("lipo -create"),
            "[source] \(file) builds a universal2 Trading binary")
     }
     if let src = try? String(contentsOfFile: "build-developer-id.sh", encoding: .utf8) {
-        ok(src.contains("BUILD_NUMBER=\"${BUILD_NUMBER:-27}\""), "[source] Developer-ID build defaults to Trading build 27")
+        ok(src.contains("BUILD_NUMBER=\"${BUILD_NUMBER:-28}\""), "[source] Developer-ID build defaults to Trading build 28")
     } else {
         ok(false, "[source] build-developer-id.sh readable for build-number contract")
     }
     if let plist = try? String(contentsOfFile: "Sources/Info.plist", encoding: .utf8) {
-        ok(plist.contains("<key>CFBundleVersion</key>\n\t<string>27</string>"),
-           "[source] Sources/Info.plist CFBundleVersion is 27")
+        ok(plist.contains("<key>CFBundleVersion</key>\n\t<string>28</string>"),
+           "[source] Sources/Info.plist CFBundleVersion is 28")
     } else {
         ok(false, "[source] Sources/Info.plist readable for build-number contract")
     }
     if let project = try? String(contentsOfFile: "project.yml", encoding: .utf8) {
-        ok(project.contains("CURRENT_PROJECT_VERSION: \"27\""),
-           "[source] project.yml CURRENT_PROJECT_VERSION is 27")
-        ok(project.contains("CFBundleVersion: \"27\""), "[source] project.yml CFBundleVersion is 27")
+        ok(project.contains("CURRENT_PROJECT_VERSION: \"28\""),
+           "[source] project.yml CURRENT_PROJECT_VERSION is 28")
+        ok(project.contains("CFBundleVersion: \"28\""), "[source] project.yml CFBundleVersion is 28")
     } else {
         ok(false, "[source] project.yml readable for build-number contract")
     }

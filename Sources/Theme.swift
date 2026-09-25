@@ -45,11 +45,18 @@ struct Field: View {
     let title: String
     @Binding var text: String
     var prompt = ""
+    var secure = false   // secrets render masked (SecureField) — never cleartext on screen
     @FocusState private var focused: Bool
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
             Text(title.uppercased()).font(.system(size: 10, weight: .bold, design: .rounded)).foregroundColor(BLTheme.sub).tracking(0.6)
-            TextField(prompt.isEmpty ? title : prompt, text: $text)
+            Group {
+                if secure {
+                    SecureField(prompt.isEmpty ? title : prompt, text: $text)
+                } else {
+                    TextField(prompt.isEmpty ? title : prompt, text: $text)
+                }
+            }
                 .textFieldStyle(.plain).font(.system(size: 14, weight: .medium, design: .rounded)).foregroundColor(BLTheme.text)
                 .focused($focused)
                 .padding(.vertical, 10).padding(.horizontal, 12)

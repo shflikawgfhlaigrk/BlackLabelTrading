@@ -172,11 +172,19 @@ struct LiveFactorSnapshot {
     // is not ES-family (TR-05 (c)): the UI labels these "ES-only module" instead of a generic "no live
     // data", so the buyer sees an honest reason — not silent wrong math on NQ/CL/SPY.
     var esOnlyAbsent: Set<String> = []
+    // The newest bar is older than the staleness window: the data is real but NOT current, so
+    // no surface may present it as live (§5.1). Set by compute() against the caller's `now`.
+    var isStale: Bool = false
     var hasData: Bool { bars >= LiveFactorEngine.minBars && price != nil && !available.isEmpty }
+    // The only condition that may render a "Live" pill or a current trade plan.
+    var isLive: Bool { hasData && !isStale }
 }
 
 enum LiveFactorEngine {
     static let minBars = 50
+    // Base bars print every 15s while the capture flows; a newest bar older than this window
+    // (8 intervals) means the feed stopped, and stored bars must render as stale, never live.
+    static let staleAfter: TimeInterval = 120
 
     // The ES-tuned modules: their math is calibrated to the S&P e-mini and would FABRICATE on another
     // instrument, so they run ONLY on ES-family and are labeled "ES-only module" everywhere else.
@@ -199,6 +207,7 @@ enum LiveFactorEngine {
         let closes = bars.map(\.close)
         s.price = last.close
         s.asOf = last.date
+        s.isStale = now.timeIntervalSince(last.date) > staleAfter
         let atr = Indicators.atr(bars, 14).compactMap { $0 }.last
             ?? max(0.01, bars.suffix(14).map { $0.high - $0.low }.reduce(0, +) / 14)
         let A = max(0.01, atr)

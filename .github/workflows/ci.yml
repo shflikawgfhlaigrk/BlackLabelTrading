@@ -15,7 +15,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  BUILD_NUMBER: "27"
+  BUILD_NUMBER: "28"
   DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
   PYTHONDONTWRITEBYTECODE: "1"
   PYTEST_ADDOPTS: -p no:cacheprovider
@@ -45,7 +45,7 @@ jobs:
         run: bash Tests/run-all.sh
 
   build-ci-artifact:
-    name: Build b27 unsigned CI artifact
+    name: Build b28 unsigned CI artifact
     needs: test
     runs-on: macos-15
     timeout-minutes: 50
@@ -75,7 +75,7 @@ jobs:
         shell: bash
         run: bash Tests/run-all.sh
 
-      - name: Verify the b27 CI artifact is ad-hoc and non-distributable
+      - name: Verify the b28 CI artifact is ad-hoc and non-distributable
         shell: bash
         run: |
           set -euo pipefail
@@ -121,16 +121,16 @@ jobs:
           out="$RUNNER_TEMP/trading-ci-artifact"
           mkdir -p "$out"
           cp "$GITHUB_WORKSPACE/build/Black-Label-Trading-DeveloperID.zip" \
-            "$out/Black-Label-Trading-b27-CI-UNSIGNED-ADHOC-NOT-FOR-DISTRIBUTION.zip"
+            "$out/Black-Label-Trading-b28-CI-UNSIGNED-ADHOC-NOT-FOR-DISTRIBUTION.zip"
           sha256="$(
-            shasum -a 256 "$out/Black-Label-Trading-b27-CI-UNSIGNED-ADHOC-NOT-FOR-DISTRIBUTION.zip" \
+            shasum -a 256 "$out/Black-Label-Trading-b28-CI-UNSIGNED-ADHOC-NOT-FOR-DISTRIBUTION.zip" \
               | awk '{print $1}'
           )"
           printf '%s  %s\n' "$sha256" \
-            "Black-Label-Trading-b27-CI-UNSIGNED-ADHOC-NOT-FOR-DISTRIBUTION.zip" \
+            "Black-Label-Trading-b28-CI-UNSIGNED-ADHOC-NOT-FOR-DISTRIBUTION.zip" \
             > "$out/SHA256SUMS"
           {
-            printf 'build=27\n'
+            printf 'build=28\n'
             printf 'commit=%s\n' "$GITHUB_SHA"
             printf 'signature=ad-hoc\n'
             printf 'distribution_allowed=false\n'
@@ -140,7 +140,7 @@ jobs:
       - name: Upload the CI-only artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: Black-Label-Trading-b27-CI-UNSIGNED-${{ github.sha }}
+          name: Black-Label-Trading-b28-CI-UNSIGNED-${{ github.sha }}
           path: ${{ runner.temp }}/trading-ci-artifact/
           if-no-files-found: error
           retention-days: 7

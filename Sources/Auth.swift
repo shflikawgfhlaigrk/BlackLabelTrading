@@ -93,13 +93,15 @@ struct AuthView: View {
 
                 VStack(spacing: 12) {
                     Field(title: "Email", text: $email, prompt: "you@trader.com")
-                    Field(title: "Password", text: $pw, prompt: "••••••••")
+                    Field(title: "Password", text: $pw, prompt: "••••••••", secure: true)
                     GoldButton(label: creating ? "Create account" : "Sign in", fill: true, icon: "arrow.right") { submit() }
                     if !err.isEmpty { Text(err).font(.system(size: 12, weight: .medium, design: .rounded)).foregroundColor(BLTheme.red).multilineTextAlignment(.center) }
-                    Button("Continue without an account") { session.email = "guest"; enter() }
+                    Button("Continue without an account") { enter(email: "guest", kind: .guest) }
                         .buttonStyle(.plain).font(.system(size: 12, weight: .semibold, design: .rounded)).foregroundColor(BLTheme.sub)
                 }
                 .frame(width: 330)
+                // Return anywhere in the email/password form submits — the universal login gesture.
+                .onSubmit { submit() }
             }
             .padding(38).frame(width: 410)
             // The holographic login panel — iridescent border + glow + pointer 3D tilt.
@@ -176,9 +178,16 @@ struct AuthView: View {
     private var appleAvailable: Bool { AppleSignInSupport.available }
     private func submit() {
         let r = creating ? AccountStore.create(email, pw) : AccountStore.signIn(email, pw)
-        switch r { case .success: session.email = email; enter(); case .failure(let e): withAnimation { err = e.rawValue } }
+        switch r {
+        case .success: enter(email: email, kind: .local)
+        case .failure(let e): withAnimation { err = e.rawValue }
+        }
     }
-    private func enter() { withAnimation(.spring(response: 0.4, dampingFraction: 0.85)) { session.signedIn = true } }
+    private func enter(email: String, kind: AppSessionKind) {
+        withAnimation(.spring(response: 0.4, dampingFraction: 0.85)) {
+            session.begin(email: email, kind: kind)
+        }
+    }
 
     // MARK: Sign in with Apple
     private func handleApple(_ result: Result<ASAuthorization, Error>) {
@@ -186,8 +195,7 @@ struct AuthView: View {
         case .success(let auth):
             if let cred = auth.credential as? ASAuthorizationAppleIDCredential {
                 // Email is only returned on first authorization, or hidden via "Hide My Email".
-                session.email = cred.email ?? "apple-user"
-                enter()
+                enter(email: cred.email ?? "apple-user", kind: .apple)
             } else {
                 withAnimation { err = "Apple sign-in returned an unexpected credential." }
             }
@@ -202,7 +210,7 @@ struct AuthView: View {
         err = ""; note = ""
         google.start { outcome in
             switch outcome {
-            case .success(let mail): session.email = mail; enter()
+            case .success(let mail): enter(email: mail, kind: .google)
             case .needsClientID:
                 // Not an error — guide the user to the prominent Settings field. Never a dead tap.
                 withAnimation { note = "To use Google: open Settings → Sign-in and paste a Google Desktop OAuth client ID. Email, Apple (signed build), or guest work now." }

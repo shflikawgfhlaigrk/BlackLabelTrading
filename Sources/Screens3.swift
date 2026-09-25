@@ -197,7 +197,13 @@ struct StrategyBuilderScreen: View {
                         GoldButton(label: "Run backtest", fill: true, icon: "play.fill") {
                             result = VisualStrategyEngine.run(bars, strat)
                         }.disabled(bars.isEmpty || strat.entry.isEmpty).opacity(bars.isEmpty || strat.entry.isEmpty ? 0.5 : 1)
-                        GhostButton(label: "Save strategy", icon: "tray.and.arrow.down") { store.add(strat); exportNote = "Saved “\(strat.name)”." }
+                        GhostButton(label: "Save strategy", icon: "tray.and.arrow.down") {
+                            store.add(strat)
+                            // Confirmation reflects the real write outcome — never an asserted success.
+                            exportNote = store.lastSaveOK
+                                ? "Saved “\(strat.name)”."
+                                : "Couldn't save “\(strat.name)” — writing to disk failed (check free space and permissions)."
+                        }
                     }
                 }
 
