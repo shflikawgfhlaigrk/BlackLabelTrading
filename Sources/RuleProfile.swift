@@ -37,6 +37,7 @@ enum RuleProfileGate {
         case emptyProfile   // a profile is selected but has no caps entered yet
         case noProfile      // no profile selected
         case noSignal       // no computable signal (flat / no stop distance / unknown $/pt)
+        case invalidProfile // a saved numeric value is non-finite or negative
     }
 
     struct Decision: Equatable {
@@ -54,6 +55,7 @@ enum RuleProfileGate {
             case .noProfile:   return "No prop-firm profile selected"
             case .emptyProfile: return "Profile has no limits set — add your firm's caps"
             case .noSignal:    return "No sized signal to check"
+            case .invalidProfile: return "Edit profile: limits must be finite, non-negative numbers"
             case .withinLimits:
                 if maxContracts > 0 {
                     return "Within limits at \(evaluatedContracts) — max \(maxContracts) contract\(maxContracts == 1 ? "" : "s")"
@@ -74,16 +76,25 @@ enum RuleProfileGate {
         guard let p = profile else {
             return Decision(verdict: .noProfile, reasons: [], maxContracts: 0, dollarRiskAtSize: 0, evaluatedContracts: contracts)
         }
+        let numbers = [p.dailyLossLimit, p.trailingDrawdown, p.maxPositionSize, p.contractScaling, p.pointValue]
+        guard numbers.allSatisfy({ $0.isFinite && $0 >= 0 }) else {
+            return Decision(verdict: .invalidProfile, reasons: ["Invalid numeric profile value"],
+                            maxContracts: 0, dollarRiskAtSize: 0, evaluatedContracts: contracts)
+        }
         if !p.hasLimits {
             return Decision(verdict: .emptyProfile, reasons: [], maxContracts: 0, dollarRiskAtSize: 0, evaluatedContracts: contracts)
         }
         // Prefer the profile's own $/pt (buyer's instrument); fall back to the signal's when unset.
         let ppt = p.pointValue > 0 ? p.pointValue : pointValue
-        guard riskPoints > 0, ppt > 0, contracts > 0 else {
+        guard riskPoints.isFinite, ppt.isFinite, riskPoints > 0, ppt > 0, contracts > 0 else {
             return Decision(verdict: .noSignal, reasons: [], maxContracts: 0, dollarRiskAtSize: 0, evaluatedContracts: contracts)
         }
         let perContract = riskPoints * ppt
         let dollarAtSize = perContract * Double(contracts)
+        guard perContract.isFinite, perContract > 0, dollarAtSize.isFinite else {
+            return Decision(verdict: .noSignal, reasons: ["Signal risk is outside the supported range"],
+                            maxContracts: 0, dollarRiskAtSize: 0, evaluatedContracts: contracts)
+        }
         var reasons: [String] = []
 
         // Position-count caps.
@@ -105,23 +116,31 @@ enum RuleProfileGate {
         var cap = Int.max
         if p.maxPositionSize > 0 { cap = min(cap, intCap(p.maxPositionSize)) }
         if p.contractScaling > 0 { cap = min(cap, intCap(p.contractScaling)) }
-        if p.dailyLossLimit > 0 { cap = min(cap, Int((p.dailyLossLimit / perContract).rounded(.down))) }
-        if p.trailingDrawdown > 0 { cap = min(cap, Int((p.trailingDrawdown / perContract).rounded(.down))) }
-        let maxContracts = cap == Int.max ? 0 : max(0, cap)
+        if p.dailyLossLimit > 0 { cap = min(cap, intCap(p.dailyLossLimit / perContract)) }
+        if p.trailingDrawdown > 0 { cap = min(cap, intCap(p.trailingDrawdown / perContract)) }
+        let maxContracts = max(0, cap)
 
         return Decision(verdict: reasons.isEmpty ? .withinLimits : .breach,
                         reasons: reasons, maxContracts: maxContracts,
                         dollarRiskAtSize: dollarAtSize, evaluatedContracts: contracts)
     }
 
-    private static func intCap(_ v: Double) -> Int { max(0, Int(v.rounded(.down))) }
+    private static func intCap(_ v: Double) -> Int {
+        if v.isNaN || v <= 0 { return 0 }
+        // Double(Int.max) rounds UP to 2^63, which itself traps when converted.
+        if v >= Double(Int.max) { return Int.max }
+        return Int(v.rounded(.down))
+    }
 
     // Whole-dollar formatting with thousands grouping (headless-safe NumberFormatter).
     private static let fmt: NumberFormatter = {
         let f = NumberFormatter(); f.numberStyle = .decimal; f.maximumFractionDigits = 0; f.minimumFractionDigits = 0
         return f
     }()
-    static func money(_ v: Double) -> String { "$" + (fmt.string(from: NSNumber(value: v.rounded())) ?? String(Int(v.rounded()))) }
+    static func money(_ v: Double) -> String {
+        guard v.isFinite else { return "Unavailable" }
+        return "$" + (fmt.string(from: NSNumber(value: v.rounded())) ?? String(format: "%.0f", v))
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -322,7 +341,10 @@ struct DisciplineCockpit: Equatable {
         let n = s.count
         return n % 2 == 1 ? s[n/2] : (s[n/2 - 1] + s[n/2]) / 2
     }
-    private static func trim(_ v: Double) -> String { v == v.rounded() ? String(Int(v)) : String(format: "%.1f", v) }
+    private static func trim(_ v: Double) -> String {
+        guard v.isFinite else { return "unavailable" }
+        return String(format: v == v.rounded() ? "%.0f" : "%.1f", v)
+    }
     private static func x(_ v: Double) -> String { String(format: "%.1f×", v) }
     private static func money(_ v: Double) -> String { RuleProfileGate.money(v) }
 }

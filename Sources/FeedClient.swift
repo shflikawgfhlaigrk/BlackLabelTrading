@@ -128,15 +128,10 @@ final class FeedClient: ObservableObject {
 
     /// Persist the buyer's alert settings (through /api/config; alert keys only).
     @discardableResult
-    func saveAlertConfig(enabled: Bool, endpoint: String, provider: String,
+    func saveAlertConfig(enabled: Bool, endpoint: String?, provider: String,
                          pushoverToken: String, pushoverUser: String) async -> Bool {
-        let patch: [String: Any] = [
-            "alertEnabled": enabled,
-            "alertEndpoint": endpoint.trimmingCharacters(in: .whitespacesAndNewlines),
-            "alertProvider": provider,
-            "alertPushoverToken": pushoverToken.trimmingCharacters(in: .whitespacesAndNewlines),
-            "alertPushoverUser": pushoverUser.trimmingCharacters(in: .whitespacesAndNewlines),
-        ]
+        let patch = AlertConfigPatch.make(enabled: enabled, provider: provider, endpoint: endpoint,
+                                          pushoverToken: pushoverToken, pushoverUser: pushoverUser)
         return await postJSON("/api/config", patch) != nil
     }
 

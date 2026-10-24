@@ -164,6 +164,44 @@ def test_status_is_token_free():
     assert st["pushoverConfigured"] is True
 
 
+def test_ntfy_real_http_post_encodes_headers_and_utf8_body():
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from threading import Thread
+    received = []
+
+    class Receiver(BaseHTTPRequestHandler):
+        def do_POST(self):
+            received.append((self.headers["Title"], self.rfile.read(int(self.headers["Content-Length"])).decode("utf-8")))
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *_args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Receiver)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        ac = A.alert_config(dict(ON_CFG, alertEndpoint=f"http://127.0.0.1:{server.server_port}/topic"))
+        for payload in [A._sample_payload(), A.canonical_payload(NO_EDGE_REPORT)]:
+            result = A._send_payload(payload, ac)
+            assert result["sent"] is True, result
+        assert len(received) == 2
+        assert all(title.isascii() for title, _ in received)
+        assert "—" in received[0][1]  # body retains Unicode
+        assert "No edge on your bars today" in received[1][1]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_redacted_endpoint_retains_port_without_credentials():
+    assert A._redact("http://me:secret@localhost:2586/topic?auth=secret#secret") == "http://localhost:2586/topic"
+    assert A._redact("http://[::1]:2586/topic?auth=secret") == "http://[::1]:2586/topic"
+    assert A._redact("not-a-url?auth=secret") == ""
+
+
 if __name__ == "__main__":
     import sys
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

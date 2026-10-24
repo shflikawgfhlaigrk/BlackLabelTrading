@@ -197,7 +197,10 @@ def render_wire(payload: dict, ac: dict) -> tuple[str, bytes, dict]:
     if provider == "ntfy":
         # ntfy takes the message as the raw body; Title/Tags via headers.
         return ("text/plain; charset=utf-8", text.encode("utf-8"),
-                {"Title": payload["title"], "Tags": "chart_with_upwards_trend"})
+                # urllib emits Latin-1 HTTP headers. Keep the UTF-8 title in the body;
+                # ntfy's header receives an ASCII display title, never raw Unicode.
+                {"Title": payload["title"].replace("—", "-").encode("ascii", "replace").decode("ascii"),
+                 "Tags": "chart_with_upwards_trend"})
     # generic webhook — send both the plaintext and the structured verdict so Slack/Discord/Shortcuts
     # and custom receivers all have something usable. "text"/"content" are the common message keys.
     obj = dict(payload)
@@ -254,9 +257,13 @@ def _redact(url: str) -> str:
     """Endpoint for display — strip any query/token so a UI/log never shows a secret."""
     try:
         u = urllib.parse.urlparse(url)
-        return f"{u.scheme}://{u.hostname}{u.path}" if u.hostname else url
+        if not u.hostname:
+            return ""
+        host = f"[{u.hostname}]" if ":" in u.hostname else u.hostname
+        port = f":{u.port}" if u.port is not None else ""
+        return f"{u.scheme}://{host}{port}{u.path}"
     except ValueError:
-        return url
+        return ""
 
 
 # ── public entrypoints (used by the API server) ───────────────────────────────────────────────────

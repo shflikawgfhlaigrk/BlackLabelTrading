@@ -755,9 +755,9 @@ struct SignalsScreen: View {
                     Spacer()
                     GhostButton(label: "Set up profiles", icon: "building.columns.fill") { nav.section = .firms }
                 }
-            } else if d.verdict == .emptyProfile {
+            } else if d.verdict == .emptyProfile || d.verdict == .invalidProfile {
                 HStack {
-                    Text("“\(profile!.name)” has no limits set yet. Enter your firm's daily-loss / trailing-drawdown / position caps to gate this signal.")
+                    Text(d.verdict == .invalidProfile ? d.annotation : "“\(profile!.name)” has no limits set yet. Enter your firm's daily-loss / trailing-drawdown / position caps to gate this signal.")
                         .font(.system(size: 11.5, weight: .medium, design: .rounded)).foregroundColor(BLTheme.sub)
                         .fixedSize(horizontal: false, vertical: true)
                     Spacer()
@@ -1945,6 +1945,7 @@ struct EdgeGateAlertsPanel: View {
     @State private var enabled = false
     @State private var provider = "ntfy"
     @State private var endpoint = ""
+    @State private var displayedEndpoint = ""
     @State private var pushToken = ""
     @State private var pushUser = ""
     @State private var saved = false
@@ -1971,15 +1972,23 @@ struct EdgeGateAlertsPanel: View {
             if provider == "pushover" {
                 Field(title: "Pushover app token", text: $pushToken, prompt: "your own app token")
                 Field(title: "Pushover user key", text: $pushUser, prompt: "your own user key")
+                Text("Leave credentials blank to keep your saved values.")
+                    .font(.system(size: 11, design: .rounded)).foregroundColor(BLTheme.sub)
             }
             HStack(spacing: 8) {
                 GoldButton(label: "Save", icon: "checkmark") {
                     busy = true
                     Task {
-                        let ok = await feed.saveAlertConfig(enabled: enabled, endpoint: endpoint,
+                        let ok = await feed.saveAlertConfig(enabled: enabled,
+                                                            endpoint: endpoint == displayedEndpoint ? nil : endpoint,
                                                             provider: provider, pushoverToken: pushToken,
                                                             pushoverUser: pushUser)
                         status = await feed.alertStatus()
+                        if ok {
+                            endpoint = status.endpoint
+                            displayedEndpoint = status.endpoint
+                            pushToken = ""; pushUser = ""
+                        }
                         busy = false
                         withAnimation { saved = ok }
                         DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { withAnimation { saved = false } }
@@ -2014,6 +2023,7 @@ struct EdgeGateAlertsPanel: View {
                 enabled = status.enabled
                 provider = status.provider.isEmpty ? "ntfy" : status.provider
                 endpoint = status.endpoint
+                displayedEndpoint = status.endpoint
             }
         }
     }
