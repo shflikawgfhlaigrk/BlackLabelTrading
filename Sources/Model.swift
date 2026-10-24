@@ -230,8 +230,16 @@ enum FirmData {
 final class AppModel: ObservableObject {
     @Published var trades: [Trade] = [] { didSet { save() } }
     @Published var signals: [SignalLog] = [] { didSet { save() } }
+    // Buyer's own prop-firm rule profiles + the one currently gating displayed signals.
+    @Published var profiles: [RuleProfile] = [] { didSet { save() } }
+    @Published var activeProfileID: UUID? = nil { didSet { save() } }
 
-    private struct Box: Codable { var trades: [Trade]; var signals: [SignalLog]? }
+    private struct Box: Codable {
+        var trades: [Trade]
+        var signals: [SignalLog]?
+        var profiles: [RuleProfile]?
+        var activeProfileID: UUID?
+    }
     private let url: URL
 
     init() {
@@ -247,11 +255,25 @@ final class AppModel: ObservableObject {
               let box = try? JSONDecoder().decode(Box.self, from: data) else { return }
         trades = box.trades
         signals = box.signals ?? []
+        profiles = box.profiles ?? []
+        activeProfileID = box.activeProfileID
     }
     private func save() {
-        let box = Box(trades: trades, signals: signals)
+        let box = Box(trades: trades, signals: signals, profiles: profiles, activeProfileID: activeProfileID)
         if let data = try? JSONEncoder().encode(box) { try? data.write(to: url, options: .atomic) }
     }
+
+    // Prop-firm rule profiles CRUD. `activeProfile` is the one gating displayed signals.
+    var activeProfile: RuleProfile? { profiles.first { $0.id == activeProfileID } }
+    func upsertProfile(_ p: RuleProfile) {
+        if let i = profiles.firstIndex(where: { $0.id == p.id }) { profiles[i] = p } else { profiles.append(p) }
+        if activeProfileID == nil { activeProfileID = p.id }
+    }
+    func deleteProfile(_ p: RuleProfile) {
+        profiles.removeAll { $0.id == p.id }
+        if activeProfileID == p.id { activeProfileID = profiles.first?.id }
+    }
+    func setActiveProfile(_ p: RuleProfile?) { activeProfileID = p?.id }
 
     // Trades CRUD
     func upsert(_ t: Trade) {

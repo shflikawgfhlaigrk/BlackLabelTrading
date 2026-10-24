@@ -186,9 +186,10 @@ enum HoloThemeStore {
         if let data = try? JSONEncoder().encode(t) { defaults.set(data, forKey: themeKey) }
     }
 
-    /// The in-app Motion toggle (independent of system Reduce Motion, which hard-overrides). Default on.
+    /// The in-app Motion toggle (independent of system Reduce Motion, which hard-overrides).
+    /// Default OFF for new profiles (founder directive 2026-07-08) — the buyer opts in via Theme Studio.
     static var motionEnabled: Bool {
-        get { defaults.object(forKey: motionKey) == nil ? true : defaults.bool(forKey: motionKey) }
+        get { defaults.object(forKey: motionKey) == nil ? false : defaults.bool(forKey: motionKey) }
         set { defaults.set(newValue, forKey: motionKey) }
     }
 

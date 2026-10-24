@@ -3,13 +3,15 @@
 # Compiles Sources/*.swift with swiftc into a signed .app bundle.
 #
 #   ./build.command            -> builds into ./build/Black Label Trading.app
-#   ./build.command --install  -> also installs into /Applications and adhoc re-signs it
+#   ./build.command --devid --install  -> Developer-ID build + guarded production install
 #
 # Signals-only product. Ships NO data. Entitlements applied at sign time.
 set -euo pipefail
 
 cd "$(dirname "$0")"
 ROOT="$(pwd)"
+# shellcheck source=scripts/production-install-guard.sh
+source "$ROOT/scripts/production-install-guard.sh"
 SRC="$ROOT/Sources"
 BUILD="$ROOT/build"
 APPNAME="Black Label Trading"
@@ -18,14 +20,24 @@ BIN_NAME="Black Label Trading"
 BUNDLE_ID="com.blacklabel.trading"
 
 # --- mode flags --------------------------------------------------------------
-# --devid   : sign Developer-ID + hardened runtime + NON-sandbox entitlements (app-devid.entitlements,
-#             an empty dict) — notarization-ready, and the ONLY build the in-app updater can
+# --devid   : sign Developer-ID + hardened runtime + NON-sandbox entitlements (app-developerid.entitlements
+#             — network.client + disable-library-validation) — notarization-ready, and the ONLY build the in-app updater can
 #             self-replace (the sandbox forbids self-replace). The adhoc default path is unchanged.
 # --install : after building, install the fresh bundle into /Applications (atomic swap).
 DEVID=0; INSTALL=0
 for a in "$@"; do case "$a" in --devid) DEVID=1;; --install) INSTALL=1;; esac; done
+if [[ "$INSTALL" == "1" && "$DEVID" != "1" ]]; then
+  echo "ABORT: --install requires --devid; ad-hoc builds remain in ./build." >&2
+  exit 64
+fi
 
-DEVID_ENTITLEMENTS="$SRC/app-devid.entitlements"
+# DEVID and ADHOC both sign with the HARDENED, non-sandbox Developer-ID entitlements
+# (network.client + disable-library-validation). The bundled Python backend loads unsigned
+# .so extensions, so library validation MUST be disabled on BOTH paths or the backend fails
+# to start. The near-namesake app-devid.entitlements is an EMPTY <dict> and must NOT be used
+# here — Tests/devid-entitlements-contract.sh guards this pointer. (See CHARTER §5.9 / memory
+# "trading-two-entitlements-files-devid-is-an-empty-dict".)
+DEVID_ENTITLEMENTS="$SRC/app-developerid.entitlements"
 ADHOC_ENTITLEMENTS="$SRC/app-developerid.entitlements"
 DEVID_IDENTITY=""
 if [ "$DEVID" = "1" ]; then
@@ -82,6 +94,17 @@ lipo -create "$BUILD/$BIN_NAME-arm64" "$BUILD/$BIN_NAME-x86_64" -output "$APP/Co
 rm -f "$BUILD/$BIN_NAME-arm64" "$BUILD/$BIN_NAME-x86_64"
 echo "==> Linked executable: $APP/Contents/MacOS/$BIN_NAME (lipo -archs: $(lipo -archs "$APP/Contents/MacOS/$BIN_NAME"))"
 
+# --- TR-10 PERMANENT zero-claims linter (⛔H1 mechanism) ----------------------
+# Fail the build if any fabricated win-rate / P&L / return / track-record claim is present in the
+# shipped source surface OR the freshly-linked binary. This is the standing mechanism that keeps a
+# fabricated number from ever reaching a buyer through the app (CHARTER §5.1 / §5.7); the same
+# linter runs in Tests/run-all.sh. Scans the compiled binary that will actually ship.
+echo "==> Zero-claims linter (source surface + fresh binary)"
+if ! python3 "$ROOT/backend/claim_linter.py" --binary "$APP/Contents/MacOS/$BIN_NAME"; then
+  echo "ABORT: claim_linter found a forbidden performance claim — build fails (§5.1/§5.7)." >&2
+  exit 65
+fi
+
 # --- Info.plist (includes GoogleClientID key, default empty; URL scheme; finance category) ---
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -98,7 +121,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleName</key><string>Black Label Trading</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>1.0</string>
-  <key>CFBundleVersion</key><string>15</string>
+  <key>CFBundleVersion</key><string>25</string>
   <key>GoogleClientID</key><string></string>
   <key>ITSAppUsesNonExemptEncryption</key><false/>
   <key>LSApplicationCategoryType</key><string>public.app-category.finance</string>
@@ -175,7 +198,7 @@ fi
 # the restricted applesignin entitlement (AMFI SIGKILLs an ad-hoc app that carries applesignin).
 # The Apple button is runtime-gated on the entitlement, so this build hides it. For a notarizable,
 # distributable bundle use ./build-developer-id.sh (hardened runtime + Developer ID + spctl/notary).
-echo "==> Signing ($([ "$DEVID" = "1" ] && echo "Developer-ID + hardened runtime + non-sandbox (app-devid.entitlements)" || echo "adhoc with Developer-ID entitlements"))"
+echo "==> Signing ($([ "$DEVID" = "1" ] && echo "Developer-ID + hardened runtime + non-sandbox (app-developerid.entitlements)" || echo "adhoc with Developer-ID entitlements"))"
 sign_bundle "$APP"
 codesign --verify --deep --strict "$APP"
 
@@ -197,6 +220,7 @@ if [ "$DEVID" = "1" ]; then
 fi
 
 if [ "$INSTALL" = "1" ]; then
+  production_install_guard "$DEVID" "$APP"
   echo "==> Installing into /Applications/$APPNAME.app (atomic stage → verify → swap)"
   DEST="/Applications/$APPNAME.app"
   # §5.9 ATOMIC install (was: cp -Rf "$APP" "$DEST" straight into the live path on

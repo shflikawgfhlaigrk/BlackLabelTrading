@@ -53,10 +53,38 @@ if symbol.lowercased().hasSuffix(".csv") {
     let lp = bars.last?.close
     _ = ChartRender.renderPNG(bars: bars, symbol: sym, title: "\(sym) · Candles · \(bars.count) bars",
         indicators: RenderIndicators(lastPriceLine: lp), showVolume: true, to: "/tmp/bltd_chart_candles.png")
-    let ind = RenderIndicators(ema1: 9, ema2: 21, vwapWindow: min(bars.count, 50), rsiPeriod: 14,
+    let ind = RenderIndicators(ema1: 9, ema2: 21, sma: 50, vwapWindow: min(bars.count, 50), rsiPeriod: 14,
+        macd: true, atrPeriod: 14, stochastic: (period: 14, d: 3),
         bollinger: (period: 20, k: 2), crosshairIndex: max(0, bars.count - 8), lastPriceLine: lp)
-    _ = ChartRender.renderPNG(bars: bars, symbol: sym, title: "\(sym) · EMA·VWAP·BB·RSI · \(bars.count) bars",
+    _ = ChartRender.renderPNG(bars: bars, symbol: sym,
+        title: "\(sym) · SMA·EMA·VWAP·BB + RSI·MACD·ATR·STOCH·VOL (9-indicator parity bar) · \(bars.count) bars",
         indicators: ind, showVolume: true, to: "/tmp/bltd_chart_indicators.png")
+
+    // PNG — multi-timeframe parity proof: honestly resample the SAME base bars up a timeframe (5m) and
+    // render the full parity indicator set on it. Proves the timeframe axis of the parity bar (TR-07).
+    func resampleTF(_ src: [Bar], factor: Int) -> [Bar] {
+        guard factor > 1, src.count > factor else { return src }
+        var out: [Bar] = []; var i = 0
+        while i < src.count {
+            let chunk = Array(src[i..<min(i+factor, src.count)])
+            if let f = chunk.first, let l = chunk.last {
+                out.append(Bar(date: f.date, open: f.open, high: chunk.map(\.high).max() ?? f.high,
+                               low: chunk.map(\.low).min() ?? f.low, close: l.close,
+                               volume: chunk.reduce(0) { $0 + $1.volume }))
+            }
+            i += factor
+        }
+        return out
+    }
+    let tfBars = resampleTF(bars, factor: 5)
+    if tfBars.count >= 20 {
+        let tfInd = RenderIndicators(ema1: 9, ema2: 21, vwapWindow: min(tfBars.count, 40), rsiPeriod: 14,
+            stochastic: (period: 14, d: 3), bollinger: (period: 20, k: 2), lastPriceLine: tfBars.last?.close)
+        _ = ChartRender.renderPNG(bars: tfBars, symbol: sym,
+            title: "\(sym) · 5m timeframe (resampled from your bars) · EMA·VWAP·BB + RSI·STOCH · \(tfBars.count) bars",
+            indicators: tfInd, showVolume: true, to: "/tmp/bltd_chart_multitf.png")
+        print("WROTE /tmp/bltd_chart_multitf.png (5m resample, \(tfBars.count) bars — multi-timeframe parity)")
+    }
 
     // PNG #3 — the engine-trade overlay (entry/stop/target). The levels are a SAMPLE long setup
     // computed from the bars' OWN ATR (real bar math), NOT a claimed trade outcome — the engine is

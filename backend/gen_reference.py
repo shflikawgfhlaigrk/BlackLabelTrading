@@ -43,6 +43,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bltd_store as S  # noqa: E402  — the SINGLE source of the OOS math
+import bltd_analytics as A  # noqa: E402  — the SINGLE source of the grid-wide BH-FDR correction
 
 DEFAULT_DSN = os.environ.get("BLTD_REF_DSN", "host=/tmp port=5433 dbname=utah")
 # ES-family reference contracts. ES is the canonical liquid US index future the engines were
@@ -75,6 +76,52 @@ def _git_sha() -> str:
         return "unknown"
 
 
+def _uncommitted(path: str) -> bool | None:
+    """True if the module that produced this artifact differs from what git_sha pins.
+
+    git_sha alone does NOT pin the math: the prover can be edited in the working tree and still
+    stamp a clean commit sha. When this is True the ONLY durable pin is prover_sha (the content
+    hash of the file that actually ran) — so say so in the artifact rather than implying the
+    commit reproduces it.
+    """
+    try:
+        out = subprocess.check_output(
+            ["git", "status", "--porcelain", "--", os.path.basename(path)],
+            cwd=os.path.dirname(os.path.abspath(path)),
+            stderr=subprocess.DEVNULL).decode().strip()
+        return bool(out)
+    except Exception:
+        return None
+
+
+def _file_sha(path: str) -> str:
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()[:16]
+    except Exception:
+        return "unknown"
+
+
+def _apply_grid_fdr(cells: list[dict], q: float) -> int:
+    """Demote every per-test-significant cell that does NOT survive a grid-wide Benjamini–Hochberg
+    correction across the whole engine×contract family, and return the family size m.
+
+    This is the SAME guard the live buyer path applies (bltd_analytics.gate_rerun, which calls the
+    same _benjamini_hochberg) — the reference artifact previously skipped it and shipped a raw
+    per-test p<alpha verdict as "cleared significance", inflating candidateCount by grid size.
+    Mutates each cell in place: proven -> False, fdrRejected -> True. It can only ever DEMOTE.
+    """
+    testable = [c for c in cells if c["trades"] > 0]
+    survivors = A._benjamini_hochberg([c["pEdge"] for c in testable], q)
+    kept = {id(testable[i]) for i in survivors}
+    m = len(testable)
+    for c in testable:
+        if c["proven"] and id(c) not in kept:
+            c["proven"] = False
+            c["fdrRejected"] = True
+    return m
+
+
 def _load(cx, sym):
     rows = list(cx.execute(
         "SELECT o::float8,h::float8,l::float8,c::float8,extract(epoch from ts)::float8 "
@@ -88,7 +135,9 @@ def build(dsn: str, symbols: list[str]) -> dict:
     import psycopg  # imported here so the module imports even without the driver (buyer path never runs this)
     cx = psycopg.connect(dsn, autocommit=True, connect_timeout=5)
     cfg = S.CONFIG_DEFAULTS
+    q = cfg.get("fdrQ", 0.10)
     engines = []
+    all_cells = []                       # every (engine, contract) cell — the BH family
     for eng, prover in S.PROVERS.items():
         # For each engine, evaluate every reference contract and keep the honest per-contract verdict.
         contracts = []
@@ -97,33 +146,47 @@ def build(dsn: str, symbols: list[str]) -> dict:
             if len(ohlc) < 40:
                 continue
             v = prover(ohlc, cfg)
-            proven = bool(v.get("ok"))
-            contracts.append({
+            # Per-test candidacy ONLY. The grid-wide FDR pass below can demote this; nothing is
+            # labeled a candidate until the whole family has been corrected.
+            c = {
                 "symbol": sym,
                 "bars": len(ohlc),
                 "from": time.strftime("%Y-%m-%d", time.gmtime(t0)) if t0 else None,
                 "to": time.strftime("%Y-%m-%d", time.gmtime(t1)) if t1 else None,
-                "proven": proven,
+                "proven": bool(v.get("ok")),
                 "trades": int(v.get("trades", 0)),
                 "winRate": round(float(v.get("winRate", 0.0)), 4),
                 "expectancyR": round(float(v.get("expectancyR", 0.0)), 4),
                 "netPts": round(float(v.get("netPts", 0.0)), 4),
                 "pEdge": v.get("pEdge", 1.0),
-                # honest verdict string: an OOS candidate that cleared significance, or "no edge"
-                "verdict": ("OOS candidate (cleared significance)" if proven else "no edge"),
                 "reason": v.get("reason", ""),
-            })
+            }
+            contracts.append(c)
+            all_cells.append(c)
         if not contracts:
             continue
-        any_proven = any(c["proven"] for c in contracts)
         engines.append({
             "engine": eng,
             "label": S.__dict__.get("ENGINE_LABELS", {}).get(eng, eng),
-            # Engine-level status is honest: "candidate" only if it cleared significance on at
-            # least one real contract; otherwise "no edge". Never averaged into a single number.
-            "status": "candidate" if any_proven else "no_edge",
+            "status": None,              # set after the family-wide correction
             "contracts": contracts,
         })
+
+    # ── grid-wide Benjamini–Hochberg FDR control (the same guard the live buyer path applies) ──
+    m = _apply_grid_fdr(all_cells, q)
+    for c in all_cells:
+        if c["proven"]:
+            c["verdict"] = "OOS candidate (cleared significance)"
+        elif c.get("fdrRejected"):
+            c["verdict"] = "no edge (FDR-rejected)"
+            c["reason"] = (f"per-test significant (p={float(c['pEdge']):.3f}) but rejected by "
+                           f"grid-wide FDR control across {m} tests (q={q:.2f})")
+        else:
+            c["verdict"] = "no edge"
+    for e in engines:
+        # Engine-level status is honest: "candidate" only if it survived the family-wide correction
+        # on at least one real contract; otherwise "no edge". Never averaged into a single number.
+        e["status"] = "candidate" if any(c["proven"] for c in e["contracts"]) else "no_edge"
 
     provenN = sum(1 for e in engines if e["status"] == "candidate")
     return {
@@ -135,10 +198,22 @@ def build(dsn: str, symbols: list[str]) -> dict:
                        "on the bars YOUR feed captures."),
         "source": "Black Label historical ES bars (WealthCharts-captured)",
         "generated_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        # Provenance pins the math that ACTUALLY ran: the content hash of the prover module plus
+        # the content hash of the module supplying the family-wide correction. git_sha is the tree
+        # it was generated from; prover_uncommitted=True means that commit does NOT reproduce it
+        # and prover_sha is the only durable pin (verify: shasum -a 256 backend/bltd_store.py).
         "prover_sha": _code_sha(),
+        "prover_file": os.path.basename(S.__file__),
+        "prover_uncommitted": _uncommitted(S.__file__),
+        "fdr_module": os.path.basename(A.__file__),
+        "fdr_module_sha": _file_sha(A.__file__),
         "git_sha": _git_sha(),
-        "significance": {"alpha": S.SIG_ALPHA, "minTrades": S.SIG_MIN_N,
-                         "test": "one-sided binomial vs R-geometry breakeven, BH-FDR at grid level"},
+        "significance": {
+            "alpha": S.SIG_ALPHA, "minTrades": S.SIG_MIN_N, "fdrQ": q, "gridCells": m,
+            "test": (f"one-sided binomial vs R-geometry breakeven (alpha={S.SIG_ALPHA}, "
+                     f"n>={S.SIG_MIN_N}), then Benjamini-Hochberg FDR control at q={q} across the "
+                     f"m={m}-cell engine x contract grid"),
+        },
         "engineCount": len(engines),
         "candidateCount": provenN,
         "engines": engines,

@@ -23,9 +23,13 @@
     * disable-library-validation — the spawned system python3 loads its own dylibs/.so
       extensions that are NOT signed by this team; library validation would otherwise refuse
       them and the backend would fail to start.
-    * allow-dyld-environment-variables — launch-backend.sh sets PYTHONPATH for the child so it
-      imports the bundled bltd_*.py modules; the hardened runtime strips DYLD/PYTHON* env unless
-      this is granted.
+
+  NOTE: allow-dyld-environment-variables is intentionally NOT granted. That entitlement governs
+  DYLD_* variables ONLY; it does not affect PYTHON* variables. launch-backend.sh passes PYTHONPATH
+  (a plain env var the interpreter reads — never stripped by the hardened runtime), and sets no
+  DYLD_* variable, so the child imports the bundled bltd_*.py modules without it. Granting it on a
+  non-sandboxed, notarized app while disable-library-validation is also present would re-enable
+  DYLD_INSERT_LIBRARIES injection of unsigned dylibs into this Developer-ID-trusted process.
 
   network.client is kept (the app + backend make outbound localhost/CDP connections). No
   network.server entitlement is needed: the loopback HTTP server is allowed without the sandbox.
@@ -35,8 +39,6 @@
   <key>com.apple.security.network.client</key>
   <true/>
   <key>com.apple.security.cs.disable-library-validation</key>
-  <true/>
-  <key>com.apple.security.cs.allow-dyld-environment-variables</key>
   <true/>
 </dict>
 </plist>

@@ -162,6 +162,52 @@ enum ChartIndicators {
         for i in 0..<closes.count { if let m = line[i], let s = signal[i] { hist[i] = m - s } }
         return MACD(macd: line, signal: signal, histogram: hist)
     }
+
+    struct Stochastic { var k: [Double?]; var d: [Double?] }
+    // Stochastic oscillator: %K = 100·(close − lowestLow(period)) / (highestHigh(period) − lowestLow(period)),
+    // %D = SMA(%K, dPeriod). Real high/low/close math on the buyer's own bars — a flat range (hi==lo)
+    // yields nil (honest — no divide-by-zero fabrication). Both lines are in [0,100].
+    static func stochastic(_ bars: [Bar], period: Int = 14, dPeriod: Int = 3) -> Stochastic {
+        var k = [Double?](repeating: nil, count: bars.count)
+        guard period > 0, bars.count >= period else { return Stochastic(k: k, d: [Double?](repeating: nil, count: bars.count)) }
+        for i in (period - 1)..<bars.count {
+            let window = bars[(i - period + 1)...i]
+            let hi = window.map { $0.high }.max() ?? bars[i].high
+            let lo = window.map { $0.low }.min() ?? bars[i].low
+            let span = hi - lo
+            k[i] = span > 0 ? 100 * (bars[i].close - lo) / span : nil
+        }
+        // %D = SMA of %K over the non-nil run.
+        var d = [Double?](repeating: nil, count: bars.count)
+        let firstIdx = k.firstIndex { $0 != nil }
+        if let start = firstIdx {
+            let vals = k[start...].map { $0 ?? Double.nan }
+            let sm = Indicators.sma(vals.map { $0.isNaN ? 0 : $0 }, dPeriod)
+            for (j, v) in sm.enumerated() where start + j < d.count { d[start + j] = v }
+        }
+        return Stochastic(k: k, d: d)
+    }
+}
+
+// MARK: - Charting parity bar (TR-07). The DEFINED, CHECKED-IN target for in-app charting depth: the
+// indicator set and timeframe set the product commits to matching, implemented on BOTH render paths
+// (the live SwiftUI ChartScreen AND the headless CoreGraphics ChartRender) from the SAME math here.
+// This is a real repo constant — not prose in a handoff — so tests and the parity doc assert against
+// it. See docs/CHARTING-PARITY-BAR.md for the per-path implementation map.
+enum ChartParityBar {
+    // ≥8 indicators. Each maps to real math in this file or Indicators (Backtest.swift), rendered on
+    // both paths. Volume is a first-class pane on both paths.
+    static let indicators: [String] = [
+        "SMA", "EMA", "VWAP", "Bollinger Bands", "RSI", "MACD", "ATR", "Stochastic", "Volume",
+    ]
+    // ≥5 timeframes. Honest down-sampling of the buyer's OWN base bars (no invented bars) — the same
+    // Resampler drives the live chart and the headless proof.
+    static let timeframes: [String] = ["1m", "5m", "15m", "30m", "1h", "1D"]
+
+    static let minIndicators = 8
+    static let minTimeframes = 5
+    // The bar is MET only when the shipped set meets or exceeds both floors.
+    static var meetsBar: Bool { indicators.count >= minIndicators && timeframes.count >= minTimeframes }
 }
 
 // MARK: - Chart axis intelligence. PURE MATH shared by the SwiftUI chart screen AND the

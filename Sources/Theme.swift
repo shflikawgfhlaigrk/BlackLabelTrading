@@ -33,14 +33,11 @@ extension Color {
 struct Logo: View {
     var size: CGFloat = 64
     var body: some View {
-        Group {
-            if let img = BLTheme.icon() { Image(nsImage: img).resizable().interpolation(.high) }
-            else { Text("BLT").font(.system(size: size*0.34, weight: .black, design: .rounded)).foregroundStyle(BLTheme.goldGrad) }
-        }
-        .frame(width: size, height: size)
-        .clipShape(RoundedRectangle(cornerRadius: size*0.22, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: size*0.22, style: .continuous).stroke(BLTheme.gold.opacity(0.25), lineWidth: 1))
-        .shadow(color: BLTheme.gold.opacity(0.35), radius: size*0.2, y: 4)
+        Image("BLBMark").resizable().interpolation(.high)
+            .frame(width: size, height: size)
+            .clipShape(RoundedRectangle(cornerRadius: size*0.22, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: size*0.22, style: .continuous).stroke(BLTheme.gold.opacity(0.25), lineWidth: 1))
+            .shadow(color: BLTheme.gold.opacity(0.35), radius: size*0.2, y: 4)
     }
 }
 

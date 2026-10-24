@@ -168,11 +168,19 @@ struct LiveFactorSnapshot {
     var atr: Double? = nil
     var asOf: Date? = nil
     var bars: Int = 0
+    // Factors that are absent SPECIFICALLY because they are ES-tuned modules and the live instrument
+    // is not ES-family (TR-05 (c)): the UI labels these "ES-only module" instead of a generic "no live
+    // data", so the buyer sees an honest reason — not silent wrong math on NQ/CL/SPY.
+    var esOnlyAbsent: Set<String> = []
     var hasData: Bool { bars >= LiveFactorEngine.minBars && price != nil && !available.isEmpty }
 }
 
 enum LiveFactorEngine {
     static let minBars = 50
+
+    // The ES-tuned modules: their math is calibrated to the S&P e-mini and would FABRICATE on another
+    // instrument, so they run ONLY on ES-family and are labeled "ES-only module" everywhere else.
+    static let esOnlyFactors: Set<String> = [SignalFactor.session.rawValue, SignalFactor.smt.rawValue]
 
     // esFamily: whether the live instrument is ES-family. Two factors are calibrated to ES and
     // would FABRICATE on another instrument, so they are computed ONLY when esFamily is true and
@@ -184,6 +192,9 @@ enum LiveFactorEngine {
                         esFamily: Bool = true) -> LiveFactorSnapshot {
         var s = LiveFactorSnapshot()
         s.bars = bars.count
+        // On a non-ES instrument the ES-tuned Session/SMT modules do not apply — record that so the UI
+        // labels them "ES-only module" (an honest reason) rather than a generic "no live data".
+        if !esFamily { s.esOnlyAbsent = esOnlyFactors }
         guard bars.count >= minBars, let last = bars.last else { return s }
         let closes = bars.map(\.close)
         s.price = last.close

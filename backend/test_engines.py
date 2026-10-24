@@ -812,6 +812,150 @@ def test_evaluate_all_fires_off_read_loop_from_store():
                 pass
 
 
+# ---- TR-13 NON-REPAINT: a signal is only emitted on a CLOSED bar, and no prior bar/signal
+# revises when a new tick arrives. This is the runnable proof behind the "does it repaint?"
+# (LuxAlgo-style) takedown: our bar aggregation excludes the still-forming bucket, a closed
+# bar is frozen once closed, and the roster fires only on appear/flip off the CLOSED series.
+def test_ohlc_bars_excludes_forming_bucket_and_never_repaints_closed():
+    # bar_seconds=15 -> buckets k0={0,1}, k1={15,16}, k2={30 (still forming)}.
+    ticks = [(0, 100.0), (1, 101.0), (15, 102.0), (16, 103.0), (30, 104.0)]
+    closed = S.ohlc_bars(ticks, 15)
+    assert [b[0] for b in closed] == [0, 1], "only fully-closed buckets are emitted (k2 is forming)"
+    assert closed[0] == (0, 100.0, 101.0, 100.0, 101.0)   # o,h,l,c from the two k0 tick-closes
+    # A new tick INSIDE the still-forming bucket must not revise ANY closed bar (non-repaint).
+    closed_more_forming = S.ohlc_bars(ticks + [(31, 999.0)], 15)
+    assert closed_more_forming == closed, "a forming-bar tick revises no CLOSED bar"
+    # A tick that OPENS the next bucket promotes k2 to closed but freezes the earlier closed bars.
+    closed_rolled = S.ohlc_bars(ticks + [(45, 50.0)], 15)
+    assert closed_rolled[:2] == closed, "earlier closed bars stay byte-identical once closed"
+    assert len(closed_rolled) == 3 and closed_rolled[2][0] == 2, "exactly one newly-closed bar (k2)"
+    assert closed_rolled[2] == (2, 104.0, 104.0, 104.0, 104.0), "k2 closes on its own tick, unaffected by k3"
+
+
+def test_ohlcv_bars_closed_bar_close_is_frozen_against_forming_ticks():
+    # The specific repaint concern: the LAST closed bar's close must not change when a later,
+    # still-forming tick prints a wild price. ohlcv variant (carries volume/delta).
+    ticks = [(0, 100.0, 5.0, 0.0), (1, 101.0, 6.0, 0.0),      # k0 closes at 101
+             (15, 200.0, 7.0, 0.0)]                            # k1 forming (not emitted)
+    closed = S.ohlcv_bars(ticks, 15)
+    assert len(closed) == 1 and closed[0][4] == 101.0, "closed bar close is the last tick of its bucket"
+    # Add more forming k1 ticks: the closed k0 bar is untouched, k1 is still excluded.
+    closed2 = S.ohlcv_bars(ticks + [(16, 9_999.0, 8.0, 0.0)], 15)
+    assert closed2 == closed, "closed bar frozen; forming bucket still excluded despite an outlier tick"
+
+
+def test_capture_forming_ticks_never_close_a_bar_or_repaint_a_closed_one():
+    # End-to-end through Capture: ticks inside one bucket queue NO closed bar; only a boundary
+    # crossing closes the prior bucket; and further ticks in the new forming bucket do not repaint
+    # the already-closed bar in the store.
+    import bltd_capture as C
+    store, path, cfg = _temp_store()
+    try:
+        cap = C.Capture(store, bar_seconds=15, lookback=20, edge_gate=False)
+        cap.on_candle({"symbol": "CM.ESU6", "close": 100.0, "epoch": None}, arrival=1_700_000_000.0)
+        cap.on_candle({"symbol": "CM.ESU6", "close": 101.0, "epoch": None}, arrival=1_700_000_005.0)
+        assert cap.pending_bars == {}, "no bar closes while the bucket is still forming"
+        cap.flush()
+        assert store.bars("CM.ESU6", 10, newest=False)["bars"] == [], "a forming bucket persists no closed bar"
+        # Cross into the next bucket -> the first bucket closes (o=100, c=101), frozen.
+        cap.on_candle({"symbol": "CM.ESU6", "close": 102.0, "epoch": None}, arrival=1_700_000_015.0)
+        cap.flush()
+        closed = [[100.0, 101.0, 100.0, 101.0, 1_700_000_010.0, 0.0, 0.0]]
+        assert store.bars("CM.ESU6", 10, newest=False)["bars"] == closed
+        # A wild tick in the NEW forming bucket must not repaint the already-closed bar.
+        cap.on_candle({"symbol": "CM.ESU6", "close": 250.0, "epoch": None}, arrival=1_700_000_020.0)
+        cap.flush()
+        assert store.bars("CM.ESU6", 10, newest=False)["bars"] == closed, "closed bar frozen while a new bucket forms"
+    finally:
+        for p in (path, cfg):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
+def test_evaluate_does_not_re_emit_or_revise_a_prior_signal_on_unchanged_bars():
+    # A prior signal must not be revised/re-emitted when a new tick arrives but the CLOSED-bar
+    # series is unchanged: the roster fires on appear/flip only (direction unchanged -> no fire).
+    import bltd_capture as C
+    store, path, cfg = _temp_store()
+    try:
+        rows = [(1_700_000_000 + i * 15, 100.0 + i * 0.9, 100.0 + i * 0.9,
+                 100.0 + i * 0.9, 100.0 + i * 0.9) for i in range(80)]
+        assert store.record_bars("CM.ESU6", rows) == 80
+        cap = C.Capture(store, bar_seconds=15, lookback=20, edge_gate=False)
+        cap.evaluate_all()
+        first = store.latest_fire()["fire"]
+        assert first is not None, "a signal fires from the CLOSED-bar series"
+        n1 = len(store.fires(500)["fires"])
+        # Re-evaluate the SAME closed series (as a new tick's forming bucket would trigger): the
+        # engine direction is unchanged, so NO new fire is recorded and the prior one is not revised.
+        cap.evaluate_all()
+        n2 = len(store.fires(500)["fires"])
+        assert n2 == n1, "unchanged closed series does not re-fire (no repaint of the prior signal)"
+        assert store.latest_fire()["fire"]["direction"] == first["direction"], "prior signal direction is stable"
+    finally:
+        for p in (path, cfg):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
+def test_on_candle_forming_bar_emits_no_signal_until_close_then_never_revises():
+    # TR-13 integrated non-repaint proof driven through the REAL ingest path (Capture.on_candle ->
+    # store -> evaluate), not just the pure ohlc helper. Two claims the "does it repaint?" takedown
+    # cares about: (1) a still-FORMING bucket produces no signal of its own — the roster only ever
+    # scores the CLOSED series; and (2) once a bar closes and fires, a later forming tick (even a wild
+    # outlier) never retroactively revises or re-emits that closed-bar signal.
+    import bltd_capture as C
+    store, path, cfg = _temp_store()
+    try:
+        # Seed a closed trending series so the roster has >= lookback+1 closed bars to score.
+        seed = [(1_700_000_000 + i * 15, 100.0 + i * 0.9, 100.0 + i * 0.9,
+                 100.0 + i * 0.9, 100.0 + i * 0.9) for i in range(80)]
+        assert store.record_bars("CM.ESU6", seed) == 80
+        cap = C.Capture(store, bar_seconds=15, lookback=20, edge_gate=False)
+
+        # (1) Feed ticks that only FORM the next bucket (no boundary crossed): no closed bar is queued
+        # or persisted, so evaluate sees the UNCHANGED closed series and fires off it alone.
+        t0 = 1_700_000_000 + 80 * 15                      # first stamp of the still-forming bucket
+        cap.on_candle({"symbol": "CM.ESU6", "close": 172.0, "epoch": None}, arrival=float(t0))
+        cap.on_candle({"symbol": "CM.ESU6", "close": 173.0, "epoch": None}, arrival=float(t0 + 5))
+        assert cap.pending_bars == {}, "a still-forming bucket queues no closed bar"
+        cap.flush()
+        assert store.bars("CM.ESU6", 3, newest=True)["bars"][-1][4] == float(seed[-1][0]), \
+            "no new closed bar from forming ticks (newest closed bar is still the seed's last)"
+        cap.evaluate_all()
+        base_fire = store.latest_fire()["fire"]
+        assert base_fire is not None, "a signal fires ONLY from the closed-bar series"
+        base_n = len(store.fires(500)["fires"])
+
+        # A WILD forming tick inside the SAME (still-open) bucket must not repaint or re-fire anything.
+        cap.on_candle({"symbol": "CM.ESU6", "close": 5000.0, "epoch": None}, arrival=float(t0 + 9))
+        cap.flush(); cap.evaluate_all()
+        assert len(store.fires(500)["fires"]) == base_n, "forming-tick outlier does not re-fire (no repaint)"
+        assert store.latest_fire()["fire"]["direction"] == base_fire["direction"], "prior signal direction is stable"
+
+        # (2) Cross the boundary -> the forming bucket closes into exactly one new bar. Then a later
+        # forming tick in the NEXT bucket must leave that just-closed bar byte-identical (frozen).
+        cap.on_candle({"symbol": "CM.ESU6", "close": 174.0, "epoch": None}, arrival=float(t0 + 15))
+        cap.flush()
+        expected_ts = float(((t0 // 15) + 1) * 15)        # _roll stamps the bar at its bucket-close boundary
+        just_closed = store.bars("CM.ESU6", 1, newest=True)["bars"]
+        assert just_closed and just_closed[0][4] == expected_ts, "boundary crossing closes the forming bucket"
+        cap.on_candle({"symbol": "CM.ESU6", "close": 9999.0, "epoch": None}, arrival=float(t0 + 20))
+        cap.flush()
+        assert store.bars("CM.ESU6", 1, newest=True)["bars"] == just_closed, \
+            "a closed bar is never repainted by a later forming tick"
+    finally:
+        for p in (path, cfg):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
 def test_freshness_watchdog_wedge_decision():
     # PURE wedge decision behind _freshness_watchdog: seed grace, reset on advance, and trip only
     # after the store's newest tick has stalled for stale_after seconds (then the daemon os._exit's
@@ -1044,6 +1188,340 @@ def test_screen_fdr_suppresses_grid_inflation():
     assert bh_survivors == {"STRONG"}, f"BH must keep only the strong cell, got {bh_survivors}"
     demoted = [r for r in rows if r["symbol"].startswith("MARGINAL")]
     assert all(not r["edge"] and "FDR" in r["reason"] for r in demoted)
+
+
+# ===========================================================================
+# maxDrawdownR + the buyer-triggered gate re-run (bltd_analytics.gate_rerun)
+# ===========================================================================
+def test_max_drawdown_r_empty_and_monotonic():
+    assert S._max_drawdown_r([]) == 0.0
+    assert S._max_drawdown_r([{"r": 1.0}, {"r": 2.0}, {"r": 0.5}]) == 0.0  # never dips below peak
+
+
+def test_max_drawdown_r_peak_to_trough():
+    # cum: +2, -1, +0 -> peak 2, trough -1 => max drawdown 3R
+    dd = S._max_drawdown_r([{"r": 2.0}, {"r": -3.0}, {"r": 1.0}])
+    assert approx(dd, 3.0), dd
+
+
+def test_summary_reports_wins_losses_and_drawdown():
+    trades = [{"dir": "long", "entry": 100.0, "exit": 102.0, "r": 2.0},
+              {"dir": "long", "entry": 100.0, "exit": 99.0, "r": -1.0},
+              {"dir": "long", "entry": 100.0, "exit": 99.0, "r": -1.0}]
+    s = S._summarize(trades, min_trades=1)
+    assert s["trades"] == 3 and s["wins"] == 1 and s["losses"] == 2
+    assert "maxDrawdownR" in s and s["maxDrawdownR"] >= 0.0
+
+
+def test_prover_source_sha_is_16hex():
+    sha = S.prover_source_sha()
+    assert len(sha) == 16 and all(ch in "0123456789abcdef" for ch in sha), sha
+
+
+class _RerunStore:
+    def __init__(self, series):
+        self._series = series
+
+    def config(self):
+        return S.CONFIG_DEFAULTS
+
+    def ohlc(self, symbol):
+        return self._series.get(symbol, [])
+
+
+def test_gate_rerun_empty_store_is_honest_not_fabricated():
+    import bltd_analytics as A
+    rep = A.gate_rerun(_RerunStore({}), [], list(S.PROVERS.keys()))
+    assert rep["available"] is False
+    assert rep["engineCount"] == 0 and rep["candidateCount"] == 0
+    assert rep["reason"] and "no bars" in rep["reason"].lower()
+    # prover_sha is always stamped so the buyer can reproduce even the empty verdict
+    assert len(rep["prover_sha"]) == 16 and rep["sigMinN"] == S.SIG_MIN_N
+
+
+def test_gate_rerun_runs_every_engine_and_stamps_prover_sha():
+    import bltd_analytics as A
+    orig_scope = S.INSTRUMENT_SCOPE
+    try:
+        S.INSTRUMENT_SCOPE = "all"
+        series = {"CM.ESU6": [(100.0 + i * 0.3,) * 4 for i in range(400)]}
+        rep = A.gate_rerun(_RerunStore(series), ["CM.ESU6"], list(S.PROVERS.keys()))
+    finally:
+        S.INSTRUMENT_SCOPE = orig_scope
+    assert rep["available"] is True
+    assert rep["prover_sha"] == S.prover_source_sha()
+    assert rep["engineCount"] == len(S.PROVERS)                       # no cherry-picking: all engines
+    assert rep["candidateCount"] + rep["noEdgeCount"] + rep["insufficientCount"] == rep["engineCount"]
+    for e in rep["engines"]:
+        assert e["status"] in ("candidate", "no_edge", "insufficient")
+        for c in e["contracts"]:
+            for k in ("trades", "wins", "losses", "maxDrawdownR", "pEdge", "reason"):
+                assert k in c
+            assert c["wins"] + c["losses"] == c["trades"]            # honest W/L split
+
+
+def test_gate_rerun_labels_thin_sample_insufficient():
+    import bltd_analytics as A
+    orig_scope = S.INSTRUMENT_SCOPE
+    try:
+        S.INSTRUMENT_SCOPE = "all"
+        # just above the warming floor but far below SIG_MIN_N trades -> insufficient, never proven
+        series = {"CM.ESU6": [(100.0 + (1.0 if i % 2 else -1.0),) * 4 for i in range(60)]}
+        rep = A.gate_rerun(_RerunStore(series), ["CM.ESU6"], ["meanrev"])
+    finally:
+        S.INSTRUMENT_SCOPE = orig_scope
+    e = rep["engines"][0]
+    c = e["contracts"][0]
+    if c["trades"] < S.SIG_MIN_N:
+        assert c["insufficient"] is True and c["proven"] is False
+        assert "insufficient" in c["reason"].lower()
+
+
+# ===========================================================================
+# No-code backtest lab (bltd_analytics.backtest_lab) — SHIPPED prover, date-scoped, per-fold,
+# honest 'insufficient', no aggregate win-rate/$ figure.
+# ===========================================================================
+class _LabStore:
+    def __init__(self, series):
+        self._series = series          # {symbol: [(o,h,l,c), ...]}
+
+    def config(self):
+        return S.CONFIG_DEFAULTS
+
+    def ohlc_between(self, symbol, start_ts=None, end_ts=None, limit=20000):
+        return self._series.get(symbol, [])
+
+
+def test_backtest_lab_unknown_engine_and_symbol_are_honest():
+    import bltd_analytics as A
+    r1 = A.backtest_lab(_LabStore({}), "not_an_engine", "CM.ESU6")
+    assert r1["available"] is False and "unknown engine" in r1["reason"]
+    assert len(r1["prover_sha"]) == 16                     # sha stamped even on the error path
+    orig_scope = S.INSTRUMENT_SCOPE
+    try:
+        S.INSTRUMENT_SCOPE = "es"                           # narrow scope rejects a junk instrument
+        r2 = A.backtest_lab(_LabStore({}), "meanrev", "NOTASYMBOL@@")
+    finally:
+        S.INSTRUMENT_SCOPE = orig_scope
+    assert r2["available"] is False and "not a recognized instrument" in r2["reason"]
+
+
+def test_backtest_lab_thin_range_reports_insufficient_not_fabricated():
+    import bltd_analytics as A
+    orig_scope = S.INSTRUMENT_SCOPE
+    try:
+        S.INSTRUMENT_SCOPE = "all"
+        series = {"CM.ESU6": [(100.0 + (1.0 if i % 2 else -1.0),) * 4 for i in range(60)]}
+        rep = A.backtest_lab(_LabStore(series), "meanrev", "CM.ESU6", folds=1)
+    finally:
+        S.INSTRUMENT_SCOPE = orig_scope
+    assert rep["available"] is True
+    w = rep["whole"]
+    if w["trades"] < S.SIG_MIN_N:
+        assert w["insufficient"] is True and w["proven"] is False
+        assert "insufficient" in w["reason"].lower()
+    # never a fabricated aggregate headline
+    assert "winRateAll" not in rep and "netPnlDollars" not in rep
+
+
+def test_backtest_lab_runs_shipped_prover_per_fold_with_provenance():
+    import bltd_analytics as A
+    orig_scope = S.INSTRUMENT_SCOPE
+    try:
+        S.INSTRUMENT_SCOPE = "all"
+        series = {"CM.ESU6": [(100.0 + i * 0.3,) * 4 for i in range(600)]}
+        rep = A.backtest_lab(_LabStore(series), "meanrev", "CM.ESU6", folds=3)
+    finally:
+        S.INSTRUMENT_SCOPE = orig_scope
+    assert rep["available"] is True
+    assert rep["prover_sha"] == S.prover_source_sha() and rep["sigMinN"] == S.SIG_MIN_N
+    assert rep["whole"] is not None
+    assert 1 <= len(rep["folds"]) <= 3
+    for f in rep["folds"]:
+        for k in ("fold", "bars", "trades", "wins", "losses", "maxDrawdownR", "pEdge",
+                  "proven", "insufficient", "reason"):
+            assert k in f, k
+        assert f["wins"] + f["losses"] == f["trades"]          # honest W/L split
+        if f["trades"] < S.SIG_MIN_N:
+            assert f["insufficient"] is True and f["proven"] is False
+
+
+def test_backtest_lab_empty_store_is_honest_pending():
+    import bltd_analytics as A
+    orig_scope = S.INSTRUMENT_SCOPE
+    try:
+        S.INSTRUMENT_SCOPE = "all"
+        rep = A.backtest_lab(_LabStore({"CM.ESU6": []}), "meanrev", "CM.ESU6")
+    finally:
+        S.INSTRUMENT_SCOPE = orig_scope
+    assert rep["available"] is False and "insufficient bars" in rep["reason"]
+    assert rep["folds"] == [] and rep["whole"] is None
+
+
+# ===========================================================================
+# TR-05 multi-asset product layer — instrument catalog + per-instrument honesty
+# ===========================================================================
+class _CatalogStore:
+    """Fake store for the instrument catalog: derives symbols() from a {symbol: ohlc} series map the
+    same way the real Store does (backtestable >=40 bars, live/liveTicks = all present, busiest = most
+    bars). Lets the catalog + per-instrument gate be tested with no DB, on real classification math."""
+    def __init__(self, series):
+        self._series = series
+
+    def config(self):
+        return S.CONFIG_DEFAULTS
+
+    def ohlc(self, symbol):
+        return self._series.get(symbol, [])
+
+    def symbols(self):
+        present = [s for s, v in self._series.items() if v]
+        bt = [s for s in present if len(self._series[s]) >= 40]
+        busiest = max(present, key=lambda s: len(self._series[s])) if present else None
+        return {"backtestable": sorted(bt), "live": sorted(present),
+                "liveTicks": sorted(present), "busiest": busiest}
+
+
+def test_classify_instrument_asset_classes_are_honest():
+    # ES-family: es modules apply, dollars known.
+    es = S.classify_instrument("CM.ESU6")
+    assert es["esFamily"] is True and es["esModules"] is True
+    assert es["assetClass"] == "us_index_future" and es["pointValue"] == 50.0 and es["root"] == "ES"
+    # Non-ES index future: classified, dollars known, but ES-tuned modules do NOT apply.
+    mnq = S.classify_instrument("CM.MNQU6")
+    assert mnq["esFamily"] is False and mnq["esModules"] is False
+    assert mnq["assetClass"] == "us_index_future" and mnq["pointValue"] == 2.0 and mnq["root"] == "MNQ"
+    # Energy future: different asset bucket, own spec.
+    cl = S.classify_instrument("CL")
+    assert cl["assetClass"] == "energy_future" and cl["pointValue"] == 1000.0
+    # US equity/ETF: honest bucket, NO fabricated futures multiplier.
+    spy = S.classify_instrument("US.SPY")
+    assert spy["assetClass"] == "equity_etf" and spy["pointValue"] is None and spy["esModules"] is False
+    assert spy["display"] == "SPY"
+    # Unknown instrument: never guessed — 'other' with no point value.
+    other = S.classify_instrument("WIBBLE")
+    assert other["assetClass"] == "other" and other["pointValue"] is None and other["esModules"] is False
+
+
+def test_instruments_catalog_enumerates_captured_symbols_dynamically():
+    import bltd_analytics as A
+    orig = S.INSTRUMENT_SCOPE
+    try:
+        S.INSTRUMENT_SCOPE = "all"
+        series = {
+            "CM.ESU6": [(100.0 + i * 0.1,) * 4 for i in range(120)],   # ES-family, deep
+            "CM.MNQU6": [(200.0 + i * 0.1,) * 4 for i in range(80)],   # non-ES future
+            "US.SPY": [(400.0 + i * 0.1,) * 4 for i in range(60)],     # ETF
+        }
+        rep = A.instruments(_CatalogStore(series))
+    finally:
+        S.INSTRUMENT_SCOPE = orig
+    assert rep["available"] is True and rep["count"] == 3
+    assert rep["esFamilyCount"] == 1 and rep["nonEsCount"] == 2
+    assert rep["onlyES"] is False
+    by_disp = {i["display"]: i for i in rep["instruments"]}
+    # >=2 non-ES instruments surfaced from the buyer's OWN bars (never a hardcoded list).
+    assert {"ESU6", "MNQU6", "SPY"} <= set(by_disp)
+    assert by_disp["MNQU6"]["esModules"] is False and by_disp["SPY"]["assetClass"] == "equity_etf"
+    assert by_disp["ESU6"]["esModules"] is True
+    # Deepest instrument leads the picker; every item carries its own real bar count.
+    assert rep["instruments"][0]["display"] == "ESU6" and rep["instruments"][0]["bars"] == 120
+
+
+def test_instruments_catalog_only_es_is_honest_state():
+    import bltd_analytics as A
+    orig = S.INSTRUMENT_SCOPE
+    try:
+        S.INSTRUMENT_SCOPE = "all"
+        rep = A.instruments(_CatalogStore({"CM.ESU6": [(100.0 + i * 0.1,) * 4 for i in range(60)]}))
+    finally:
+        S.INSTRUMENT_SCOPE = orig
+    # The honest "only ES captured so far" state — never a fabricated multi-asset spread.
+    assert rep["onlyES"] is True and rep["nonEsCount"] == 0 and rep["esFamilyCount"] == 1
+
+
+def test_instruments_catalog_empty_store_is_honest():
+    import bltd_analytics as A
+    rep = A.instruments(_CatalogStore({}))
+    assert rep["available"] is False and rep["count"] == 0 and rep["onlyES"] is False
+    assert rep["reason"] and "no instruments" in rep["reason"].lower()
+
+
+def test_gate_rerun_judges_each_instrument_independently_never_pooled():
+    import bltd_analytics as A
+    orig = S.INSTRUMENT_SCOPE
+    try:
+        S.INSTRUMENT_SCOPE = "all"
+        # Deep ES + a THIN NQ (below the arm threshold). Verdicts must be per (engine, contract):
+        # the thin NQ series is judged insufficient/warming on ITS OWN bars, never averaged into ES.
+        series = {
+            "CM.ESU6": [(100.0 + i * 0.3,) * 4 for i in range(400)],
+            "CM.NQU6": [(200.0 + i * 0.3,) * 4 for i in range(15)],
+        }
+        rep = A.gate_rerun(_CatalogStore(series), ["CM.ESU6", "CM.NQU6"], list(S.PROVERS.keys()))
+    finally:
+        S.INSTRUMENT_SCOPE = orig
+    assert rep["symbols"] == ["CM.ESU6", "CM.NQU6"]                    # both instruments, listed separately
+    for e in rep["engines"]:
+        contracts = {c["symbol"]: c for c in e["contracts"]}
+        assert set(contracts) == {"CM.ESU6", "CM.NQU6"}               # a row PER instrument, not pooled
+        nq = contracts["CM.NQU6"]
+        # The thin instrument is honestly insufficient (warming) and NEVER proven off ES's sample.
+        assert nq["insufficient"] is True and nq["proven"] is False
+        assert nq["bars"] == 15 and ("warming" in nq["reason"] or "insufficient" in nq["reason"])
+
+
+def test_on_candle_routes_non_es_instrument_identically_no_repaint_es_unchanged():
+    # TR-05 engine parameterization proof: the ingest + bar path is instrument-AGNOSTIC. A non-ES
+    # instrument driven through the REAL Capture.on_candle path must obey the SAME closed-bar /
+    # non-repaint invariants as ES — byte-identical closed-bar structure — proving no capture or
+    # bucketing code is ES-special-cased. Guards against a multi-asset regression where non-ES ticks
+    # would be dropped, mis-bucketed, or repaint an already-closed bar. Also asserts ES's own behavior
+    # is unchanged by multi-asset support (the "ES behavior unchanged" floor).
+    import bltd_capture as C
+
+    def _run(sym):
+        store, path, cfg = _temp_store()
+        try:
+            cap = C.Capture(store, bar_seconds=15, lookback=20, edge_gate=False)
+            # Two ticks inside one 15s bucket -> nothing closes while the bucket is still forming.
+            cap.on_candle({"symbol": sym, "close": 100.0, "epoch": None}, arrival=1_700_000_000.0)
+            cap.on_candle({"symbol": sym, "close": 101.0, "epoch": None}, arrival=1_700_000_005.0)
+            assert cap.pending_bars == {}, f"{sym}: no bar closes while the bucket is still forming"
+            cap.flush()
+            assert store.bars(sym, 10, newest=False)["bars"] == [], f"{sym}: forming bucket persists no closed bar"
+            # Cross into the next bucket -> the first bucket closes (o=100, c=101), frozen.
+            cap.on_candle({"symbol": sym, "close": 102.0, "epoch": None}, arrival=1_700_000_015.0)
+            cap.flush()
+            closed = store.bars(sym, 10, newest=False)["bars"]
+            # A wild tick in the NEW forming bucket must not repaint the already-closed bar.
+            cap.on_candle({"symbol": sym, "close": 250.0, "epoch": None}, arrival=1_700_000_020.0)
+            cap.flush()
+            assert store.bars(sym, 10, newest=False)["bars"] == closed, \
+                f"{sym}: closed bar frozen while a new bucket forms (no repaint)"
+            return closed
+        finally:
+            for p in (path, cfg):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+
+    orig = S.INSTRUMENT_SCOPE
+    try:
+        S.INSTRUMENT_SCOPE = "all"                  # deterministic even under a dev BLTD_SCOPE=es
+        es_closed = _run("CM.ESU6")                 # ES-family future
+        mnq_closed = _run("CM.MNQU6")               # non-ES index future (esModules=False)
+        spy_closed = _run("US.SPY")                 # equity ETF, no fabricated futures multiplier
+    finally:
+        S.INSTRUMENT_SCOPE = orig
+    # ES's own closed-bar structure is unchanged by multi-asset support.
+    expected = [[100.0, 101.0, 100.0, 101.0, 1_700_000_010.0, 0.0, 0.0]]
+    assert es_closed == expected, "ES closed-bar structure unchanged by multi-asset support"
+    # The non-ES instruments produce EXACTLY the ES closed-bar structure — the ingest path is
+    # instrument-agnostic; non-ES bars route through on_candle identically, with no repaint.
+    assert mnq_closed == es_closed, "non-ES (MNQ) routes through on_candle identically to ES"
+    assert spy_closed == es_closed, "non-ES (SPY ETF) routes through on_candle identically to ES"
 
 
 if __name__ == "__main__":

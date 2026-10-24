@@ -96,7 +96,7 @@ struct AuthView: View {
                     Field(title: "Password", text: $pw, prompt: "••••••••")
                     GoldButton(label: creating ? "Create account" : "Sign in", fill: true, icon: "arrow.right") { submit() }
                     if !err.isEmpty { Text(err).font(.system(size: 12, weight: .medium, design: .rounded)).foregroundColor(BLTheme.red).multilineTextAlignment(.center) }
-                    Button("Continue as guest") { session.email = "guest"; enter() }
+                    Button("Continue without an account") { session.email = "guest"; enter() }
                         .buttonStyle(.plain).font(.system(size: 12, weight: .semibold, design: .rounded)).foregroundColor(BLTheme.sub)
                 }
                 .frame(width: 330)

@@ -19,6 +19,7 @@ SOURCES=(
   "$ROOT/Sources/Updater.swift"
   "$ROOT/Sources/TradeMath.swift"
   "$ROOT/Sources/SignalCore.swift"
+  "$ROOT/Sources/RuleProfile.swift"
   "$ROOT/Sources/Analytics.swift"
   "$ROOT/Sources/Backtest.swift"
   "$ROOT/Sources/BacktestDepth.swift"

@@ -23,6 +23,10 @@ Endpoints (Bearer token from /auth/signin required on /api/*):
   GET  /api/studies?symbol=&limit=300     -> {symbol, studies:{ema/vwap/rsi/bollinger...}}
   GET  /api/backtest?engine=&symbol=      -> {ok, stats:{...}, curve:[...], reason}
   GET  /api/screen?symbols=&engines=      -> {rows:[{engine,symbol,edge,winRate,netPts...}]}
+  GET  /api/gate/rerun?symbols=&engines=  -> {available,prover_sha,sigMinN,alpha,engines:[{engine,status,contracts:[{n,wins,losses,maxDrawdownR,pEdge...}]}], ...}
+  GET  /api/backtest/run?engine=&symbol=&start=&end=&folds= -> {available,prover_sha,whole,folds:[{fold,trades,wins,losses,maxDrawdownR,pEdge,insufficient...}]}  (no-code lab)
+  GET  /api/backtest/bounds?symbol=       -> {symbol, count, firstTs, lastTs}  (date-range defaults for the lab)
+  GET  /api/backtest/farm?engine=&symbol=&start=&end=&workers= -> {available,prover_sha,cellsTried,provenCells,cells:[{params,trades,wins,losses,maxDrawdownR,pEdgeAdj,proven,insufficient}],best,status}  (TR-19 own-silicon parameter-sweep farm; BH-FDR-corrected p per cell)
   GET  /api/fires?limit=&symbol=&engine=  -> {fires:[{...}]}   (the signal journal)
   GET  /api/journal?symbol=&engine=       -> {graded, winRate, netPnl, byEngine}
   GET  /api/feed/sources                  -> {sources:[{key,label,kind,credFields,note}], active}
@@ -51,6 +55,7 @@ from urllib.parse import parse_qs, urlparse
 
 import bltd_store
 import bltd_analytics
+import bltd_alerts   # TR-06 honest edge-gate alert delivery (off by default; buyer-owned endpoint)
 
 # A real deployment issues per-user tokens; for the local/dev backend any sign-in mints this.
 # SECURITY: never default to a publicly-known constant (the source ships in the repo). When
@@ -624,6 +629,20 @@ class H(BaseHTTPRequestHandler):
             if not self._authed():
                 return self._send(401, {"error": "unauthorized"})
             return self._send(200, _exec_command(u.path, body if isinstance(body, dict) else {}))
+        # TR-06 honest alert: post the edge-gate verdict (incl. "no edge") to the buyer's OWN
+        # endpoint. OFF/no-endpoint => zero egress (bltd_alerts guards before any socket). This path
+        # can NEVER place an order — it imports nothing from bltd_exec.
+        if u.path == "/api/alerts/test":
+            if not self._authed():
+                return self._send(401, {"error": "unauthorized"})
+            return self._send(200, bltd_alerts.test_send(STORE))
+        if u.path == "/api/alerts/send":
+            if not self._authed():
+                return self._send(401, {"error": "unauthorized"})
+            b = body if isinstance(body, dict) else {}
+            syms = b.get("symbols") if isinstance(b.get("symbols"), list) else None
+            engs = b.get("engines") if isinstance(b.get("engines"), list) else None
+            return self._send(200, bltd_alerts.send_gate_alert(STORE, syms, engs))
         self._send(404, {"error": "not found"})
 
     def do_GET(self):
@@ -634,20 +653,28 @@ class H(BaseHTTPRequestHandler):
         g = lambda k, d="": (q.get(k, [d])[0] or d)  # noqa: E731
         if u.path == "/health":
             return self._send(200, {"ok": True, "ts": time.time(), "store": "pg" if USING_PG else "own"})
-        # Reference OOS verdicts are public research (Black Label's own ES history, no buyer data),
-        # so they are served BEFORE the auth gate — a cold buyer who has not signed in can still see
-        # that the edge-gate produces a real, earned verdict. Read-only static artifact.
-        if u.path == "/api/reference":
-            return self._send(200, _load_reference())
         if not u.path.startswith("/api/"):
             return self._send(404, {"error": "not found"})
         if not self._authed():
             return self._send(401, {"error": "unauthorized"})
+        # Reference OOS verdicts (Black Label's own ES history, no buyer data) render in the app as an
+        # EARNED edge-gate verdict ("no edge" / candidate). They were once served BEFORE this auth
+        # gate as "public research", which let a cold, UNAUTHENTICATED GET on :8787 scrape a signed
+        # verdict the server cannot attribute to a buyer session — a fail-open (trading-analyst
+        # 2026-07-23). FAIL CLOSED: the reference artifact requires the same per-launch Bearer token
+        # as every other /api/* read. The app already holds that token before its reference screen
+        # loads (FeedClient.connect() runs first), so no honest pre-signin surface is lost.
+        if u.path == "/api/reference":
+            return self._send(200, _load_reference())
         try:
             if u.path == "/api/meta":
                 return self._send(200, STORE.meta())
             if u.path == "/api/symbols":
                 return self._send(200, STORE.symbols())
+            if u.path == "/api/instruments":
+                # First-class multi-asset catalog over the buyer's OWN captured bars (TR-05): every
+                # instrument classified + per-instrument (never pooled). Honest onlyES state when thin.
+                return self._send(200, bltd_analytics.instruments(STORE, STORE.config()))
             if u.path == "/api/bars":
                 return self._send(200, STORE.bars(g("symbol"), int(g("limit", "5000")), newest=False))
             if u.path == "/api/recent":
@@ -689,11 +716,66 @@ class H(BaseHTTPRequestHandler):
                 syms = bltd_store.scoped_symbols(requested_syms) if requested_syms else STORE.symbols().get("backtestable", [])
                 engs = [e for e in g("engines").split(",") if e] or cfg.get("engines", [])
                 return self._send(200, {"rows": bltd_analytics.screen(STORE, syms, engs, cfg)})
+            if u.path == "/api/gate/rerun":
+                # Buyer-triggered one-click re-run of the SHIPPED edge-gate over their OWN captured
+                # bars — full n/W/L/drawdown/p-value per (engine, contract) + prover_sha. Every scoped
+                # symbol × every engine (no cherry-picking); honest 'insufficient' under SIG_MIN_N.
+                cfg = STORE.config()
+                requested_syms = [s for s in g("symbols").split(",") if s]
+                syms = bltd_store.scoped_symbols(requested_syms) if requested_syms else STORE.symbols().get("backtestable", [])
+                engs = [e for e in g("engines").split(",") if e] or cfg.get("engines", [])
+                report = bltd_analytics.gate_rerun(STORE, syms, engs, cfg)
+                report["generatedUTC"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                return self._send(200, report)
+            if u.path == "/api/backtest/run":
+                # No-code backtest lab: run the SHIPPED prover on ONE (engine, symbol) over the buyer's
+                # OWN captured bars, optionally date-scoped, split into contiguous folds. Per-fold
+                # n/W/L/max-drawdown-R/p + prover_sha. No aggregate win-rate/$ figure (§5.1).
+                def _int(name):
+                    raw = g(name, "")
+                    try:
+                        return int(raw) if raw != "" else None
+                    except ValueError:
+                        return None
+                engine = g("engine", "meanrev")
+                sym = g("symbol")
+                report = bltd_analytics.backtest_lab(STORE, engine, sym,
+                                                     start_ts=_int("start"), end_ts=_int("end"),
+                                                     folds=int(g("folds", "1") or 1), cfg=STORE.config())
+                report["generatedUTC"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                return self._send(200, report)
+            if u.path == "/api/backtest/farm":
+                # TR-19 own-silicon parameter-sweep FARM: fan the SHIPPED prover's hyperparameter
+                # grid across this Mac's cores over the buyer's OWN bars. Per-cell n/W/L/DD + a
+                # BH-FDR-corrected p across the whole grid (NEVER a raw best-cell p) + prover_sha.
+                # No cloud, no data fee, no aggregate win-rate/$ figure (§5.1/§5.7).
+                def _int(name):
+                    raw = g(name, "")
+                    try:
+                        return int(raw) if raw != "" else None
+                    except ValueError:
+                        return None
+                engine = g("engine", "meanrev")
+                sym = g("symbol")
+                wk = g("workers", "")
+                report = bltd_analytics.backtest_farm(
+                    STORE, engine, sym, start_ts=_int("start"), end_ts=_int("end"),
+                    workers=(int(wk) if wk.isdigit() else None), cfg=STORE.config())
+                report["generatedUTC"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                return self._send(200, report)
+            if u.path == "/api/backtest/bounds":
+                # First/last captured epoch + bar count for a symbol — so the lab can default the
+                # date range to the real span of the buyer's own data.
+                return self._send(200, STORE.bar_bounds(g("symbol")))
             if u.path == "/api/fires":
                 return self._send(200, STORE.fires(int(g("limit", "200")),
                                                    g("symbol") or None, g("engine") or None))
             if u.path == "/api/journal":
                 return self._send(200, STORE.journal_stats(g("symbol") or None, g("engine") or None))
+            if u.path == "/api/alerts/status":
+                # Token-free view of the TR-06 alert config for the settings UI (no Pushover
+                # token/user, no raw endpoint query is ever returned).
+                return self._send(200, bltd_alerts.status(STORE))
         except Exception as exc:  # noqa: BLE001
             return self._send(200, {"error": f"{type(exc).__name__}: {exc}"})
         self._send(404, {"error": "unknown endpoint"})
